@@ -1,0 +1,35 @@
+{
+  "name": "floken-engine",
+  "version": "0.0.0",
+  "description": "Token-based process engine with Chinese-style approval actions for floken",
+  "type": "module",
+  "sideEffects": false,
+  "engines": { "node": ">=22.12" },
+  "packageManager": "pnpm@12.6.0",
+  "exports": {
+    ".": { "types": "./dist/index.d.ts", "default": "./dist/index.js" }
+  },
+  "types": "./dist/index.d.ts",
+  "main": "./dist/index.js",
+  "files": ["dist", "README.md", "LICENSE", "CHANGELOG.md"],
+  "publishConfig": { "access": "public", "provenance": true },
+  "scripts": {
+    "build": "tsup",
+    "test": "vitest run",
+    "verify": "node tooling/verify.mjs",
+    "changeset": "changeset",
+    "release": "pnpm build && pnpm verify && changeset publish",
+    "prepublishOnly": "pnpm build && pnpm verify"
+  },
+  "dependencies": {
+    "floken-feel": ">=0.0.0 <1.0.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.20.4",
+    "typescript": "5.9.3",
+    "tsup": "8.5.1",
+    "vitest": "5.0.2",
+    "@changesets/cli": "3.0.3"
+  },
+  "license": "Apache-2.0"
+}
