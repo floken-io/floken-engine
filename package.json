@@ -1,5 +1,5 @@
 {
-  "name": "floken-engine",
+  "name": "@floken/engine",
   "version": "0.0.0",
   "description": "Token-based process engine with Chinese-style approval actions for floken",
   "repository": { "type": "git", "url": "git+https://github.com/floken-io/floken-engine.git" },
@@ -29,7 +29,7 @@
     "prepublishOnly": "npm run build && npm run verify"
   },
   "dependencies": {
-    "floken-feel": ">=0.0.0 <1.0.0"
+    "@floken/feel": ">=0.0.0 <1.0.0"
   },
   "devDependencies": {
     "@types/node": "^22.20.4",
