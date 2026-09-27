@@ -1,4 +1,4 @@
-# @floken/engine
+# @floken-io/engine
 
 令牌制流程内核 + 中国式审批动作（会签 / 或签 / 加签 / 转办 / 驳回 / 撤回）。
 
@@ -6,8 +6,8 @@
 
 ## 依赖
 
-- `@floken/moddle`（运行时）
-- **`@floken/feel`（普通 `dependencies`，默认带，Q30）**——装上即可写 `amount > 5000` 网关条件。
+- `@floken-io/moddle`（运行时）
+- **`@floken-io/feel`（普通 `dependencies`，默认带，Q30）**——装上即可写 `amount > 5000` 网关条件。
 
 ## 开发
 
