@@ -159,7 +159,10 @@ try {
   }
 
   const leaked = paths.filter(
-    (p) => /(^|\/)(src|test)\//.test(p) || (/\.ts$/.test(p) && !p.endsWith('.d.ts')),
+    (p) =>
+      /(^|\/)(src|test)\//.test(p) ||
+      (/\.ts$/.test(p) && !p.endsWith('.d.ts')) ||
+      /\.map$/.test(p), // ★ sourcemap 的 sourcesContent 会夹带原始 TS 源码，禁止进包
   );
   if (leaked.length) bad('check:pack', '泄漏源码/测试: ' + leaked.join(', '));
   else ok('check:pack', `${paths.length} 个文件${degraded ? '（退化口径）' : ''}`);

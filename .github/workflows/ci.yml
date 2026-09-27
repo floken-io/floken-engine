@@ -1,0 +1,31 @@
+# CI：push / PR 都跑一遍完整门禁（build → test → verify）。
+# verify 是本项目唯一对外承诺的门禁 —— 不在门禁里的承诺等于没有。
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22.12' # engines: node >= 22.12
+          cache: npm
+
+      - name: 安装依赖
+        run: if [ -f package-lock.json ]; then npm ci; else npm install; fi
+
+      - name: 构建
+        run: npm run build
+
+      - name: 测试
+        run: npm test
+
+      - name: 门禁
+        run: node tooling/verify.mjs

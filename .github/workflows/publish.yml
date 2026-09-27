@@ -1,0 +1,48 @@
+# 发布：打 `v*` tag 即发到 npm（也可在 Actions 页面手动触发）。
+#
+# 前置一次性配置：
+#   1) npmjs.com → Access Tokens → 新建 **Automation / granular token**（Automation 才会绕开 2FA，
+#      否则 CI 里发布会被 OTP 卡住），权限给对应包的 read/write；
+#   2) GitHub 仓库 → Settings → Secrets and variables → Actions → New repository secret
+#      名字叫 NPM_TOKEN，值贴上面的 token。
+#
+# provenance：npm 需要 GitHub 的 OIDC token 才能给包签名，所以下面 id-token: write 不能少；
+# 同时 package.json 里要有 repository 字段，否则 npm 会拒发（它没法确认签名对应的源码仓库）。
+name: Publish
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  id-token: write # provenance 必需
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22.12'
+          registry-url: 'https://registry.npmjs.org'
+          cache: npm
+
+      - name: 安装依赖
+        run: if [ -f package-lock.json ]; then npm ci; else npm install; fi
+
+      - name: 构建
+        run: npm run build
+
+      - name: 门禁（不过不发）
+        run: node tooling/verify.mjs
+
+      # --ignore-scripts：跳过 prepublishOnly（它也是 build+verify，上面已经跑过一遍了，别重复）
+      # --provenance：生成来源证明，npm 页面会显示"已验证来源 + 对应 commit"
+      - name: 发布到 npm
+        run: npm publish --provenance --access public --ignore-scripts
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
