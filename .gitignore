@@ -2,5 +2,8 @@ node_modules/
 dist/
 *.tgz
 coverage/
+# 构建工具在工作目录里写的临时文件（tsup 编译 TS 配置的中间产物，正常会自动删，被中断就留下）
+tsup.config.bundled_*.mjs
+tmp/
 .changeset/*.md
 !.changeset/config.json
