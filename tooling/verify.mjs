@@ -58,10 +58,42 @@ function run(script, args, attempts = 5) {
 
 const TSC = localBin(join('node_modules', 'typescript', 'bin', 'tsc'));
 const VITEST = localBin(join('node_modules', 'vitest', 'vitest.mjs'));
-const NPM_CLI = localBin(
-  join('node_modules', 'npm', 'bin', 'npm-cli.js'),
-  join('node_modules', 'npm', 'bin', 'npm-cli.js'),
-);
+/**
+ * 找 npm 的可执行入口。
+ *
+ * 位置因环境而异，写死一处必在别处翻车：
+ *   - 本机 Windows（官方安装包）：<node 目录>/node_modules/npm
+ *   - CI（actions/setup-node，Linux）：<node 目录>/../lib/node_modules/npm
+ *   - 都没有：退回 PATH 上的 `npm` 命令（返回值用 'npm' 标记，调用处区分执行方式）
+ *
+ * ⚠️ 实测（2026-10-01）：GitHub Actions 上**只有**第一处时拿不到 npm →
+ *   门禁报「npm-cli.js 未找到」而失败。**本地 Windows 一直是绿的**，所以这条
+ *   是靠 CI 的红灯才暴露的（与 `floken-dmn` 1dd5532 修的是同一个坑）。
+ */
+function findNpmCli() {
+  const near = [
+    join('node_modules', 'npm', 'bin', 'npm-cli.js'),
+    join(dirname(NODE), 'node_modules', 'npm', 'bin', 'npm-cli.js'),
+    join(dirname(NODE), '..', 'lib', 'node_modules', 'npm', 'bin', 'npm-cli.js'),
+    join(dirname(NODE), '..', '..', 'lib', 'node_modules', 'npm', 'bin', 'npm-cli.js'),
+  ];
+  for (const p of near) {
+    if (existsSync(p)) return p;
+    const abs = join(root, p);
+    if (existsSync(abs)) return abs;
+  }
+  // PATH 上的 npm：Windows 是 npm.cmd，Linux 是 npm
+  for (const cmd of ['npm', 'npm.cmd']) {
+    try {
+      execFileSync(cmd, ['--version'], { stdio: ['ignore', 'pipe', 'pipe'] });
+      return cmd;
+    } catch {
+      /* 换下一个 */
+    }
+  }
+  return null;
+}
+const NPM_CLI = findNpmCli();
 
 // ---------- 进程内退化实现 ----------
 
@@ -159,8 +191,13 @@ try {
   let paths = [];
   let degraded = false;
   try {
-    if (!NPM_CLI) throw new Error('npm-cli.js 未找到');
-    const out = run(NPM_CLI, ['pack', '--dry-run', '--json']).toString();
+    if (!NPM_CLI) throw new Error('npm 可执行文件未找到（项目内 / node 旁 / PATH 都没有）');
+    // NPM_CLI 为 'npm' / 'npm.cmd' 时说明走的是 PATH 上的命令，不能交给 node 执行
+    const out = (
+      NPM_CLI === 'npm' || NPM_CLI === 'npm.cmd'
+        ? execFileSync(NPM_CLI, ['pack', '--dry-run', '--json'], { stdio: ['ignore', 'pipe', 'pipe'], cwd: root })
+        : run(NPM_CLI, ['pack', '--dry-run', '--json'])
+    ).toString();
     paths = (JSON.parse(out)[0].files || []).map((f) => f.path);
   } catch (spawnErr) {
     if (!SPAWN_BLOCKED.test(String(spawnErr.message || spawnErr))) throw spawnErr;
