@@ -27,7 +27,9 @@
  *
  * ⚠️ **能力边界（诚实标注）**：
  *   - 原语级审计（`TraceEntry.kind:'primitive'`）→ 见 **D-23**；
- *   - `deliver*`（T20）与 `exportTrace`（T22）均未实现 —— 表现为**显式抛错**而非静默降级。
+ *   - **T20 已落地**：`IntermediateCatchEvent` / `receiveTask` 是本循环**第三种稳定点**
+ *     （前两种 = 等人办的 `userTask`、停在 `callActivity` 上等子实例）；
+ *   - `exportTrace`（T22）未实现 —— 表现为**显式抛错**而非静默降级。
  *
  * ## ★ T16：并行分支在这里落地（分叉 / 汇聚两条新路径）
  *
@@ -72,6 +74,7 @@ import { canJoin, isConverging, isGatewayType, routeGateway, waitingAt } from '.
 import type { RoutedFlow } from '../nodes/gateways.js';
 import type { NodeEffect } from '../nodes/tasks.js';
 import { assertTaskSupported, taskBehaviorOf } from '../nodes/tasks.js';
+import { parkForCatch } from '../nodes/catch.js';
 
 /** 探测阶段用的办理人占位：**非空**（否则会触发 INV-13 的空集报错），仅用于问出落点 */
 export const PROBE_ASSIGNEE = '__probe__';
@@ -437,6 +440,8 @@ function restIdsOf(state: InstanceState, groupId: string): string[] {
  * 每个在途令牌各自走到「等待节点」或「终结」为止：
  *   - 等待节点（`userTask`）→ 落定办理人后停下（`Token.createdAt` 此时才填）；
  *     解析出**多个**办理人 → **展开成汇聚组**（会签 / 或签 / 票签，T13）；
+ *   - **等外部投递**（`intermediateCatchEvent` / `receiveTask`，T20）→ 记下 `Token.awaiting` 后停下，
+ *     由 `deliverMessage()` / `deliverSignal()` 唤醒；
  *   - 结束事件 → 该令牌 `completed`；
  *   - **网关**（T16）→ 先判要不要**汇聚等待**，再按类型路由：
  *     一条出向 = 直通过去；多条 = **令牌分裂**（见档首 `forkToken`）；
@@ -500,6 +505,13 @@ function advanceTokens(
     if (!LIVE_TOKEN_STATES.includes(token.state)) continue;
     // 串行会签里还没轮到的令牌：**不是**稳定点，也不该被推进
     if (token.state === 'waiting') continue;
+    /*
+     * ★ **正在等外部投递**的令牌（`Token.awaiting`，T20）同样是稳定点 —— 而且必须在这里判，
+     *   不能靠"节点类型是 catch 就停"：若靠类型，`advanceTokens` 每轮都会重新走到这里，
+     *   于是令牌停在同一个 catch 节点上被反复停车（幂等但无意义）；更糟的是
+     *   投递唤醒后 `awaiting` 已被摘掉，若只看类型它会被**再次停住** —— 永远醒不过来。
+     */
+    if (token.awaiting !== undefined) continue;
 
     for (;;) {
       budget.steps += 1;
@@ -519,7 +531,7 @@ function advanceTokens(
       // ⓪ 数据节点：**不是**可执行节点（引擎只读不写），令牌落到它上面 = 定义画错了
       assertNotDataNode(type, token.nodeId);
 
-      // ① 事件族：未实现的 3 类在这里显式抛（绝不静默直通）
+      // ① 事件族：未实现的 2 类在这里显式抛；**catch** 类停住等投递（T20）
       const behavior = eventBehaviorOf(type);
       if (behavior !== undefined) {
         assertEventSupported(type, token.nodeId, behavior);
@@ -527,7 +539,11 @@ function advanceTokens(
           token.state = 'completed';
           break;
         }
-        // 'start' / 'pass' → 落到下面的自动直通
+        if (behavior === 'catch') {
+          parkCatch(token, ctx);
+          break;
+        }
+        // 'start' → 落到下面的自动直通
       }
 
       // ② 网关（T16）
@@ -556,11 +572,16 @@ function advanceTokens(
         continue;
       }
 
-      // ③ 任务族（T17）：未实现的 2 类显式抛；有副作用的先**消费**已解析的结果
+      // ③ 任务族（T17）：未实现的 1 类显式抛；有副作用的先**消费**已解析的结果
       const taskBehavior = taskBehaviorOf(type);
       if (taskBehavior !== undefined) {
         assertTaskSupported(type, token.nodeId, taskBehavior);
         if (taskBehavior === 'effect') applyEffect(next, token, ctx, events);
+        // 'catch'（receiveTask）→ 停住等投递，与 intermediateCatchEvent 同一处置
+        if (taskBehavior === 'catch') {
+          parkCatch(token, ctx);
+          break;
+        }
         // 'wait' → 落到下面的 `settleAssignee`；'pass' 与已消费的 'effect' → 自动直通
       }
 
@@ -727,6 +748,30 @@ function joinPass(state: InstanceState, ctx: LoopContext): boolean {
 
 /** `settleAssignee` 的返回值 */
 type Settled = 'wait' | 'skipped' | 'expanded';
+
+/**
+ * ★ 令牌**停在等待节点上**（T20）—— 记下它在等什么。
+ *
+ * 与 `settleAssignee` 对称：那一个是"等人"，这一个"等外部世界"。
+ * 两处的 `createdAt` 同一口径 = **进入等待的时刻**（T21 的超时判定要用它）。
+ *
+ * ⚠️ 不进 `landings`：等待节点**没有办理人**要解析，塞进去会让引擎去
+ *   `ApproverSource` 问一个根本不存在的人（与 `callActivity` 的停车同一理由）。
+ */
+function parkCatch(token: Token, ctx: LoopContext): void {
+  const binding = ctx.graph.catchOf(token.nodeId);
+  if (binding === undefined) {
+    // 兜底：能走到这里的只有 intermediateCatchEvent / receiveTask，
+    // 而 `catchOf` 对它们要么给绑定、要么抛（见 `nodes/catch.ts`）。真发生了也要报出来。
+    throw stateShapeInvalid(`node '${token.nodeId}' is a catch node without a catch binding`, {
+      nodeId: token.nodeId,
+      type: ctx.graph.typeOf(token.nodeId) ?? null,
+      instanceId: ctx.graph.processId,
+    });
+  }
+  parkForCatch(token, binding);
+  if (token.createdAt === undefined) token.createdAt = ctx.at;
+}
 
 /**
  * 等待节点上落定办理人；解析出多人时**展开成汇聚组**。

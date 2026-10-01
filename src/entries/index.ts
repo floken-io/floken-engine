@@ -38,6 +38,7 @@ export type {
   AuditEntry,
   ActionRecord,
   InstanceParent,
+  TokenAwait,
   InstanceStateHeader,
   InstanceStateBody,
   InstanceState,
@@ -229,6 +230,30 @@ export type { LoopContext, LoopResult, StepInput } from '../runtime/loop.js';
 export { CALL_RETURN_ACTION, callReturnOf } from '../nodes/activities.js';
 export type { PendingCall } from '../nodes/activities.js';
 
+// ---------------- ★ 投递：等外部消息 / 信号（§7.1 · T20 · 门 2 同样要能完成） ----------------
+
+/**
+ * ★ 为什么**必须公开** `deliverStep()` 与两个动作名：与 `step()` / `callReturnOf()` 同一条理由 ——
+ *   门 2（宿主自编排）下投递也得由宿主自己落库，若「匹配 → 唤醒 → run-to-wait」只活在
+ *   `deliverMessage()` 里，门 2 就得复制一份，§7.1 两条路径立刻分叉。
+ *
+ *   `matchingTokens()` / `waitingNamesOf()` 一并公开：宿主做**订阅表**时要读
+ *   `Token.awaiting`（"谁在等什么"），而那份判据只能有一份（就在 `nodes/catch.ts`）。
+ */
+export {
+  MESSAGE_DELIVER_ACTION,
+  SIGNAL_DELIVER_ACTION,
+  DELIVER_ACTIONS,
+  CATCH_KINDS,
+  catchBindingOf,
+  matchingTokens,
+  waitingNamesOf,
+} from '../nodes/catch.js';
+export type { CatchKind, CatchBinding, CatchNodeLike, DeliverMatch } from '../nodes/catch.js';
+
+export { deliverStep } from '../runtime/deliver.js';
+export type { DeliverResult } from '../runtime/deliver.js';
+
 // ---------------- 事件派生与投递（§7.3 · ADR-006） ----------------
 
 /**
@@ -247,14 +272,16 @@ export type { EmitInput } from '../runtime/emit.js';
 /**
  * ★ `createEngine()` 是宿主接入的**唯一入口**。
  *
- * `start` / `submit` 是日常路径；`plan()` 是门 2（强一致自编排）的入口，
+ * `start` / `submit` 是日常路径；`deliverMessage`（点对点）/ `deliverSignal`（广播）是
+ * T20 的**投递入口**（唤醒停在 `intermediateCatchEvent` / `receiveTask` 上的令牌）；
+ * `plan()` 是门 2（强一致自编排）的入口，
  * 引擎实例上的 `plan` 只是给它补上 `EngineConfig.clock` / `maxAuditEntries`（ADR-007）。
  *
- * ⚠️ `deliverMessage` / `deliverSignal`（T20）与 `exportTrace`（T22）尚未实现 ——
- *    `Engine` 接口会随它们的落地扩展，此处**刻意不提前声明**（声明了就得给实现）。
+ * ⚠️ `exportTrace`（T22）尚未实现 —— `Engine` 接口会随它的落地扩展，
+ *   此处**刻意不提前声明**（声明了就得给实现）。
  */
 export { createEngine } from '../runtime/engine.js';
-export type { Engine, EngineConfig, StartOptions } from '../runtime/engine.js';
+export type { Engine, EngineConfig, StartOptions, DeliverInput } from '../runtime/engine.js';
 
 // ---------------- 条件求值（§7 / §8.3 · AC-E9） ----------------
 

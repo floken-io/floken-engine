@@ -315,6 +315,38 @@ export function addSignLimit(nodeId: string, limit: number, current: number): En
   });
 }
 
+/**
+ * ★ 投递**没有命中任何等待**（T20 · 「不得静默丢弃」的落点）。
+ *
+ * 为什么必须抛：名字差一个大小写（`Msg_paid` vs `msg_paid`）如果静默丢弃，
+ * 表现是「流程永久卡在等待节点上，而宿主以为自己投过了」—— 与 INV-13 同型的静默事故。
+ *
+ * ⚠️ 码复用 `ACTION_TARGET_INVALID`（**不新增第 20 个码**）：投递本质是一次动作，
+ *   它失败的原因是「**目标**不存在」。与驳回目标非法的区别只在 `details` 的形状上
+ *   （这里是 `waiting` = 该实例此刻在等的东西，即**合法取值**）。
+ */
+export function deliverNoTarget(
+  instanceId: string | undefined,
+  kind: string,
+  name: string,
+  waiting: readonly string[],
+  details: Record<string, unknown> = {},
+): EngineActionError {
+  const message =
+    instanceId === undefined
+      ? `No instance among the candidates is waiting for ${kind} '${name}'`
+      : `No token in instance '${instanceId}' is waiting for ${kind} '${name}'`;
+  return new EngineActionError(message, {
+    code: ENGINE_ERROR_CODES.ACTION_TARGET_INVALID,
+    ...(instanceId === undefined ? {} : { instanceId }),
+    hint:
+      waiting.length === 0
+        ? '此刻**没有**任何等待中的令牌（可能已经走过那个节点，或实例已不在等待）；请确认投递目标与时机'
+        : '消息 / 信号名必须与定义里的 messageRef / signalRef **逐字一致**；details.waiting 是此刻在等的东西',
+    details: { kind, name, waiting: [...waiting], ...details },
+  });
+}
+
 /** 票签配置非法（INV-7） */
 export function voteConfigInvalid(message: string, details: Record<string, unknown> = {}): EngineActionError {
   return new EngineActionError(message, {

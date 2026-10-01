@@ -65,6 +65,34 @@ export const VOTE_OUTCOMES = ['approved', 'rejected'] as const satisfies readonl
 
 // ---------------- 体：引擎内部结构（宿主当不透明 JSON，不解包） ----------------
 
+/**
+ * ★ 令牌**正在等的东西**（T20 · `intermediateCatchEvent` / `receiveTask`）。
+ *
+ * 为什么必须落在令牌上、而不是"看节点类型临时推"：
+ *   ① 同一个节点可能被**多个令牌**同时等待（并行分支），"谁等到了"是令牌级事实；
+ *   ② 投递要按 `name` 精确匹配，而 `name` 来自**定义** —— 定义可能被改版（AC-E10），
+ *      在令牌上留一份快照，投递判据才不随图纸漂移；
+ *   ③ 它是唯一能回答「这个实例现在在等什么」的地方 —— 宿主做订阅表 / 超时扫描都要它。
+ *
+ * ⚠️ 与 `state:'waiting'` 无关：那是**串行会签里还没轮到**（人已定、等前面的人办完）。
+ *    本字段是「等**外部世界**的某个消息 / 信号」，没人能替它办 —— 命名刻意不叫 `waiting`
+ *    就是为了避免这两件事被当成一件。
+ */
+export interface TokenAwait {
+  readonly kind: 'message' | 'signal';
+  /** 消息名 / 信号名（`messageRef` / `signalRef`） */
+  readonly name: string;
+}
+
+export const TOKEN_AWAIT_KINDS = ['message', 'signal'] as const;
+
+/**
+ * 令牌 —— 审批流的**执行指针**。
+ *
+ * ⚠️ 与「待办」不是一回事：一条待办 = `active` + 有 `assignee` 的令牌
+ * （详见 `runtime/loop.ts` 的 `tasksOf`）。没有 `assignee` 的在途令牌
+ * （刚分叉出来还没落定、停在等待外部消息的 catch 节点上）**不是**待办。
+ */
 export interface Token {
   id: string;
   nodeId: string;
@@ -107,6 +135,14 @@ export interface Token {
    * ⚠️ 无分支（单干）的令牌**不写本字段**：此时"撤销下游"= 撤销全部在途，
    *   与 T15 之前的既有行为一致（向后兼容，不需要迁移）。
    */
+  /**
+   * ★ **正在等外部消息 / 信号**（T20）—— 见 {@link TokenAwait}。
+   *
+   * - 令牌落到 `intermediateCatchEvent` / `receiveTask` 时写入，被投递唤醒时**摘掉**；
+   * - 有本字段的令牌是**稳定点**：`run-to-wait` 见到它就停（不会自己走过去）；
+   * - 令牌换节点时由 `clearAssignment()` 一并清除（与办理人同一口径 —— 它是**节点级**属性）。
+   */
+  awaiting?: TokenAwait;
   branch?: string;
 }
 
@@ -443,6 +479,18 @@ export function assertInstanceState(state: InstanceState, path = '$'): void {
     }
     if (t.vote !== undefined && !(VOTE_OUTCOMES as readonly string[]).includes(t.vote)) {
       fail(`tokens[${i}].vote must be 'approved' or 'rejected' when present`, { value: t.vote });
+    }
+    if (t.awaiting !== undefined) {
+      const a = t.awaiting;
+      if (a === null || typeof a !== 'object') {
+        fail(`tokens[${i}].awaiting must be an object when present`);
+      }
+      if (!(TOKEN_AWAIT_KINDS as readonly string[]).includes(a.kind)) {
+        fail(`tokens[${i}].awaiting.kind must be 'message' or 'signal'`, { value: a.kind });
+      }
+      if (!isNonEmptyString(a.name)) {
+        fail(`tokens[${i}].awaiting.name must be a non-empty string`, { value: a.name });
+      }
     }
     if (t.branch !== undefined && !isNonEmptyString(t.branch)) {
       fail(`tokens[${i}].branch must be a non-empty string when present`, { value: t.branch });

@@ -11,13 +11,13 @@
  *
  * ★ **分类必须是穷举的**（`TASK_TYPES` 就是那 8 个名字）：新增一类时 `taskBehaviorOf`
  *   返回 `undefined` → `runtime/loop.ts` 把它当**自动直通**处理；本档的 8 类里
- *   `sendTask` / `receiveTask` 是 **`unsupported`（显式抛错）**，绝不静默直通。
+ *   `sendTask` 是 **`unsupported`（显式抛错）**，绝不静默直通。
  *
- * ## ★ 三类必须显式抛错，绝不降级
- *   - `receiveTask` → **FR-E14 / T20**：它要等外部消息，而 `deliverMessage()` 还没落地 ——
- *     让它"等待"会造成**没有任何手段唤醒**的永久卡死，比抛错糟得多（与
- *     `intermediateCatchEvent` 同一处置，见 `nodes/events.ts`）。
- *   - `sendTask` → **FR-E14 / T20（D-56）**：`03` 自己写明它「与 `IntermediateThrowEvent`
+ * ## ★ 两类消息节点的处置（T20 已分家）
+ *   - `receiveTask` → **`'catch'`（等外部消息）**，T20 随 `deliverMessage()` 一并落地。
+ *     它与 `intermediateCatchEvent` 的等待语义**完全同形**，故判据不在本档 ——
+ *     见 `nodes/catch.ts`（横跨任务族与事件族，放哪一族都会长出第二份写法）。
+ *   - `sendTask` → **仍抛错（D-56）**：`03` 自己写明它「与 `IntermediateThrowEvent`
  *     同构」，而后者在 T16 就是因为 **ADR-006 把事件集定死 10 个、其中没有"抛出事件"**
  *     才推迟的。此处若"顺手发一条"，只有两条路：① 偷偷加第 11 个事件（违反 ADR-006，
  *     且必须走 ADR 修订而不是代码）；② 复用 `taskCreated` + `taskCompleted`
@@ -64,10 +64,12 @@ export type TaskType = (typeof TASK_TYPES)[number];
  * - `'wait'` —— 等人办（`userTask`）。令牌落定办理人后停下（ADR-003 的稳定点）。
  * - `'effect'` —— **有副作用**（`serviceTask` / `scriptTask` / `businessRuleTask` / `manualTask`）。
  *   副作用**不在本档**：由 `runtime/engine.ts` 解析成 `NodeEffect` 后，纯循环只负责**消费**它。
+ * - `'catch'` —— **等外部消息**（`receiveTask`，T20）。与 `intermediateCatchEvent` 同处置，
+ *   判据在 `nodes/catch.ts`（令牌停住 → 由 `deliverMessage()` 唤醒）。
  * - `'pass'` —— 直通（裸 `task`）：无副作用、不产生待办、**不发事件**，令牌到达即离开。
- * - `'unsupported'` —— 已知但**未实现**（见档首两类）。
+ * - `'unsupported'` —— 已知但**未实现**（`sendTask`，见档首）。
  */
-export type TaskBehavior = 'wait' | 'effect' | 'pass' | 'unsupported';
+export type TaskBehavior = 'wait' | 'effect' | 'catch' | 'pass' | 'unsupported';
 
 /** 该类型是不是任务族；是 → 返回它的执行语义；不是任务 → `undefined` */
 export function taskBehaviorOf(type: string | undefined): TaskBehavior | undefined {
@@ -79,10 +81,11 @@ export function taskBehaviorOf(type: string | undefined): TaskBehavior | undefin
     case 'businessRuleTask':
     case 'manualTask':
       return 'effect';
+    case 'receiveTask':
+      return 'catch';
     case 'task':
       return 'pass';
     case 'sendTask':
-    case 'receiveTask':
       return 'unsupported';
     default:
       return undefined;
@@ -110,8 +113,7 @@ export function assertTaskSupported(
 ): void {
   if (behavior !== 'unsupported') return;
   const owner: Record<string, string> = {
-    sendTask: 'FR-E14 / T20（抛出事件：ADR-006 事件集定死 10 个，须先改 ADR 再加）',
-    receiveTask: 'FR-E14 / T20（deliverMessage / deliverSignal）',
+    sendTask: 'FR-E14 / T20（向外抛出：ADR-006 事件集定死 10 个，须先改 ADR 再加）',
   };
   throw stateShapeInvalid(`node '${nodeId}' is a '${type}', which is not executable yet`, {
     nodeId,

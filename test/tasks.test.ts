@@ -82,15 +82,15 @@ describe('① 任务 8 类的分类（`03-engine` §6）', () => {
     }
   });
 
-  it('行为归类：1 等待 / 4 副作用 / 1 直通 / 2 未实现', () => {
+  it('行为归类：1 等待 / 4 副作用 / 1 等投递 / 1 直通 / 1 未实现', () => {
     expect(taskBehaviorOf('userTask')).toBe('wait');
     for (const t of ['serviceTask', 'scriptTask', 'businessRuleTask', 'manualTask']) {
       expect(taskBehaviorOf(t), t).toBe('effect');
     }
+    // ★ T20：`receiveTask` 从「未实现」变成「等外部消息」（与 intermediateCatchEvent 同档）
+    expect(taskBehaviorOf('receiveTask')).toBe('catch');
     expect(taskBehaviorOf('task')).toBe('pass');
-    for (const t of ['sendTask', 'receiveTask']) {
-      expect(taskBehaviorOf(t), t).toBe('unsupported');
-    }
+    expect(taskBehaviorOf('sendTask')).toBe('unsupported');
   });
 
   it('非任务类型 → `undefined`（留给事件 / 网关 / 数据的分类）', () => {
@@ -200,8 +200,8 @@ describe('③ `isFeelScriptFormat`（白名单，不是"含 feel 就算"）', ()
 
 // ---------------- ④ 未实现的两类：显式抛 ----------------
 
-describe('④ `sendTask` / `receiveTask`：显式抛并指名归属（不静默直通）', () => {
-  it.each(['sendTask', 'receiveTask'])('%s → 抛 STATE_SHAPE_INVALID 且带 owner', (type) => {
+describe('④ `sendTask`：显式抛并指名归属（不静默直通；`receiveTask` 已随 T20 落地为等投递）', () => {
+  it.each(['sendTask'])('%s → 抛 STATE_SHAPE_INVALID 且带 owner', (type) => {
     expect(() => assertTaskSupported(type, 'Node_1', 'unsupported')).toThrow(/not executable yet/);
     try {
       assertTaskSupported(type, 'Node_1', 'unsupported');
@@ -219,7 +219,16 @@ describe('④ `sendTask` / `receiveTask`：显式抛并指名归属（不静默�
     }
   });
 
-  it('★ 运行期：令牌落到 `receiveTask` → 抛（没有 `deliverMessage` 就让它等 = 永久卡死）', async () => {
+  it('★ 运行期：令牌落到 `receiveTask` → 停在它上面等投递（T20；端到端断言见 `deliver.test.ts`）', async () => {
+    const { engine, store } = engineOf(defWith({ type: 'receiveTask', messageRef: 'Msg_paid' }));
+    const id = await engine.start('Process_1', { definitionVersion: 1, starter: 'u0' });
+    const st = await store.load(id);
+    expect(st?.tokens[0]?.nodeId).toBe('Node_1');
+    expect(st?.tokens[0]?.awaiting).toEqual({ kind: 'message', name: 'Msg_paid' });
+    expect(st?.status).toBe('running');
+  });
+
+  it('★ 运行期：`receiveTask` 缺 `messageRef` → 抛（等不到 = 永久卡死，不得放行）', async () => {
     const { engine } = engineOf(defWith({ type: 'receiveTask' }));
     await expectCodeAsync(engine.start('Process_1', { definitionVersion: 1, starter: 'u0' }),
       ENGINE_ERROR_CODES.STATE_SHAPE_INVALID,

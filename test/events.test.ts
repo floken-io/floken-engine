@@ -58,11 +58,11 @@ describe('事件 6 类的分类（`01-moddle` §5.3 · event 族）', () => {
     }
   });
 
-  it('行为归类：start=入口 / end=终点 / throw=直通 / 其余 3 类=未实现', () => {
+  it('行为归类：start=入口 / end=终点 / catch=等投递 / 其余 3 类=未实现', () => {
     expect(eventBehaviorOf('startEvent')).toBe('start');
     expect(eventBehaviorOf('endEvent')).toBe('terminal');
-    expect(eventBehaviorOf('intermediateThrowEvent')).toBe('pass');
-    expect(eventBehaviorOf('intermediateCatchEvent')).toBe('unsupported');
+    expect(eventBehaviorOf('intermediateCatchEvent')).toBe('catch');
+    expect(eventBehaviorOf('intermediateThrowEvent')).toBe('unsupported');
     expect(eventBehaviorOf('boundaryEvent')).toBe('unsupported');
     expect(eventBehaviorOf('implicitThrowEvent')).toBe('unsupported');
   });
@@ -79,7 +79,7 @@ describe('事件 6 类的分类（`01-moddle` §5.3 · event 族）', () => {
    */
   it('未实现的 3 类：`assertEventSupported` 一律抛 `STATE_SHAPE_INVALID`', () => {
     for (const [type, owner] of [
-      ['intermediateCatchEvent', 'FR-E14'],
+      ['intermediateThrowEvent', 'FR-E14'],
       ['boundaryEvent', 'FR-E13'],
       ['implicitThrowEvent', 'FR-E24'],
     ] as const) {
@@ -97,17 +97,19 @@ describe('事件 6 类的分类（`01-moddle` §5.3 · event 族）', () => {
   it('已实现的 3 类：`assertEventSupported` 是 no-op', () => {
     expect(() => assertEventSupported('endEvent', 'End_1', 'terminal')).not.toThrow();
     expect(() => assertEventSupported('startEvent', 'Start_1', 'start')).not.toThrow();
-    expect(() => assertEventSupported('intermediateThrowEvent', 'Ev_1', 'pass')).not.toThrow();
+    expect(() => assertEventSupported('intermediateCatchEvent', 'Ev_1', 'catch')).not.toThrow();
   });
 });
 
 describe('令牌到达各类事件时的真实行为', () => {
   /**
-   * ★ `intermediateThrowEvent` 是**自动直通**。
-   * ⚠️ 严格说抛事件应当通告 `EventSink`，但 ADR-006 把事件集定死 10 个、其中没有它，
-   *    故 T16 只直通；真正的抛出语义归 **T20**（届时须先给 ADR-006 补事件）。
+   * ★ **`intermediateThrowEvent` 显式抛错（D-56 的第二半，T20 收口）**。
+   *
+   * 它是「向**外**抛出」：引擎没有对外的消息出口（11 项 SPI 里没有 `MessageSink`），
+   * ADR-006 又把事件集定死 10 个。直通的表现是「流程图上说这里发了一条消息，
+   * 而它从来没发出去」—— 那正是「不得静默降级」要挡的事。
    */
-  it('`intermediateThrowEvent` → 自动直通（不停、不抛）', () => {
+  it('`intermediateThrowEvent` → 抛 `STATE_SHAPE_INVALID`（不静默直通）', () => {
     const def = makeDefinition({
       nodes: [
         { id: 'Start_1', type: 'startEvent' },
@@ -121,9 +123,11 @@ describe('令牌到达各类事件时的真实行为', () => {
         { from: 'Task_1', to: 'End_1' },
       ],
     });
-    const r = runToWait(base([{ id: 'tk_1', nodeId: 'Start_1', state: 'active' }]), ctx(def));
-    expect(r.next.tokens[0]?.nodeId).toBe('Task_1');
-    expect(r.next.tokens[0]?.assignee).toBe('u1');
+    const err = expectCode(
+      () => runToWait(base([{ id: 'tk_1', nodeId: 'Start_1', state: 'active' }]), ctx(def)),
+      ENGINE_ERROR_CODES.STATE_SHAPE_INVALID,
+    );
+    expect(String(err.details?.owner)).toContain('FR-E14');
   });
 
   it('`endEvent` → 令牌完成；全部结束 → 实例 completed', () => {

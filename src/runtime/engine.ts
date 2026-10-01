@@ -24,7 +24,12 @@
  *      `ctx.next`（宿主最常见的用法是「看下下一步是谁再决定要不要放行」）。
  *   ⑨ 事件在**最后**且**不 await**：`EventSink` 的语义是「丢了不影响流程」（ADR-006）。
  *
- * ⚠️ `deliverMessage` / `deliverSignal` / `exportTrace` 属 T20 / T22，不在本档。
+ * ★ **T20 追加**：`deliverMessage` / `deliverSignal` 与 `submit()` **同构**（同样九个槽位、
+ *   同样走 `plan()` 的 `apply` 接缝、同样经 `queue.run()` 串行），差别只有两点：
+ *     ① 纯执行段是 `deliverStep()`（匹配 → 唤醒 → run-to-wait）而不是 `step()`（原语 → 记票 → …）；
+ *     ② 动作名是**第四类**（`deliverMessage` / `deliverSignal`），不是 19 项审批动作。
+ *
+ * ⚠️ `exportTrace` 属 T22，不在本档。
  */
 
 import type { ApproverSpec } from '@floken-io/moddle';
@@ -38,10 +43,12 @@ import {
   actionVetoed,
   approverEmpty,
   definitionMissing,
+  deliverNoTarget,
   optionInvalid,
   optionUnknown,
   stateNotFound,
   stateShapeInvalid,
+  stateSuspended,
   stateTerminal,
 } from '../core/errors.js';
 import type { EngineHooks } from '../core/hooks.js';
@@ -69,6 +76,13 @@ import { assertTokensInGraph, createProcessGraph } from '../nodes/graph.js';
 import type { OutFlow, ProcessGraph } from '../nodes/graph.js';
 import { CALL_RETURN_ACTION, callReturnOf } from '../nodes/activities.js';
 import type { PendingCall } from '../nodes/activities.js';
+import {
+  MESSAGE_DELIVER_ACTION,
+  SIGNAL_DELIVER_ACTION,
+  matchingTokens,
+  waitingNamesOf,
+} from '../nodes/catch.js';
+import type { CatchKind, DeliverMatch } from '../nodes/catch.js';
 import type { NodeEffect, TaskEffectKind } from '../nodes/tasks.js';
 import {
   asUnresolvedEffect,
@@ -80,9 +94,10 @@ import {
 } from '../nodes/tasks.js';
 import { plan } from './plan.js';
 import type { PlanOptions, PlanResult } from './plan.js';
+import { deliverStep } from './deliver.js';
 import { createInstanceQueue } from './queue.js';
 import { PROBE_ASSIGNEE, step, tasksOf } from './loop.js';
-import type { StepInput, VoteCast } from './loop.js';
+import type { LoopContext, LoopResult, StepInput, VoteCast } from './loop.js';
 import type { PostStep } from '../actions/compile.js';
 import { emitAll, eventsOf } from './emit.js';
 import { createMemoryStore } from '../store/memory.js';
@@ -143,11 +158,61 @@ export interface StartOptions {
   variables?: Record<string, unknown>;
 }
 
+/**
+ * 一次投递的输入（T20 · `deliverMessage` / `deliverSignal`）。
+ *
+ * ★ 与 `ActionInput` **刻意不共用**：投递不是审批动作 —— 它没有「19 项动作名」、
+ *   没有 `target` / `comment`（消息名本身就是目标）。共用会让宿主写出
+ *   `submit({action:'approve', name:'Msg_paid'})` 这种四不像，且编译期挡不住。
+ */
+export interface DeliverInput {
+  /** 消息名 / 信号名，与定义里的 `messageRef` / `signalRef` **逐字**匹配 */
+  name: string;
+  /** 谁投的（进审计；外部系统就写系统名，如 `'bank-callback'`） */
+  actor: string;
+  /** 随消息带来的数据 → 并入 `variables`（如 `{ paid: true, amount: 9000 }`） */
+  payload?: Record<string, unknown>;
+  /** 显式时间（ISO 8601）；缺省由 `clock()` 填 —— ADR-007 */
+  at?: string;
+}
+
+function assertDeliverInput(input: unknown): asserts input is DeliverInput {
+  if (typeof input !== 'object' || input === null || Array.isArray(input)) {
+    throw optionInvalid('input', 'must be a plain object', input);
+  }
+  const i = input as Record<string, unknown>;
+  const fail = (field: string, reason: string): never => {
+    throw optionInvalid(`input.${field}`, reason, i[field]);
+  };
+  if (typeof i.name !== 'string' || i.name.length === 0) fail('name', 'must be a non-empty string');
+  if (typeof i.actor !== 'string' || i.actor.length === 0) fail('actor', 'must be a non-empty string');
+  if (i.at !== undefined && (typeof i.at !== 'string' || i.at.length === 0)) {
+    fail('at', 'must be a non-empty ISO 8601 string when present');
+  }
+  if (i.payload !== undefined && (typeof i.payload !== 'object' || i.payload === null || Array.isArray(i.payload))) {
+    fail('payload', 'must be a plain object when present');
+  }
+}
+
 export interface Engine {
   /** 发起一个实例；返回 `instanceId` */
   start(processId: string, opts: StartOptions): Promise<string>;
   /** 提交一次动作；返回待办差分（INV-15） */
   submit(instanceId: string, action: ActionInput): Promise<TaskDelta>;
+  /**
+   * ★ **点对点**投递一条消息，唤醒该实例里正在等它的令牌（T20 · `intermediateCatchEvent` / `receiveTask`）。
+   *
+   * @throws `ENGINE_ACTION_TARGET_INVALID` —— 该实例没有在等这个名字（**不静默丢弃**）
+   */
+  deliverMessage(instanceId: string, input: DeliverInput): Promise<TaskDelta>;
+  /**
+   * ★ **广播**一个信号，唤醒候选实例里**所有**正在等它的实例（T20）。
+   *
+   * ⚠️ 候选集由宿主给：引擎不知道实例全集（`StateStore` 没有查询接口，见 §3b）。
+   *
+   * @throws `ENGINE_ACTION_TARGET_INVALID` —— 一个都没命中（完全无效果 = 静默丢弃）
+   */
+  deliverSignal(instanceIds: readonly string[], input: DeliverInput): Promise<TaskDelta[]>;
   /**
    * ★ 门 2 入口：纯函数，不碰存储。
    * 本档只补上 `EngineConfig` 里的 `clock` / `maxAuditEntries`，其余交给调用方。
@@ -364,19 +429,15 @@ export function createEngine(config: EngineConfig): Engine {
    * @param state 已并入 `payload` 增量的状态（与 `plan()` 交给 `apply` 的那份**同源** ——
    *              否则「表单里把 amount 改成 9000、网关却按旧值走分支」，正是 §7.2 要防的事故）
    * @param record 本次动作事实（副作用产出的事件要与它**同源**，否则重放时对不上）
+   * @param run ★ 一次推进的**纯执行段**：`step()`（动作）或 `deliverStep()`（投递）。
+   *   探测跑与真值跑**共用**它 —— 两者跑同一段代码，「探测问错落点」从结构上不可能发生。
    */
   async function buildApply(params: {
     readonly state: InstanceState;
-    readonly calls: readonly PrimitiveCall[];
     readonly graph: ProcessGraph;
     readonly at: string;
     readonly record: ActionRecord;
-    /** 组内投票（`CompiledAction.vote`）；非组内动作为 `undefined` */
-    readonly vote?: VoteCast | undefined;
-    /** ★ T15 令牌级微调（`CompiledAction.post`：委派回归 / 解散组） */
-    readonly post?: PostStep | undefined;
-    /** 汇聚驳回时的显式退回目标 */
-    readonly rejectTarget?: string | undefined;
+    readonly run: (state: InstanceState, ctx: LoopContext) => LoopResult;
   }): Promise<{
     readonly apply: (draft: InstanceState) => InstanceState;
     /** ★ 本次推进里由节点副作用产出的事件（**槽位 9** 投递，见 `pendingEvents` 注释） */
@@ -384,13 +445,7 @@ export function createEngine(config: EngineConfig): Engine {
     /** ★ 本次推进里停在 `callActivity` 上、待建的子实例（T18；与 `pendingEvents` 同套路） */
     readonly pendingCalls: readonly PendingCall[];
   }> {
-    const { state, calls, graph, at, record } = params;
-    const stepInput: StepInput = {
-      calls,
-      ...(params.vote !== undefined ? { vote: params.vote } : {}),
-      ...(params.post !== undefined ? { post: params.post } : {}),
-      ...(params.rejectTarget !== undefined ? { rejectTarget: params.rejectTarget } : {}),
-    };
+    const { state, graph, at, record, run } = params;
 
     /** 已解析的条件（按 flow id）。惰性填充 —— 只算本次**真正走到**的那几条 */
     const conditions = new Map<string, boolean>();
@@ -441,7 +496,7 @@ export function createEngine(config: EngineConfig): Engine {
          *   会签最后一人通过后，落点是**汇聚之后的下一个节点**，只跑推进会问错落点。
          */
         const probe = new Set<string>();
-        step(cloneState(state), {
+        run(cloneState(state), {
           graph,
           at,
           assigneesOf: (nodeId) => {
@@ -450,7 +505,7 @@ export function createEngine(config: EngineConfig): Engine {
           },
           conditionsOf,
           effectsOf,
-        }, stepInput);
+        });
 
         const resolved = new Map<string, readonly string[]>();
         for (const nodeId of probe) {
@@ -461,10 +516,9 @@ export function createEngine(config: EngineConfig): Engine {
           pendingEvents,
           pendingCalls,
           apply: (draft: InstanceState): InstanceState => {
-            const r = step(
+            const r = run(
               draft,
               { graph, at, assigneesOf: (nodeId) => resolved.get(nodeId) ?? [], conditionsOf, effectsOf },
-              stepInput,
             );
             // 只有**真值跑**产出的东西算数：探测跑的结果一律丢弃（它可能被重试掉）
             pendingEvents.length = 0;
@@ -548,7 +602,13 @@ export function createEngine(config: EngineConfig): Engine {
     const record: ActionRecord = { name: 'start', actor: opts.starter, at };
 
     // 发起也要跑 run-to-wait：发起节点是自动节点，令牌要一直走到第一个等待节点
-    const built = await buildApply({ state: base, calls: [], graph, at, record });
+    const built = await buildApply({
+      state: base,
+      graph,
+      at,
+      record,
+      run: (s, ctx) => step(s, ctx, { calls: [] }),
+    });
     const looped = built.apply(cloneState(base));
 
     const next: InstanceState = {
@@ -657,6 +717,12 @@ export function createEngine(config: EngineConfig): Engine {
      *   故节点副作用产出的事件与 `delta.action` 必然同源 —— 否则重放时对不上。
      */
     const record: ActionRecord = { name: input.action, actor: input.actor, at };
+    const stepInput: StepInput = {
+      calls: compiled.calls,
+      ...(compiled.vote !== undefined ? { vote: compiled.vote } : {}),
+      ...(compiled.post !== undefined ? { post: compiled.post } : {}),
+      ...(input.target !== undefined ? { rejectTarget: input.target } : {}),
+    };
     const built = await buildApply({
       /*
        * ★ 传给探测/闭包的是**已并入 payload 增量**的状态。
@@ -664,13 +730,10 @@ export function createEngine(config: EngineConfig): Engine {
        *   否则「表单里把 amount 改成 9000、网关却按旧值走分支」（§7.2 要防的头号事故）。
        */
       state: withPayload(state, input.payload),
-      calls: compiled.calls,
       graph,
       at,
       record,
-      ...(compiled.vote !== undefined ? { vote: compiled.vote } : {}),
-      ...(compiled.post !== undefined ? { post: compiled.post } : {}),
-      ...(input.target !== undefined ? { rejectTarget: input.target } : {}),
+      run: (s, ctx) => step(s, ctx, stepInput),
     });
     const result = plan(state, input, {
       clock,
@@ -710,6 +773,191 @@ export function createEngine(config: EngineConfig): Engine {
       [
         ...eventsOf({ before, delta: result.delta, next: result.next, previousStatus: state.status }),
         // ★ 节点副作用产出的事件（`manualTask` 的留痕）—— 状态已落库，此刻投递才安全
+        ...built.pendingEvents,
+      ],
+    );
+
+    return { next: result.next, pendingCalls: built.pendingCalls, delta: result.delta };
+  }
+
+  // ---------------- ★ 投递入口：deliverMessage / deliverSignal（T20） ----------------
+
+  /**
+   * ★ **点对点**投递一条消息（`intermediateCatchEvent` / `receiveTask` 在等它）。
+   *
+   * BPMN 的消息语义是 **1:1**（一个消息只有一个接收者），故第一个参数是单个 `instanceId`。
+   * 要广播请用 {@link deliverSignal} —— 两者不是"同一件事的两种写法"，别合并。
+   *
+   * @throws `ENGINE_ACTION_TARGET_INVALID` —— 该实例**没有**在等这个名字（**绝不静默丢弃**：
+   *   名字差一个大小写就会变成"流程永久卡住、而宿主以为自己投过了"）
+   */
+  async function deliverMessage(instanceId: string, input: DeliverInput): Promise<TaskDelta> {
+    const outcome = await queue.run(instanceId, () => doDeliver(instanceId, 'message', input, 'throw'));
+    await followUp(outcome.next, outcome);
+    return outcome.delta;
+  }
+
+  /**
+   * ★ **广播**一个信号：唤醒 `instanceIds` 里**所有**正在等它的实例。
+   *
+   * ⚠️ **为什么必须由宿主给候选集**（而不是引擎自己去找订阅者）：
+   *   `StateStore` 的接口只有 `load(id)` / `save(next, rev)` —— **没有**查询接口，
+   *   这是刻意的（见 §3b：真相线只做单实例读写，查询能力归宿主的待办表 / 订阅表）。
+   *   引擎因此**不知道实例全集**，「谁在等 `Sig_x`」这件事只有宿主答得出来。
+   *
+   *   正确用法：宿主自己维护一张订阅表（`instance_id, signal`），
+   *   可以由 `EventSink` / 投影同步写入，也可以直接从 `InstanceState.tokens[].awaiting` 派生。
+   *
+   * @throws `ENGINE_ACTION_TARGET_INVALID` —— **一个都没命中**（完全无效果 = 静默丢弃，必须报出来）；
+   *   部分命中是**合法**的（BPMN 的信号不要求人人接收），未命中的实例被跳过。
+   * @throws 其余（实例不存在 / 终态 / 挂起）一律抛 —— 那些说明候选集本身给错了
+   */
+  async function deliverSignal(
+    instanceIds: readonly string[],
+    input: DeliverInput,
+  ): Promise<TaskDelta[]> {
+    assertDeliverInput(input);
+    if (!Array.isArray(instanceIds) || instanceIds.length === 0) {
+      throw optionInvalid('instanceIds', 'must be a non-empty array', instanceIds);
+    }
+
+    const deltas: TaskDelta[] = [];
+    const waiting: string[] = [];
+    for (const id of instanceIds) {
+      // 顺序执行（不并发）：广播的结果顺序 = 入参顺序，可重放、可断言
+      const outcome = await queue.run(id, () => doDeliver(id, 'signal', input, 'skip', waiting));
+      if (outcome === null) continue;
+      await followUp(outcome.next, outcome);
+      deltas.push(outcome.delta);
+    }
+
+    if (deltas.length === 0) {
+      throw deliverNoTarget(undefined, 'signal', input.name, waiting, {
+        candidates: [...instanceIds],
+      });
+    }
+    return deltas;
+  }
+
+  /**
+   * 一次投递的**受队列保护**的那一段（槽位 1~9，与 `doSubmit` 同构）。
+   *
+   * @param onMiss `'throw'`（消息：没命中就是错） / `'skip'`（信号：没命中是合法的，返回 `null`）
+   * @param waitingSink 收集各候选实例「此刻在等什么」—— 供广播全落空时的报错给**合法取值**
+   */
+  /** `doDeliver` 的结果形状（与 `submit()` 的返回值同构，故后续动作可以复用 `followUp`） */
+  type DeliverOutcome = AdvanceOutcome & { readonly delta: TaskDelta };
+
+  /** 点对点（消息）：没命中就抛 ⇒ 结果**一定**不是 `null` */
+  async function doDeliver(
+    instanceId: string,
+    kind: CatchKind,
+    input: DeliverInput,
+    onMiss: 'throw',
+  ): Promise<DeliverOutcome>;
+  /** 广播（信号）：没命中是合法的 ⇒ 返回 `null` 表示"这个实例不在等" */
+  async function doDeliver(
+    instanceId: string,
+    kind: CatchKind,
+    input: DeliverInput,
+    onMiss: 'skip',
+    waitingSink?: string[],
+  ): Promise<DeliverOutcome | null>;
+  async function doDeliver(
+    instanceId: string,
+    kind: CatchKind,
+    input: DeliverInput,
+    onMiss: 'throw' | 'skip',
+    waitingSink?: string[],
+  ): Promise<DeliverOutcome | null> {
+    assertDeliverInput(input);
+
+    // 槽位 1
+    const state = await store.load(instanceId);
+    if (state === null || state === undefined) throw stateNotFound(instanceId);
+
+    const actionName = kind === 'message' ? MESSAGE_DELIVER_ACTION : SIGNAL_DELIVER_ACTION;
+
+    /*
+     * INV-2（终态不再受理推进）/ INV-5（挂起 = 冻结，除 `resume` 外不受理）。
+     *
+     * ⚠️ 广播下这两类**跳过**而不是抛：候选集本质是「**可能**订阅者的一个超集」，
+     *   里面躺着刚跑完 / 被冻结的实例是**正常**的（订阅表总比状态滞后一拍）。
+     *   为了一行过期数据让整批广播失败，是拿可用性去换一条本来就不紧急的提示；
+     *   真正不能吞的是「**一个都没命中**」（下面由 `deliverNoTarget` 抛）。
+     */
+    if (isTerminalStatus(state.status) || state.status === 'suspended') {
+      if (onMiss === 'skip') return null;
+      if (isTerminalStatus(state.status)) {
+        throw stateTerminal(state.instanceId, state.status, actionName);
+      }
+      throw stateSuspended(state.instanceId, actionName);
+    }
+
+    const match: DeliverMatch = { kind, name: input.name };
+    const matches = matchingTokens(state, match);
+    if (matches.length === 0) {
+      const names = waitingNamesOf(state);
+      if (waitingSink !== undefined) for (const n of names) if (!waitingSink.includes(n)) waitingSink.push(n);
+      if (onMiss === 'skip') return null;
+      // ★「不得静默丢弃」的落点：一个都没命中 → 抛，并把此刻在等什么列给宿主
+      throw deliverNoTarget(instanceId, kind, input.name, names);
+    }
+
+    // 槽位 3（ADR-007）
+    const at = input.at ?? now();
+    // 槽位 2 的前置：图纸与图（INV-3 的判定点）
+    const graph = await graphOf(state);
+    assertTokensInGraph(state, graph);
+
+    const before = tasksOf(state, graph);
+    const record: ActionRecord = { name: actionName, actor: input.actor, at };
+    const ai: ActionInput = {
+      action: actionName,
+      actor: input.actor,
+      at,
+      // 审计要记「唤醒了哪儿」：多个命中时取第一个（保序，可重放）
+      target: (matches[0] as { nodeId: string }).nodeId,
+      ...(input.payload !== undefined ? { payload: input.payload } : {}),
+    };
+
+    const built = await buildApply({
+      state: withPayload(state, input.payload),
+      graph,
+      at,
+      record,
+      run: (s, ctx) => deliverStep(s, ctx, match),
+    });
+    const result = plan(state, ai, {
+      clock,
+      ...(maxAuditEntries !== undefined ? { maxAuditEntries } : {}),
+      apply: built.apply,
+      tasks: (s) => tasksOf(s, graph),
+    });
+
+    const hookCtx = freezeActionContext({
+      action: result.delta.action,
+      state: headerOf(state),
+      next: headerOf(result.next),
+      delta: result.delta,
+    });
+
+    // 槽位 5：门 1 前钩子 —— 可否决（典型用法：宿主做**投递幂等去重**）
+    if (hooks?.beforeAction !== undefined) {
+      const verdict = await hooks.beforeAction(hookCtx);
+      if (verdict === false) throw actionVetoed(actionName, instanceId);
+    }
+
+    // 槽位 6~8
+    await store.save(result.next, state.rev);
+    if (projection !== undefined) await projection.apply(instanceId, result.delta);
+    if (hooks?.afterAction !== undefined) await hooks.afterAction(hookCtx);
+
+    // 槽位 9
+    emitAll(
+      sink,
+      [
+        ...eventsOf({ before, delta: result.delta, next: result.next, previousStatus: state.status }),
         ...built.pendingEvents,
       ],
     );
@@ -790,7 +1038,13 @@ export function createEngine(config: EngineConfig): Engine {
     if (spec.tenantId !== undefined) base.tenantId = spec.tenantId;
 
     const record: ActionRecord = { name: 'start', actor: spec.starter, at };
-    const built = await buildApply({ state: base, calls: [], graph, at, record });
+    const built = await buildApply({
+      state: base,
+      graph,
+      at,
+      record,
+      run: (s, ctx) => step(s, ctx, { calls: [] }),
+    });
     const looped = built.apply(cloneState(base));
 
     const next: InstanceState = {
@@ -852,7 +1106,13 @@ export function createEngine(config: EngineConfig): Engine {
      * 探测用的基准状态 = **已放行**的父状态（`callReturnOf` 是纯函数，探测与真值跑同一份）。
      */
     const resumed = callReturnOf(parent, p, to);
-    const built = await buildApply({ state: resumed, calls: [], graph, at, record });
+    const built = await buildApply({
+      state: resumed,
+      graph,
+      at,
+      record,
+      run: (s, ctx) => step(s, ctx, { calls: [] }),
+    });
     const before = tasksOf(parent, graph);
     const result = plan(parent, { action: CALL_RETURN_ACTION, actor, at }, {
       clock,
@@ -940,6 +1200,8 @@ export function createEngine(config: EngineConfig): Engine {
   return {
     start,
     submit,
+    deliverMessage,
+    deliverSignal,
     plan: (state, action, options) =>
       plan(state, action, {
         clock,

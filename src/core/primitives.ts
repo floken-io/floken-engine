@@ -267,6 +267,9 @@ export function clearAssignment(t: Token): void {
   delete t.assignee;
   delete t.returnTo;
   delete t.createdAt;
+  // ★ T20：等待态同样是**节点级**属性 —— 换了节点，旧的"等什么"立即作废
+  //   （留着会让令牌在新节点上被判成稳定点而**永远推不动**）
+  delete t.awaiting;
 }
 
 const isLive = (t: Token): boolean => LIVE_TOKEN_STATES.includes(t.state);

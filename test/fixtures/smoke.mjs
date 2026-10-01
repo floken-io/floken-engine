@@ -1960,6 +1960,144 @@ await checkAsync('T19 · 绑定的版本被下线 → 抛 DEFINITION_MISSING（�
   eq(after.rev, 1, '失败后 rev 不得前移');
 });
 
+// ---------------- T20 · 投递入口 deliverMessage / deliverSignal ----------------
+
+const T20 = '2026-10-01T00:00:00.000Z';
+
+/** `Start_1 → Catch_1（等 Msg_paid）→ Task_1（u1）→ End_1` */
+const catchDefOf = (kind, name) =>
+  defOf(
+    'Process_1',
+    [
+      { id: 'Start_1', type: 'startEvent' },
+      {
+        id: 'Catch_1',
+        type: 'intermediateCatchEvent',
+        name: '等付款',
+        eventDefinition: kind === 'signal' ? { type: 'signal', signalRef: name } : { type: 'message', messageRef: name },
+      },
+      { id: 'Task_1', type: 'userTask', extension: userApprovalOf('u1') },
+      { id: 'End_1', type: 'endEvent' },
+    ],
+    [
+      { id: 'Flow_1', from: 'Start_1', to: 'Catch_1' },
+      { id: 'Flow_2', from: 'Catch_1', to: 'Task_1' },
+      { id: 'Flow_3', from: 'Task_1', to: 'End_1' },
+    ],
+  );
+
+const engineOn = (def, extra = {}) => {
+  const store = m.createMemoryStore();
+  const events = [];
+  const engine = m.createEngine({
+    definitionSource: { async getDefinition(pid, v) { return pid === 'Process_1' && v === 1 ? def : null; } },
+    store,
+    clock: () => T20,
+    events: { emit: (e) => void events.push(e.name) },
+    ...extra,
+  });
+  return { engine, store, events };
+};
+
+await checkAsync('T20 · ★ 令牌停在 `intermediateCatchEvent` 上等投递（不投递就绝不自己走过去）', async () => {
+  const { engine, store } = engineOn(catchDefOf('message', 'Msg_paid'));
+  const id = await engine.start('Process_1', { definitionVersion: 1, starter: 'u_0' });
+
+  const parked = await store.load(id);
+  eq(parked.status, 'running', '实例仍在跑（等待不算结束）');
+  eq(parked.tokens[0].nodeId, 'Catch_1', '令牌停在等待节点');
+  sameArray([parked.tokens[0].awaiting], [{ kind: 'message', name: 'Msg_paid' }], 'awaiting');
+
+  const delta = await engine.deliverMessage(id, { name: 'Msg_paid', actor: 'bank' });
+  eq(delta.instance.status, 'running', '唤醒后仍在跑（落到 Task_1）');
+  const after = await store.load(id);
+  eq(after.tokens[0].nodeId, 'Task_1', '唤醒后走到下一个节点');
+  eq(after.tokens[0].awaiting, undefined, '等待态已摘掉');
+  sameArray(delta.added.map((t) => t.nodeId), ['Task_1'], '产出一条待办');
+});
+
+await checkAsync('T20 · ★ 投递没命中 → 抛 ACTION_TARGET_INVALID 并给出「此刻在等什么」', async () => {
+  const { engine, store } = engineOn(catchDefOf('message', 'Msg_paid'));
+  const id = await engine.start('Process_1', { definitionVersion: 1, starter: 'u_0' });
+  const before = await store.load(id);
+
+  let err = null;
+  try {
+    await engine.deliverMessage(id, { name: 'msg_paid', actor: 'bank' }); // 差一个大小写
+  } catch (e) {
+    err = e;
+  }
+  eq(err?.code, 'ENGINE_ACTION_TARGET_INVALID', '错误码');
+  sameArray(err?.details?.waiting, ['message:Msg_paid'], 'details.waiting（合法取值）');
+
+  const after = await store.load(id);
+  eq(after.rev, before.rev, '失败投递不得推进 rev');
+  eq(after.tokens[0].nodeId, 'Catch_1', '失败投递不得留下半截状态');
+});
+
+await checkAsync('T20 · ★ `deliverSignal` 广播：两个实例各走各的图', async () => {
+  const { engine, store } = engineOn(catchDefOf('signal', 'Sig_go'));
+  const a = await engine.start('Process_1', { definitionVersion: 1, starter: 'u_0' });
+  const b = await engine.start('Process_1', { definitionVersion: 1, starter: 'u_0' });
+
+  const deltas = await engine.deliverSignal([a, b], { name: 'Sig_go', actor: 'erp' });
+  eq(deltas.length, 2, '两个 delta');
+  sameArray(deltas.map((d) => d.instance.instanceId), [a, b], '顺序 = 入参顺序（可重放）');
+  eq((await store.load(a)).tokens[0].nodeId, 'Task_1', 'a 被唤醒');
+  eq((await store.load(b)).tokens[0].nodeId, 'Task_1', 'b 被唤醒');
+
+  // 一个都没命中 → 抛（完全无效果 = 静默丢弃）
+  let err = null;
+  try {
+    await engine.deliverSignal([a], { name: 'Sig_other', actor: 'erp' });
+  } catch (e) {
+    err = e;
+  }
+  eq(err?.code, 'ENGINE_ACTION_TARGET_INVALID', '全落空 → 抛');
+});
+
+await checkAsync('T20 · ★ `intermediateThrowEvent` 显式抛（D-56 第二半：无对外消息出口）', async () => {
+  const def = defOf(
+    'Process_1',
+    [
+      { id: 'Start_1', type: 'startEvent' },
+      { id: 'Throw_1', type: 'intermediateThrowEvent', name: '通知' },
+      { id: 'End_1', type: 'endEvent' },
+    ],
+    [
+      { id: 'Flow_1', from: 'Start_1', to: 'Throw_1' },
+      { id: 'Flow_2', from: 'Throw_1', to: 'End_1' },
+    ],
+  );
+  const { engine } = engineOn(def);
+  let err = null;
+  try {
+    await engine.start('Process_1', { definitionVersion: 1, starter: 'u_0' });
+  } catch (e) {
+    err = e;
+  }
+  eq(err?.code, 'ENGINE_STATE_SHAPE_INVALID', '错误码');
+  eq(String(err?.details?.owner).includes('FR-E14'), true, 'owner 指向 FR-E14');
+});
+
+check('T20 · 公开面：投递所需的纯函数已导出，`wakeTokens` 未泄漏（它会让人"只摘等待态不离开节点"）', () => {
+  for (const k of [
+    'deliverStep',
+    'matchingTokens',
+    'waitingNamesOf',
+    'catchBindingOf',
+    'MESSAGE_DELIVER_ACTION',
+    'SIGNAL_DELIVER_ACTION',
+    'DELIVER_ACTIONS',
+  ]) {
+    const want = k === 'DELIVER_ACTIONS' ? 'object' : k.startsWith('MESSAGE') || k.startsWith('SIGNAL') ? 'string' : 'function';
+    eq(typeof m[k], want, `导出 ${k}`);
+  }
+  eq(m.MESSAGE_DELIVER_ACTION, 'deliverMessage', '消息动作名');
+  eq(m.SIGNAL_DELIVER_ACTION, 'deliverSignal', '信号动作名');
+  eq(m.wakeTokens, undefined, 'wakeTokens 不得导出（单独用会把令牌原地重新停车）');
+});
+
 // ---------------- 汇总 ----------------
 
 let failed = 0;

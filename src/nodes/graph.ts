@@ -13,9 +13,12 @@
  *
  * ⚠️ **T16 / T17 / T18 落地后的能力边界（诚实标注，勿含糊成"支持"）**：
  *   - 认得全部 **6 类事件 + 5 类网关 + 8 类任务**（分类与可达性见图适配层），但其中
- *     `intermediateCatchEvent` / `boundaryEvent` / `implicitThrowEvent` /
- *     `complexGateway` / `eventBasedGateway` / `sendTask` / `receiveTask` 一律**显式抛错**
+ *     `intermediateThrowEvent` / `boundaryEvent` / `implicitThrowEvent` /
+ *     `complexGateway` / `eventBasedGateway` / `sendTask` 一律**显式抛错**
  *     （分属 T20 / T21 / FR-E24 / FR-E17 / FR-E14）；
+ *   - ★ **T20 起 `intermediateCatchEvent` / `receiveTask` 可执行**：令牌停在它们上面
+ *     **等外部投递**（`deliverMessage` / `deliverSignal`）；但等 `timer` / `error` 之类
+ *     仍抛（归 T21），没写 `messageRef` / `signalRef` 也抛（等不到 = 永久卡死）；
  *   - **单出向的普通节点**（`userTask` 等）有多条 `sequenceFlow` → 仍抛 `D-22`
  *     （"隐式排他 / 隐式包容"没有规格依据，不发明）；多出向**只**在网关上被路由；
  *   - **T18 起内嵌子流程在建图时展开**（`nodes/activities.ts` 的 `expandSubProcesses`），
@@ -30,6 +33,8 @@ import type { Flow, FlowNode, NormalizedApproval, ProcessDefinition } from '@flo
 import { definitionMissing, stateShapeInvalid, tokenOrphan } from '../core/errors.js';
 import { callTargetOf, expandSubProcesses } from './activities.js';
 import type { CallTarget } from './activities.js';
+import { catchBindingOf } from './catch.js';
+import type { CatchBinding } from './catch.js';
 
 // ---------------- 引擎关心的节点分类 ----------------
 
@@ -159,6 +164,17 @@ export interface ProcessGraph {
    *   `nodes/activities.ts` 的 `callTargetOf`）。
    */
   callTargetOf(nodeId: string): CallTarget | undefined;
+  /**
+   * ★ 该节点在等什么（T20 · `intermediateCatchEvent` / `receiveTask`）。
+   *
+   * - 不是等待节点 → `undefined`；
+   * - 是等待节点但**没写名字**（缺 `messageRef` / `signalRef`）→ **抛**
+   *   （这样的节点永远等不到东西，放行 = 埋一个不报错的永久卡死）；
+   * - 是等待节点但等的是 `timer` / `error` 之类 → **抛**（归 T21）。
+   *
+   * ⚠️ 判据不在本档而在 `nodes/catch.ts`：等待语义**横跨**事件族与任务族。
+   */
+  catchOf(nodeId: string): CatchBinding | undefined;
 }
 
 /**
@@ -342,6 +358,8 @@ export function createProcessGraph(
     },
 
     callTargetOf: (nodeId) => callTargetOf(nodes.get(nodeId)),
+
+    catchOf: (nodeId) => catchBindingOf(nodes.get(nodeId)),
   };
 }
 

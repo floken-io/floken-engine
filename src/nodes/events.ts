@@ -12,14 +12,20 @@
  *   返回 `undefined` → `runtime/loop.ts` 会在**令牌到达**时抛「未知节点类型」，
  *   而不是静默当成自动节点直通 —— 静默直通会让"这个事件没实现"表现为"流程走过去了"。
  *
- * ⚠️ **能力边界（诚实标注）**：本档把 6 类分成「已实现」与「未实现但已知」两组，
+ * ⚠️ **能力边界（诚实标注）**：本档把「跑不了语义」的几类分成两组 ——
+ * ⚠️ **能力边界（诚实标注）**：本档把「跑不了语义」的几类分成两组 ——
+ *   「**能等**」（`intermediateCatchEvent` → T20 已落地）与「**未实现但已知**」，
  *   后者**显式抛错并指名归哪个 FR**，绝不静默降级成直通（那是最难查的一类假象）。
  *
  *   未实现的三类与归属：
- *     - `intermediateCatchEvent` → **FR-E14 / T20**（`deliverMessage` / `deliverSignal` 未落地，
- *       让它"等待"会造成**没有任何手段唤醒**的永久卡死，比抛错糟得多）；
- *     - `boundaryEvent`         → **FR-E13 / T21**（要 `attachedTo` + `cancelActivity` 与宿主活动的中断语义）；
- *     - `implicitThrowEvent`    → **FR-E24 / T18**（事件子流程内的隐式抛出，随子流程一并落地）。
+ *     - `intermediateThrowEvent` → **FR-E14 / T20**（**D-56 的第二半**）：它是「向**外**抛出」，
+ *       而引擎没有对外的消息出口（11 项 SPI 里没有 `MessageSink`），ADR-006 的事件集又定死 10 个；
+ *       静默直通的表现是「流程图上说这里发了一条消息，而它从来没发出去」；
+ *     - `boundaryEvent`      → **FR-E13 / T21**（要 `attachedTo` + `cancelActivity` 与宿主活动的中断语义）；
+ *     - `implicitThrowEvent` → **FR-E24 / T18**（事件子流程内的隐式抛出，随子流程一并落地）。
+ *
+ *   ⚠️ `intermediateCatchEvent` 只有 message / signal 两类**可投递**（其余如 `timer` 仍抛）——
+ *   判据在 `nodes/catch.ts`（横跨事件族与 `receiveTask`，放哪一族都会复制一份）。
  *
  * ★ 分层：`nodes/` 可 import `core/` 与模型层；**`core/` 不得反向 import 本目录**。
  */
@@ -49,12 +55,12 @@ export type EventType = (typeof EVENT_TYPES)[number];
  * 事件的执行语义。
  * - `'start'` —— 入口（`startEvent`）。令牌落在它上面时视同**自动直通**（驳回回发起节点后要自动走下去）。
  * - `'terminal'` —— 终点（`endEvent`）。令牌到达即该令牌完成。
- * - `'pass'` —— 自动直通（`intermediateThrowEvent`）。
- *   ⚠️ 严格说抛事件应当通告 `EventSink`，但 ADR-006 把事件集**定死 10 个**，其中没有"抛出事件"，
- *   故 T16 只直通；真正的抛出语义归 **T20**（届时须先给 ADR-006 补事件，不能偷偷加）。
+ * - `'catch'`  —— 等**外部投递**（`intermediateCatchEvent`，T20）。令牌停住、记下在等什么，
+ *   由 `deliverMessage()` / `deliverSignal()` 唤醒。**只有 message / signal 两类可投递**
+ *   （其余如 `timer` 在 `nodes/catch.ts` 里抛错并指名 T21）。
  * - `'unsupported'` —— 已知但**未实现**（见档首三行归属）。
  */
-export type EventBehavior = 'start' | 'terminal' | 'pass' | 'unsupported';
+export type EventBehavior = 'start' | 'terminal' | 'catch' | 'unsupported';
 
 /**
  * 该类型是不是事件族；是 → 返回它的执行语义；不是事件 → `undefined`。
@@ -65,9 +71,9 @@ export function eventBehaviorOf(type: string | undefined): EventBehavior | undef
       return 'start';
     case 'endEvent':
       return 'terminal';
-    case 'intermediateThrowEvent':
-      return 'pass';
     case 'intermediateCatchEvent':
+      return 'catch';
+    case 'intermediateThrowEvent':
     case 'boundaryEvent':
     case 'implicitThrowEvent':
       return 'unsupported';
@@ -85,9 +91,15 @@ export function isEventType(type: string | undefined): boolean {
 /**
  * 令牌到达了「已知但尚未实现」的事件 → **抛**，绝不静默直通。
  *
- * ★ 为什么必须抛而不是"当普通节点走下去"：这三类都是**等待 / 中断**语义，
- *   静默直通的表现是"流程办完了，但那个事件从来没发生过" —— 业务上无法接受，
- *   且排查时**没有任何报错**可循。抛出来至少是一条能照着修（或照着排期）的错误。
+ * ★ 为什么必须抛而不是"当普通节点走下去"：`intermediateThrowEvent` 的语义是
+ *   「**向外**发出一件事」（消息 / 信号 / 升级），而引擎没有对外的消息出口
+ *   （11 项 SPI 里没有 `MessageSink`），ADR-006 又把事件集定死 10 个、其中没有"抛出事件"。
+ *   放行它的表现是「流程图上写着这里发了一条消息，而它从来没发出去」——
+ *   业务上无法接受，且排查时**没有任何报错**可循。抛出来至少是一条能照着排期
+ *   （或照着申请改 ADR）的错误。
+ *
+ *   `boundaryEvent` / `implicitThrowEvent` 同理：它们都是**中断 / 抛出**语义，
+ *   静默直通会让"这个事件没发生过"变成一个不可观测的事实。
  */
 export function assertEventSupported(
   type: string,
@@ -96,7 +108,7 @@ export function assertEventSupported(
 ): void {
   if (behavior !== 'unsupported') return;
   const owner: Record<string, string> = {
-    intermediateCatchEvent: 'FR-E14 / T20（deliverMessage / deliverSignal）',
+    intermediateThrowEvent: 'FR-E14 / T20（向外抛出：无 MessageSink 出口，须先改 ADR-006 事件集）',
     boundaryEvent: 'FR-E13 / T21（边界事件与补偿）',
     implicitThrowEvent: 'FR-E24 / T18（事件子流程内的隐式抛出）',
   };

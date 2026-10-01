@@ -295,17 +295,26 @@ interface InstanceParent {
 
 type InstanceState = InstanceStateHeader & InstanceStateBody;
 
+interface TokenAwait {                   // ★ T20：正在等外部世界（**不是** `state:'waiting'`）
+  kind: 'message' | 'signal';            //   message = 点对点；signal = 广播
+  name: string;                          //   messageRef / signalRef
+}
+
 interface Token {
   id: string; nodeId: string;
   state: 'active' | 'waiting' | 'completed' | 'cancelled';
   assignee?: string;                     // 分配层解析后的结果
   instanceGroup?: string;                // 同节点多实例归组（会签用）
   returnTo?: string;                     // 委派时的回归目标
+  awaiting?: TokenAwait;                 // ★ T20：等外部投递（有它 = 稳定点，见 INV-20）
+  vote?: 'approved' | 'rejected';        // 组内表态（`state` 管在不在途，本字段管投了什么）
+  createdAt?: string;                    // 落到等待节点的时刻（超时判定的输入）
+  branch?: string;                       // 并行分支标记（D-47 / D-53）
 }
 
 interface AuditEntry {
   seq: number; at: string;
-  actor: string; action: string;         // 19 项动作名 或 内核原语名
+  actor: string; action: string;         // 19 项动作名 / 'start' / 'callActivityReturn' / 'deliverMessage' / 'deliverSignal'
   nodeId?: string; tokenId?: string;
   from?: string; to?: string;            // 前后状态
   payload?: Record<string, unknown>;     // 意见、表单增量等
@@ -389,6 +398,7 @@ interface ConvergeCtx {
 | INV-17 | `auditTrail.length ≤ maxAuditEntries`（配置后）；溢出部分走 `EventSink`，**不得静默丢弃** | 每次追加后 | `runtime/plan.ts` | 上限测试 + 溢出可见性断言 |
 | INV-18 | `pendingProjectionRev` 存在 ⟺ 该 `rev` 的投影尚未追平；`load()` 发现该键 → **必须先 `sync()` 补做**，完成后删除键 | `load()` 时 | `runtime/engine.ts` | 补偿路径测试（模拟 apply 失败） |
 | INV-19 | 实例的 `definitionVersion` **终身不变**（改版只影响之后发起的实例；`AC-E10`）。`null` 版本（`getDefinition` 取不到）= `ENGINE_STATE_DEFINITION_MISSING`，**绝不回退**到别版 | 每次 `plan()` 后 / 每次取图 | `runtime/plan.ts`（守卫：`options.apply` 不得改 `definitionVersion`）+ `runtime/engine.ts`（`graphOf`） | `AC-E10` + 「改版后在途仍走旧图」「绑定版被下线 → 抛错」✅ **T19 已验** |
+| INV-20 | `Token.awaiting` 存在 ⟺ 该令牌**停在等待节点上等外部投递**；投递唤醒 = 摘掉 `awaiting` **并离开该节点**（`leaveWait`）。唤醒前令牌不得自己走过去；唤醒后不得被原地重新停车 | 每次 `run-to-wait` / 每次投递 | `nodes/catch.ts`（`catchBindingOf`）+ `runtime/loop.ts`（`parkCatch` / 停车判定）+ `runtime/deliver.ts`（`leaveWait`） | 「不投递再跑一次推进，令牌纹丝不动」+「唤醒后走到下一节点」两向断言 ✅ **T20 已验** |
 
 ### 6.5 设计期数据约束（静态配置）
 
@@ -466,9 +476,27 @@ interface ActionInput {
 **`submit()` 与 `plan()` 的关系（写死）**：`submit()` = `load → gate → plan → beforeAction → save → apply → afterAction → emit` 的便利封装；
 `plan()` 是其中**唯一含状态演化逻辑**的那一步，且必须是纯的。**两条路径的状态演化必须完全一致**（不许出现"走 submit 和走 plan 得到不同 next"）。
 
-> **T11 已落地 `start` / `submit` / `plan`；T12 已补齐九个槽位中的 ⑤⑧⑨**（2026-10-01）。
-> `deliverMessage` / `deliverSignal`（T20）与 `exportTrace`（T22）尚未实现 ——
-> 公开的 `Engine` 接口**刻意不提前声明**它们（声明了就得给实现）。
+```ts
+// —— T20：投递入口（**不是** 19 项审批动作，故不共用 `ActionInput`） ——
+interface DeliverInput {
+  name: string;                          // messageRef / signalRef，**逐字**匹配
+  actor: string;                         // 谁投的（外部系统写系统名，如 'bank-callback'）
+  payload?: Record<string, unknown>;     // 消息带来的数据 → 并入 variables
+  at?: string;                           // ADR-007
+}
+/** 点对点：BPMN 消息语义是 1:1 */
+deliverMessage(instanceId: string, input: DeliverInput): Promise<TaskDelta>;
+/** 广播：唤醒候选集里**所有**在等的实例。⚠️ 候选集由宿主给（D-71） */
+deliverSignal(instanceIds: readonly string[], input: DeliverInput): Promise<TaskDelta[]>;
+```
+
+> **T11 已落地 `start` / `submit` / `plan`；T12 已补齐九个槽位中的 ⑤⑧⑨；T20 已落地 `deliverMessage` / `deliverSignal`。**
+> `exportTrace`（T22）尚未实现 —— 公开的 `Engine` 接口**刻意不提前声明**它（声明了就得给实现）。
+
+> **★ 投递与提交的九槽位同构**（T20 的落点）：两者都走 `queue.run()` 串行、都经 `plan()` 的
+> `apply` 接缝、都触发门 1 钩子。差别只有两处：① 纯执行段是 `deliverStep()`（匹配 → 唤醒 →
+> run-to-wait）而不是 `step()`（原语 → 记票 → 汇聚 → run-to-wait）；② 审计里的动作名是
+> **第四类**（`deliverMessage` / `deliverSignal`，见 D-62）。
 
 ### 7.2 11 项 SPI（与业务的全部接触面）
 
@@ -1006,7 +1034,8 @@ class EngineError extends Error {
   把 `rev` CAS 当主防线用是设计错误，见 ADR-004）。
 
   ⚠️ **能力边界（诚实标注）**：多出向路由（D-22）/ 原语级审计（D-23）
-  / `deliver*`（T20）与 `exportTrace`（T22）均未实现 —— 全部表现为**显式抛错**而非静默降级。
+  / `exportTrace`（T22）未实现 —— 全部表现为**显式抛错**而非静默降级。
+  （★ `deliver*` 已随 **T20** 落地，见 T20 那一行。）
 
 - [x] **T12 事件发射（节点级 5 + 实例级 5）与门 1 钩子**
   组件：`runtime/emit.ts` / `core/hooks.ts`
@@ -1111,10 +1140,11 @@ class EngineError extends Error {
   **⑤ `Token.branch` 收口 D-47**：并行分叉写入、合流清除；`rollbackTo` 据此把"撤销下游"
   收缩到**本分支**（按**相等**判定，不用前缀匹配 —— 否则嵌套并行会把兄弟分支算进来）。
 
-  ⚠️ **能力边界（诚实标注）**：`intermediateCatchEvent` / `boundaryEvent` / `implicitThrowEvent` /
-  `complexGateway` / `eventBasedGateway` 五类**显式抛错**并指名归属 FR（T20 / T21 / FR-E24 / FR-E17 / FR-E14）；
+  ⚠️ **能力边界（诚实标注）**：`boundaryEvent` / `implicitThrowEvent` /
+  `complexGateway` / `eventBasedGateway` 四类**显式抛错**并指名归属 FR（T21 / FR-E24 / FR-E17 / FR-E14）；
+  ★ **`intermediateCatchEvent` 已随 T20 落地**（只认 message / signal；等 `timer` / `error` 仍抛，归 T21）；
   **普通节点**多出向仍抛（D-22：隐式排他 / 隐式包容无规格依据）；
-  `endEvent` 的 `eventDefinition`（terminate / message）尚未区分，随 T20 / T21 落地。
+  `endEvent` 的 `eventDefinition`（terminate / message）尚未区分，随 T21 落地。
 
 - [x] **T17 任务 8 类 + 连线与数据 4 类** ✅ 2026-10-01
   组件：`nodes/tasks.ts` / `nodes/flows.ts` + `eval/script.ts` + `runtime/{loop,engine}.ts`（副作用接线）
@@ -1138,17 +1168,19 @@ class EngineError extends Error {
   `variables`。不带的后果是「`scriptTask` 把 `amount` 改成 9000、网关却按旧值走分支」——
   §7.2 要防的头号事故换了一副面孔出现。探针与单测各有一条端到端断言钉住它。
 
-  **③ `sendTask` 与 `intermediateThrowEvent` 同处置：显式抛错（D-56）**：`03` 自己写明二者同构，
-  而后者在 T16 就是因为 **ADR-006 把事件集定死 10 个、其中没有"抛出事件"** 才推迟的。
+  **③ `sendTask` 与 `intermediateThrowEvent` 同处置：显式抛错（D-56，第二半随 T20 收口 → D-72）**：
+  `03` 自己写明二者同构，而后者在 T16 就是因为 **ADR-006 把事件集定死 10 个、其中没有"抛出事件"** 才推迟的。
   只剩两条路可走：偷偷加第 11 个事件（须先改 ADR，不能靠代码），或复用
   `taskCreated`+`taskCompleted`（⇒ 与 `manualTask` **完全同形**，把两条规格写明的语义静默合并成一条）。
   两条都不接受 ⇒ 抛错并指名 FR-E14 / T20。
+  ⚠️ T17 时只在 `sendTask` 一侧落地（`intermediateThrowEvent` 仍 `'pass'`），记录与实现对不上；
+  **T20 已把第二半补齐**（`eventBehaviorOf` → `'unsupported'`）。要真正支持抛出须先改 ADR-006 并新增 SPI。
 
   **④ 连线的语义收口在 `nodes/flows.ts`（D-52 的落点）**：`flowPasses()` 是「这条流通不通」的
   **唯一口径**（无条件恒真且不进求值器），`nodes/gateways.ts` 改为复用它 —— 此前网关里那份
   `taken()` 是同一判定的第二份写法，必然漂移。
 
-  ⚠️ **能力边界（诚实标注）**：`receiveTask`（等消息）随 **T20** 的 `deliverMessage` 落地；
+  ⚠️ **能力边界（诚实标注）**：★ `receiveTask` 已随 **T20** 落地（等消息，判据在 `nodes/catch.ts`）；
   `serviceTask` 的**失败重试属内核外**（D-58，与超时 / 暂存同族 —— 内核内重试会让 `plan()` 不纯
   且放大副作用），由宿主在 handler 内或经 `Scheduler` 自行实现。
 
@@ -1195,11 +1227,30 @@ class EngineError extends Error {
 
 ### 阶段 E8 · 边界事件 / 补偿 / 事件驱动（v1.x）
 
-- [ ] **T20 投递入口 `deliverMessage` / `deliverSignal`**
-  组件：`runtime/deliver.ts`
+- [x] **T20 投递入口 `deliverMessage` / `deliverSignal`** ✅ 2026-10-01
+  组件：`nodes/catch.ts`（等待语义）+ `runtime/deliver.ts`（纯执行段）+ `runtime/engine.ts`（九槽位）
   依赖：T18
-  验证：`IntermediateCatchEvent` 等待中被 `deliverMessage` 唤醒；`deliverSignal` 广播唤醒多实例（返回 `TaskDelta[]`）；
-  投递到**不存在的等待** → 抛错（不静默丢弃）
+  验证：`IntermediateCatchEvent` 等待中被 `deliverMessage` 唤醒 ✅；`deliverSignal` 广播唤醒多实例（返回 `TaskDelta[]`）✅；
+  投递到**不存在的等待** → 抛错（不静默丢弃）✅
+
+  **实现要点**：
+  ① **等待语义横跨两个节点族**（`intermediateCatchEvent` 属事件族、`receiveTask` 属任务族），
+     故判据单开 `nodes/catch.ts` —— 放哪一族都会长出第二份「怎么取名 / 怎么匹配 / 怎么唤醒」。
+  ② **`Token.awaiting`**（`{kind, name}`）是第三类稳定点的标记：有它的令牌 `run-to-wait` 一律停住。
+     ⚠️ 判据**必须**看字段而不是"节点类型是 catch" —— 否则唤醒后会被**原地重新停车**（D-73）。
+  ③ ★ **唤醒 = 摘等待态 + 离开等待节点**（`leaveWait`，与 `callReturnOf()` 同形态）：
+     只摘等待态就把令牌交给 `runToWait()`，它会因为"这是 catch 节点"再停一次 ——
+     表现为「投递返回了差分、状态也写了，但令牌一动没动」，且**没有任何报错**。
+  ④ **投递必须精确匹配 `(kind, name)`，未命中即抛**（`ACTION_TARGET_INVALID`，**不新增第 20 个码** —— D-74），
+     且 `details.waiting` 列出「此刻在等什么」（给**合法取值**，否则 `Msg_paid` vs `msg_paid` 无从修起）。
+  ⑤ ★ **广播的候选集由宿主给**（D-71）：`StateStore` 只有 `load` / `save`，**没有**查询接口
+     （§3b 刻意为之），引擎不知道实例全集 —— 「谁在等 `Sig_x`」只有宿主的订阅表答得出来。
+     未命中的候选**跳过**（BPMN 信号不要求人人接收），但**一个都没命中 → 抛**（完全无效果 = 静默丢弃）。
+  ⑥ **抛出侧仍不实现**：`intermediateThrowEvent` 与 `sendTask` 同处置 → 显式抛错（**D-56 的第二半**，D-72）。
+     理由：引擎没有对外的消息出口（11 项 SPI 里没有 `MessageSink`），ADR-006 又把事件集定死 10 个；
+     要落地须**先改 ADR-006 并新增 SPI**，不能在代码里偷加。
+  ⑦ `buildApply()` 的入参从 `stepInput` 改为 **`run`（纯执行段接缝）**：探测跑与真值跑由此
+     **共用同一段代码**，「探测问错落点」从结构上不可能发生（D-76）。
 
 - [ ] **T21 边界事件 / 补偿 / `EventBasedGateway`**
   组件：`nodes/events.ts` / `nodes/activities.ts`
@@ -1236,6 +1287,7 @@ class EngineError extends Error {
 | 2026-09-30 | **T9 落地**：`actions/{catalog,compile,gates}.ts` —— 19 项动作映射表（20 个可提交名字）、设计期开关校验（DV-2/3/5、AC-E2/E15）；与 `03` §4 主表**逐字对账**；公开面只导出动作名与 `enabledActionNames` | §5 / §9 / §10 | T9 / D-18 | `verify` PASSED + 探针 **29/29** + **274 单测** + `src+test` 类型检查 0 err（本轮 D-13 抓出 5 处写错的码名） |
 | 2026-10-01 | **T16 落地**：`nodes/events.ts`（事件 6 类）+ `nodes/gateways.ts`（网关 5 类）+ `runtime/loop.ts` 的分叉 / 汇聚 + `runtime/engine.ts` 的条件接线；**D-49** 汇聚判据改为图可达性（包容网关不再死锁）、**D-50** 合流必须在推进之前、**D-51** 条件走惰性解析 + `ConditionUnresolved` 哨兵重跑、**D-53** `Token.branch` 收口 **D-47**（并行下 `rollbackTo` 只撤本分支）、**D-55** `payload` 在探测之前并入；**482 单测** + 探针 **60/60** | §5 / §9 / §10 | T16 / D-42 / D-47 / D-48~D-55 | `verify` PASSED + 两个 project 类型检查 0 err |
 | 2026-10-01 | **T19 落地**：`DefinitionSource` 版本语义与在途实例绑定（`AC-E10`）。`core/spi.ts` 把版本语义写成四条硬约定（版本精确 / 不存在 = `null` **绝不回退** / 不得改内容 / 异常入参返回 `null`）；新增 **INV-19** + 在 `plan()` 的 `apply` 接缝落守卫（★ 放这里是因 `plan()` 为两条路径唯一演化入口，一条守卫护住 `submit()` 与门 2）；新增 `conformance/definition.ts`（`runDefinitionConformance`，7 条判据，头号目标是「忽略 `version` 参数」；三套里唯一要宿主交 `fixtures` —— 定义是业务资产、套件造不出来）；反向验收补「不看 version」「取不到就抛」两个坏实现并断言**点名**抓到。端到端用「v1 两段审批 / v2 中间插入 `Task_new`」做观测点：改版后在途仍走 `Task_b`、绑定版下线 → `DEFINITION_MISSING` 且不留下半截状态。顺手修 `expectCodeAsync` 误传 thunk 时断言静默失效（D-70）。**591 单测** + 探针 **77/77** | §6.4 / §7.2 / §9 / §10 | T19 / INV-19 / D-67~D-70 | `verify` PASSED + 两个 project 类型检查 0 err |
+| 2026-10-01 | **T20 落地**：投递入口 `deliverMessage`（点对点）/ `deliverSignal`（广播）。等待语义单开 `nodes/catch.ts`（**横跨事件族与任务族**：`intermediateCatchEvent` + `receiveTask`，放哪一族都会长出第二份「怎么取名 / 怎么匹配 / 怎么唤醒」）；新增 `Token.awaiting` + **INV-20**（第三类稳定点：不投递绝不自己走过去）；★ **唤醒 = 摘等待态 + 离开等待节点**（只摘会被 `runToWait` 原地重新停车，D-73）；纯执行段 `runtime/deliver.ts` 的 `deliverStep()` 公开给门 2；`buildApply()` 入参改为 `run`（探测跑与真值跑共用同一段代码，D-76）；投递未命中 → `ACTION_TARGET_INVALID` 且 `details.waiting` 给合法取值（**不新增第 20 个码**，D-74）；广播候选集归宿主（`StateStore` 无查询接口，D-71），未命中跳过、**全落空才抛**；★ 收口 **D-56 的第二半**：`intermediateThrowEvent` 与 `sendTask` 同处置 → 显式抛错（无 `MessageSink` 出口，D-72）。**625 单测** + 探针 **82/82** | §6.4 / §7.1 / §9 / §10 | T20 / INV-20 / D-71~D-76 | `verify` PASSED + 两个 project 类型检查 0 err |
 | 2026-10-01 | **T18 落地**：`nodes/activities.ts`（活动 / 子流程 4 类）+ `nodes/graph.ts` 接入内嵌展开 + `runtime/engine.ts` 的子实例链路。内嵌子流程**在建图时拍平**（内嵌 `endEvent` → `subProcessExit`，否则令牌会被判终结、出口后的节点永远走不到）；`CallActivity` = **子实例 + 等待 + 自动回归**（子实例 id 确定性、父令牌 `waiting`、子实例终态唤醒父实例、父实例终态连坐终止子实例）；★ 后续动作一律放在 `queue.run()` **之外**（否则「子实例一建就跑完 → 回头唤醒父实例」= 自锁）；版本绑定读 `extension['floken:call'].version`，**缺即抛**（INV-16）；`AdHocSubProcess` / `Transaction` / 事件子流程显式抛并指名 FR-E18 / FR-E13 / FR-E24。另补 **AC-E1 巡检**（20 个可提交名逐个不得抛 `ACTION_UNKNOWN` + 反证）；**572 单测** + 探针 **73/73** | §5 / §6.1 / §7.1 / §9 / §10 | T18 / INV-16 / D-62~D-66 | `verify` PASSED + 两个 project 类型检查 0 err |
 | 2026-10-01 | **T17 落地**：`nodes/tasks.ts`（任务 8 类）+ `nodes/flows.ts`（连线与数据 4 类）+ `eval/script.ts`（FEEL 脚本求值）+ 副作用接线（`LoopContext.effectsOf` + `NodeEffectUnresolved` 哨兵重跑）；**D-56** `sendTask` 与 `intermediateThrowEvent` 同处置（显式抛错，ADR-006 事件集定死 10 个）、**D-57** 非 FEEL 脚本先查 `handlers` 表、**D-58** 服务重试归内核外、**D-59** FEEL 结果落 `variables[nodeId]`、**D-60** 副作用按 `${nodeId}::${tokenId}` 缓存且条件取「此刻」变量快照、**D-61** 源码扫描必须去注释；**538 单测** + 探针 **69/69** | §5 / §7.3 / §9 / §10 | T17 / D-52 / D-56~D-61 | `verify` PASSED + 两个 project 类型检查 0 err（产物层双层扫描：无 `new Function` / `node:vm` / `eval(`） |
 | 2026-10-01 | **D-21 / D-31 在模型层修根因**：`floken-moddle` 的 `shouldTerminate()` 重排规则序（先按 `mode` 判，`pending === 0` 的多数决兜底只对票签生效）；引擎侧 `convergence.ts` 的 `mode:'all' && rejected>0` 短路**整块删除**，对账测试取消例外格改为逐格全一致（>300 组）；**482 单测** + 探针 **60/60** | §5 / §9 / §10 | D-19 / D-21 / D-31 | `verify` PASSED + 两个 project 类型检查 0 err（moddle 侧 299 单测全绿 + dist 已重建同步） |
@@ -1320,3 +1372,9 @@ class EngineError extends Error {
 | **D-68** ⚠️ | **INV-19 的守卫放在 `plan()` 的 `apply` 接缝里**（不是 `engine.ts`） | `plan()` 是 `submit()` 与门 2 自编排的**唯一**演化入口 —— 放这里**一条守卫同时护住两条路**；放 `engine.ts` 则门 2 完全裸奔，而「两条路径不得分叉」正是 §7.1 写死的东西。与同处已有的 `rev` 守卫（INV-1）完全同位 | ✅ 已落地（`runtime/plan.ts`：`next.definitionVersion !== state.definitionVersion` → `STATE_SHAPE_INVALID`）。反证用例：同版本提交照常通过（防守卫变成"永远抛错"） |
 | **D-69** | **`DefinitionSource` 契约套件必须由宿主交 `fixtures`**（三套里唯一） | `StateStore` 的用例能自己造假状态（状态是引擎的数据），但**定义是业务资产** —— 随包发布的套件不可能知道宿主库里有哪些流程。硬要自造就得给套件内置"示例流程"，那等于给引擎塞业务资产并背上 semver 约束（与 `test/helpers/definition.ts` 刻意不放进 `src/` 同一条理由） | ✅ 已落地（`runDefinitionConformance(source, fixtures, options)`；与 `TaskProjection` 要交 `readback` 同理）。套件**第一条用例就是 `fixtures` 自检**：同 pid 须 ≥2 个版本且内容互不相同，否则「忽略 version」根本无法被观测 |
 | **D-70** | **`expectCodeAsync` 必须拒收非 Promise**（误传 thunk 会让断言静默失效） | 原签名只收 Promise。误传 `() => engine.start(...)` 时 `await` 一个函数**正常返回**，于是「应当抛错」的断言**永远通过却什么都没验** —— 而这个助手存在的唯一意义就是防假断言（`toThrow(码名)` 匹配不上 message 却也不报错，详见它自己的档首）。T19 写测试时踩到 | ✅ 已落地（`test/helpers/expect.ts`：接受 Promise 与 thunk 两种，形状不对就 `throw TypeError`） |
+| **D-71** ⚠️ | **信号广播的候选集必须由宿主给**（`deliverSignal(instanceIds, …)`） | `StateStore` 只有 `load(id)` / `save(next, rev)`，**没有**查询接口 —— 这是刻意的（§3b：真相线只做单实例读写，查询能力归宿主的待办表 / 订阅表）。引擎因此**不知道实例全集**，「谁在等 `Sig_x`」只有宿主答得出来。给 `StateStore` 加一个 `findWaiting()` 等于把它从"存储抽象"变成"查询引擎"，且会让 `runStoreConformance` 的契约面被迫扩张 | ✅ 已落地。宿主订阅表可由 `EventSink` / 投影同步写入，或直接从 `InstanceState.tokens[].awaiting` 派生（`matchingTokens()` 已公开，判据只有一份） |
+| **D-72** ⚠️ | **`intermediateThrowEvent` 与 `sendTask` 同处置 → 显式抛错**（D-56 的**第二半**） | D-56 已判 `sendTask` 抛错，但 `intermediateThrowEvent` 一直还是 `'pass'` —— 记录与实现对不上。T20 收口：`03` §6 写明二者同构，而抛出侧需要「对外的消息出口」，11 项 SPI 里**没有** `MessageSink`，ADR-006 又定死 10 个事件。留下的两条路（偷偷加事件 / 复用 `manualTask` 那两条）D-56 都已否决 ⇒ 抛错并指名归属 | ✅ 已落地（`eventBehaviorOf` → `'unsupported'`，`owner` = FR-E14 / T20）。⚠️ **要真正支持抛出须先改 ADR-006 并新增 SPI**，不是代码能决定的 |
+| **D-73** ⚠️ | **唤醒 = 摘掉 `Token.awaiting` + 离开等待节点**（两件事必须一起做） | 只摘等待态就把令牌交给 `runToWait()`：它会因为「这是 catch 节点」**再停一次** —— 症状是「投递返回了差分、状态也落库了，令牌却一动没动」，而**没有任何报错**。唤醒的语义本来就是「**离开**等待节点」（与 `callReturnOf()` 放行 `callActivity` 上的令牌同形态） | ✅ 已落地（`runtime/deliver.ts` 的 `leaveWait()`：`wakeTokens` → `markCompleted` → 换节点 → `clearAssignment`）。反向断言：不投递时再跑一次推进，令牌纹丝不动 |
+| **D-74** | **投递没命中复用 `ACTION_TARGET_INVALID`**（**不新增第 20 个错误码**） | 错误码是稳定契约（`AGENTS.md` §5），每加一个都要全量回写。投递失败的本质就是「**目标**不存在」—— 与驳回目标非法同类，差别只在 `details` 形状（`waiting` = 此刻在等什么，即**合法取值**） | ✅ 已落地（`core/errors.ts` 的 `deliverNoTarget()`）。⚠️ 抛出码仍是 **19 个**，报数时别说 20 |
+| **D-75** | **广播下「终态 / 挂起」的候选跳过而非抛**（点对点则严格抛） | 候选集本质是「**可能**订阅者的一个**超集**」，里面躺着刚跑完 / 被冻结的实例是**正常**的（订阅表总比状态滞后一拍）。为一行过期数据让整批广播失败，是拿可用性换一条本来就不紧急的提示；真正不能吞的是「**一个都没命中**」 | ✅ 已落地（`doDeliver` 的 `onMiss:'skip'`：终态 / 挂起 / 不在等 → 跳过；点对点 `onMiss:'throw'` 仍按 INV-2 / INV-5 抛） |
+| **D-76** | **`buildApply()` 的入参是 `run`（纯执行段）而不是 `stepInput`** | 投递的纯执行段是 `deliverStep()` 而非 `step()`。若继续传 `stepInput`，就得给 `buildApply` 加一堆「投递用不到的可选参数」或复制一份重试循环。改成传**执行段本身**，探测跑与真值跑由此**共用同一段代码**，「探测问错落点」从结构上不可能发生 | ✅ 已落地（`runtime/engine.ts`：调用方闭包 `run: (s, ctx) => step(s, ctx, stepInput)` / `run: (s, ctx) => deliverStep(s, ctx, match)`） |

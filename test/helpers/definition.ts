@@ -45,6 +45,17 @@ export interface TestNode {
   /** `calledElement`（`callActivity`：被调用流程的 processId） */
   calledElement?: string;
   /**
+   * T20：`messageRef`（`receiveTask` 等消息的名字）。
+   * 缺它 → `catchBindingOf()` 抛（等不到 = 永久卡死，引擎不放行）。
+   */
+  messageRef?: string;
+  /**
+   * T20：`eventDefinition`（各类事件的事件定义）。
+   * 常用两种：`{type:'message', messageRef:'Msg_x'}` / `{type:'signal', signalRef:'Sig_x'}`；
+   * 给 `{type:'timer'}` 之类 → 抛（归 T21）。
+   */
+  eventDefinition?: Record<string, unknown>;
+  /**
    * `floken:call` 扩展（`callActivity` 的**版本绑定**，INV-16）。
    * 缺它 → 建图 / 推进时抛（引擎**不**替宿主取最新版）。
    */
@@ -76,6 +87,8 @@ function buildNodes(list: readonly TestNode[]): FlowNode[] {
     if (n.operationRef !== undefined) node.operationRef = n.operationRef;
     if (n.triggeredByEvent !== undefined) node.triggeredByEvent = n.triggeredByEvent;
     if (n.calledElement !== undefined) node.calledElement = n.calledElement;
+    if (n.messageRef !== undefined) node.messageRef = n.messageRef;
+    if (n.eventDefinition !== undefined) node.eventDefinition = n.eventDefinition;
     if (n.nodes !== undefined) node.nodes = buildNodes(n.nodes);
     if (n.flows !== undefined) node.flows = buildFlows(n.flows);
     return node as unknown as FlowNode;
