@@ -123,8 +123,18 @@ describe('AC-E13 · 零配置跑通「报销」（start → approve → approve�
     expect(s?.businessKey).toBe('EXP-1');
     expect(s?.variables).toEqual({ amount: 1200 });
     expect(s?.rev).toBe(1); // INSERT 后由存储层归一化
+    // ★ T22（D-88）：发起这条也带轨迹三件套 —— 它是 `exportTrace()` 的第一行
     expect(s?.auditTrail).toEqual([
-      { seq: 1, at: T0, actor: 'u_applicant', action: 'start', nodeId: 'Start_1' },
+      {
+        seq: 1,
+        at: T0,
+        actor: 'u_applicant',
+        action: 'start',
+        nodeId: 'Start_1',
+        tokenId: 'tk_start',
+        from: 'Start_1',
+        to: 'Task_apply',
+      },
     ]);
     expect(s?.lastAction).toEqual({ name: 'start', actor: 'u_applicant', at: T0 });
   });

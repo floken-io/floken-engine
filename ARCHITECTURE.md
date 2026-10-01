@@ -359,8 +359,19 @@ interface TaskDelta {
 
 interface TraceEntry {                   // exportTrace() 的返回元素，派生自 auditTrail
   seq: number; at: string; actor: string; action: string;
-  nodeId?: string; from?: string; to?: string;
-  kind: 'action' | 'primitive';          // 区分「审批动作」与「内核原语」
+  /** ★ T22/**D-87**：判据是「是不是 19 项审批动作之一」，不是"谁发起的" */
+  kind: 'approval' | 'system';
+  nodeId?: string; tokenId?: string;
+  from?: string; to?: string;            // ★ T22/**D-88**：由 plan() 填（before/after 只有它同时握着）
+  payload?: Record<string, unknown>;
+}
+
+/** ★ T22：`exportTrace()` / `traceOf()` 的返回值（**不是**裸数组） */
+interface TraceResult {
+  entries: TraceEntry[];                 // 与 auditTrail 一一对应、同序
+  truncated: boolean;                    // ★ INV-17 的另一半：被裁剪过必须看得出来
+  droppedFromSeq?: number;               // 被丢掉的最旧 seq
+  droppedToSeq?: number;                 // 被丢掉的最新 seq
 }
 ```
 
@@ -408,6 +419,7 @@ interface ConvergeCtx {
 | INV-21 | **边界事件不持有令牌**：它「武装」⟺ 宿主活动上有在途令牌（含其内嵌作用域）；触发后宿主（中断时）与其作用域内**全部**在途令牌退场，并**另起一条**令牌走边界出向。⚠️ 因此命中集合必须**两个来源求并**（`matchingTokens` + `armedBoundaries`），只看 `Token.awaiting` 会把边界事件整个漏掉 | 每次投递 / 每次建图 | `nodes/boundary.ts`（`boundaryBindingOf` / `armedBoundaries` / `cancelTargetsOf`）+ `nodes/graph.ts`（`boundaryOf`，向上走内嵌作用域） | 「点对点命中等待令牌时不触发边界」「图里只有边界事件时仍能命中」「`details.waiting` 列出 `boundary:*`」✅ **T21 已验** |
 | INV-22 | 同一 `Token.race` 内**至多一个赢家**：`EventBasedGateway` 分叉出的等待令牌共享 `race`，先被唤醒者赢、其余**取消**；赢家离开等待节点后即**退出**竞速（`race` 被清除） | 竞速分叉后至赢家离开前 | `runtime/loop.ts`（EBG 分叉写 `race`）+ `runtime/deliver.ts`（`pickRaceWinners` / `resolveRace`） | 「投递 A → B 分支 `cancelled`」+「反过来同样成立」+「赢家 `race === undefined`」✅ **T21 已验** |
 | INV-23 | **内核不定时**：它只产出「该排什么 / 该取消什么」的**意图**（`TimerDiff`），`dueAt` 由调度方按工作日历算；不注入 `Scheduler` = **不排程**（不是"用默认实现假装做了"）。已排 handle 必须写回 `Token.timerHandles`，离开节点时由不纯层 `cancel()` 后删除 | 每次状态推进（save 之前） | `runtime/timers.ts`（纯 diff）+ `runtime/engine.ts`（`reconcileTimers`，唯一不纯处） | 「逐条 `actions` 排程」+「`dueAt` 不存在」+「办完 → `cancel()` 旧 handle 且不残留」+「不注入 → 无 handle 但流程照跑」✅ **T21 已验** |
+| INV-24 | ★ **轨迹是 `auditTrail` 的只读投影**：`exportTrace(id)` 与门 2 的 `traceOf(state)` **必须逐字相同**（同一条纯函数，不许在 `engine.ts` 里另算一份）；`entries` 与 `auditTrail` 一一对应、同序、**不补算**任何审计里没有的字段。⚠️ 轨迹被裁剪过（`truncated`）必须**报出来**，不得与完整轨迹长得一样 | 每次导出 | `runtime/trace.ts`（`traceOf`，纯）+ `runtime/engine.ts`（`exportTrace` = `load → traceOf`） | 「`exportTrace(id)` 深等 `traceOf(load(id))`」+「auditTrail 里没写的字段不出现在 `TraceEntry` 上」+「首条 seq>1 ⇒ `truncated:true` 且报出丢掉的区间」✅ **T22 已验** |
 
 ### 6.5 设计期数据约束（静态配置）
 
@@ -461,7 +473,10 @@ interface Engine {
   plan(state: InstanceState, action: ActionInput, options?: PlanOptions): PlanResult;
   deliverMessage(instanceId: string, messageRef: string, payload?: unknown): Promise<TaskDelta>;
   deliverSignal(signalRef: string, payload?: unknown, instanceId?: string): Promise<TaskDelta[]>;
-  exportTrace(instanceId: string): Promise<TraceEntry[]>;
+  /** ★ T22：导出**令牌轨迹** = `auditTrail` 的只读投影（FR-E15）。
+   *  ⚠️ 返回 `TraceResult` 而非裸数组：`maxAuditEntries` 裁剪之后两者**从数组上看不出区别**，
+   *     宿主会把"只剩最近 3 条"当成"一共就 3 条"（INV-17 要防的就是这个） */
+  exportTrace(instanceId: string): Promise<TraceResult>;
 }
 
 interface StartOptions {
@@ -499,8 +514,13 @@ deliverMessage(instanceId: string, input: DeliverInput): Promise<TaskDelta>;
 deliverSignal(instanceIds: readonly string[], input: DeliverInput): Promise<TaskDelta[]>;
 ```
 
-> **T11 已落地 `start` / `submit` / `plan`；T12 已补齐九个槽位中的 ⑤⑧⑨；T20 已落地 `deliverMessage` / `deliverSignal`。**
-> `exportTrace`（T22）尚未实现 —— 公开的 `Engine` 接口**刻意不提前声明**它（声明了就得给实现）。
+> **T11 已落地 `start` / `submit` / `plan`；T12 已补齐九个槽位中的 ⑤⑧⑨；
+> T20 已落地 `deliverMessage` / `deliverSignal`；T22 已落地 `exportTrace`。**
+>
+> ★ **`exportTrace()` 的投影逻辑在 `runtime/trace.ts`（纯函数）里，`engine.ts` 里只有两行** ——
+>   门 2（宿主自编排）拿着手里的状态直接调 `traceOf(state)`，必须得到**逐字相同**的结果。
+>   ⚠️ 返回 `TraceResult`（`{ entries, truncated, dropped* }`）而不是 `TraceEntry[]`：
+>   审计被 `maxAuditEntries` 裁剪之后，裸数组与完整轨迹**无从区分**。
 
 > **★ 投递与提交的九槽位同构**（T20 的落点）：两者都走 `queue.run()` 串行、都经 `plan()` 的
 > `apply` 接缝、都触发门 1 钩子。差别只有两处：① 纯执行段是 `deliverStep()`（匹配 → 唤醒 →
@@ -1042,8 +1062,8 @@ class EngineError extends Error {
   `NFR-E5`（20 次并发 `submit`：**CAS 冲突 0 次**，说明串行队列这道主防线真的挡住了 ——
   把 `rev` CAS 当主防线用是设计错误，见 ADR-004）。
 
-  ⚠️ **能力边界（诚实标注）**：多出向路由（D-22）/ 原语级审计（D-23）
-  / `exportTrace`（T22）未实现 —— 全部表现为**显式抛错**而非静默降级。
+  ⚠️ **能力边界（诚实标注）**：多出向路由（D-22）未实现 —— 表现为**显式抛错**而非静默降级；
+  原语级审计（D-23）**已否决**（**D-87**）；`exportTrace` 已随 **T22** 落地。
   （★ `deliver*` 已随 **T20** 落地，见 T20 那一行。）
 
 - [x] **T12 事件发射（节点级 5 + 实例级 5）与门 1 钩子**
@@ -1297,10 +1317,28 @@ class EngineError extends Error {
   ⑦ 建图时**提前**校验边界事件（D-85）：缺 `attachedTo` / 宿主不存在 / 没有出向 → 建图即抛。
      理由同 T20 的 `catchBindingOf`：悬空的监听器**永远不会亮**，且运行时没有任何报错可循。
 
-- [ ] **T22 令牌轨迹导出 `exportTrace()`**
-  组件：`runtime/engine.ts`
+- [x] **T22 令牌轨迹导出 `exportTrace()`**
+  组件：`runtime/trace.ts`（新，纯）/ `runtime/plan.ts` / `runtime/engine.ts`
   依赖：T11
   验证：返回的 `TraceEntry[]` 与 `auditTrail` 一一对应且 `kind` 标注正确；`maxAuditEntries` 溢出后轨迹仍在（**INV-17**）
+  ✅ **已落地（2026-10-01，commit `T22`）**。实现要点：
+  ① **投影必须住在纯函数里** —— `traceOf(state)` 在 `runtime/trace.ts`，`engine.exportTrace()` 只有
+     `load → traceOf` 两行。门 2（宿主自编排）自己持状态时也调它 ⇒ **两条路径逐字相同**（有断言钉死）。
+     若长在 `engine.ts`（唯一不纯档）里，门 2 就得复制一份，"审计和轨迹对不上"从纪律问题变成必然。
+  ② **返回 `TraceResult` 而不是 `TraceEntry[]`**（**D-89**）：审计被 `maxAuditEntries` 裁剪之后，
+     裸数组与完整轨迹**从数组上看不出区别** —— 宿主会把"只剩最近 3 条"当成"一共就 3 条"。
+     ⚠️ 完整性的判据是「首条 `seq` 是否 > 1」（INV-4 保证 seq 从 1 起、无空洞），
+     **不需要**为此在状态里新增字段 —— 新增字段就要动 `stateSchema` 与迁移表。
+  ③ **`kind` 只有「审批 / 非审批」两档**（**D-87**）：判据取 `ACTION_NAMES`（19 项），
+     不取"已知的非审批名单" —— 后者会让将来新增的系统动作**静默变成 `approval`**。
+  ④ **`from` / `to` / `tokenId` 由 `plan()` 填**（**D-88**）：只有它同时握着推进前的 `state`
+     与推进后的 `next`；定位令牌**只准走 `subjectTokenOf()`**（与 `submit()` 认领令牌同一套判据，
+     已从 `engine.ts` 收口到 `core/task.ts`）。认不出时**留空而不猜** —— 会签下猜错令牌
+     会让 `exportTrace()` 显示"李四办了两次"。
+     令牌终结（`completed` / `cancelled`）**照记 `to`**：那一跳正是轨迹的最后一跳
+     （走到 `End_1`）；只有令牌**被移除**（会签展开取代占位令牌）才缺席。
+  ⑤ `start()` 那条审计也补了 `from` / `to`（`tk_start`：`Start_1 → 第一个待办`）——
+     它是轨迹的第一行，缺了就看不出"发起之后走到了哪"。
 
 ### 横切（贯穿各阶段）
 
@@ -1328,6 +1366,7 @@ class EngineError extends Error {
 | 2026-10-01 | **T19 落地**：`DefinitionSource` 版本语义与在途实例绑定（`AC-E10`）。`core/spi.ts` 把版本语义写成四条硬约定（版本精确 / 不存在 = `null` **绝不回退** / 不得改内容 / 异常入参返回 `null`）；新增 **INV-19** + 在 `plan()` 的 `apply` 接缝落守卫（★ 放这里是因 `plan()` 为两条路径唯一演化入口，一条守卫护住 `submit()` 与门 2）；新增 `conformance/definition.ts`（`runDefinitionConformance`，7 条判据，头号目标是「忽略 `version` 参数」；三套里唯一要宿主交 `fixtures` —— 定义是业务资产、套件造不出来）；反向验收补「不看 version」「取不到就抛」两个坏实现并断言**点名**抓到。端到端用「v1 两段审批 / v2 中间插入 `Task_new`」做观测点：改版后在途仍走 `Task_b`、绑定版下线 → `DEFINITION_MISSING` 且不留下半截状态。顺手修 `expectCodeAsync` 误传 thunk 时断言静默失效（D-70）。**591 单测** + 探针 **77/77** | §6.4 / §7.2 / §9 / §10 | T19 / INV-19 / D-67~D-70 | `verify` PASSED + 两个 project 类型检查 0 err |
 | 2026-10-01 | **T20 落地**：投递入口 `deliverMessage`（点对点）/ `deliverSignal`（广播）。等待语义单开 `nodes/catch.ts`（**横跨事件族与任务族**：`intermediateCatchEvent` + `receiveTask`，放哪一族都会长出第二份「怎么取名 / 怎么匹配 / 怎么唤醒」）；新增 `Token.awaiting` + **INV-20**（第三类稳定点：不投递绝不自己走过去）；★ **唤醒 = 摘等待态 + 离开等待节点**（只摘会被 `runToWait` 原地重新停车，D-73）；纯执行段 `runtime/deliver.ts` 的 `deliverStep()` 公开给门 2；`buildApply()` 入参改为 `run`（探测跑与真值跑共用同一段代码，D-76）；投递未命中 → `ACTION_TARGET_INVALID` 且 `details.waiting` 给合法取值（**不新增第 20 个码**，D-74）；广播候选集归宿主（`StateStore` 无查询接口，D-71），未命中跳过、**全落空才抛**；★ 收口 **D-56 的第二半**：`intermediateThrowEvent` 与 `sendTask` 同处置 → 显式抛错（无 `MessageSink` 出口，D-72）。**625 单测** + 探针 **82/82** | §6.4 / §7.1 / §9 / §10 | T20 / INV-20 / D-71~D-76 | `verify` PASSED + 两个 project 类型检查 0 err |
 | 2026-10-01 | **T21 落地**：边界事件 / 事务取消 / `EventBasedGateway` 竞速 / 超时经 `Scheduler`。新增 `nodes/boundary.ts`（判据单开，理由同 `nodes/catch.ts`：边界事件横跨"事件族的语法"与"任务族的宿主"）；★ **边界事件是监听器、不持有令牌**（故不在 `Token.awaiting` 里，命中集合必须 `matchingTokens` + `armedBoundaries` **取并**，否则挂审批上的撤回消息永远收不到，D-77）；中断 = 宿主 + 其内嵌作用域内**全部**在途令牌退场（拍平后靠 `Tx_1/` 前缀判，D-78），非中断则宿主不退场且可重复触发（令牌 id 附 `#N`，D-83）；★ **点对点优先等待令牌、没命中才兜底问边界**，广播取并集（D-84）；`EventBasedGateway` = 分叉全部出向 + 竞速，新增 `Token.race`（与 `branch` 正交，赢家离开等待节点即退出，D-80）；`Transaction` 的 `cancel` 半边落地（`compensate` 仍 v1.x）；★ **内核不定时**（INV-23）：新增纯 `runtime/timers.ts` 只产意图，`reconcileTimers()` 在 `save()` 前兑现（先 cancel 旧、再写回新 handle）；`ScheduleRequest` **去掉 `dueAt`**、改交 `fromAt` + 原始 `TimeoutSpec`（Q33 禁时态库 + `03` F-1 工作日历是业务数据，D-81），handle 落 `Token.timerHandles`（只能由不纯层删，D-82），无 `assignee` 不计时（D-86）。新增 **INV-21 / INV-22 / INV-23**。**661 单测** + 探针 **91/91** | §6.1 / §6.4 / §9 / §10 | T21 / INV-21~23 / D-77~D-86 | `verify` PASSED + 两个 project 类型检查 0 err |
+| 2026-10-01 | **T22 落地**：令牌轨迹 `exportTrace()`。新增纯 `runtime/trace.ts`（投影**必须**住在纯函数里 —— 门 2 自己持状态时也调它，两条路径才不会分叉）；★ **返回 `TraceResult` 而非裸数组**（D-89）：`maxAuditEntries` 裁剪后裸数组与完整轨迹无从区分，完整性判据取「首条 `seq` 是否 > 1」（INV-4 无空洞），故**不新增状态字段**；★ **`kind` 改为「审批 / 非审批」两档**（D-87），**原语级审计正式否决** —— run-to-wait 的令牌推进不走 `advance` 原语（直接改 `token.nodeId`），按原语记出来的"轨迹"里没有令牌移动，且一次提交炸出几十条会把 `maxAuditEntries` 的语义扭曲成"保留最近两次提交"（**D-23 就此闭环**）；★ `tokenId` / `from` / `to` 由 `plan()` 填（只有它同时握着 before/after），定位令牌**收口到 `core/task.ts` 的 `subjectTokenOf()`**（D-88，与 `submit()` 认领令牌同一套判据），认不出留空不猜、令牌终结照记 `to`；`start()` 那条审计补齐 `Start_1 → 第一个待办`。新增 **INV-24**。**685 单测** + 探针 **98/98** | §6.2 / §6.4 / §7.1 / §9 / §10 | T22 / INV-24 / D-87~D-89（D-23 闭环） | `verify` PASSED + 两个 project 类型检查 0 err |
 | 2026-10-01 | **T18 落地**：`nodes/activities.ts`（活动 / 子流程 4 类）+ `nodes/graph.ts` 接入内嵌展开 + `runtime/engine.ts` 的子实例链路。内嵌子流程**在建图时拍平**（内嵌 `endEvent` → `subProcessExit`，否则令牌会被判终结、出口后的节点永远走不到）；`CallActivity` = **子实例 + 等待 + 自动回归**（子实例 id 确定性、父令牌 `waiting`、子实例终态唤醒父实例、父实例终态连坐终止子实例）；★ 后续动作一律放在 `queue.run()` **之外**（否则「子实例一建就跑完 → 回头唤醒父实例」= 自锁）；版本绑定读 `extension['floken:call'].version`，**缺即抛**（INV-16）；`AdHocSubProcess` / `Transaction` / 事件子流程显式抛并指名 FR-E18 / FR-E13 / FR-E24。另补 **AC-E1 巡检**（20 个可提交名逐个不得抛 `ACTION_UNKNOWN` + 反证）；**572 单测** + 探针 **73/73** | §5 / §6.1 / §7.1 / §9 / §10 | T18 / INV-16 / D-62~D-66 | `verify` PASSED + 两个 project 类型检查 0 err |
 | 2026-10-01 | **T17 落地**：`nodes/tasks.ts`（任务 8 类）+ `nodes/flows.ts`（连线与数据 4 类）+ `eval/script.ts`（FEEL 脚本求值）+ 副作用接线（`LoopContext.effectsOf` + `NodeEffectUnresolved` 哨兵重跑）；**D-56** `sendTask` 与 `intermediateThrowEvent` 同处置（显式抛错，ADR-006 事件集定死 10 个）、**D-57** 非 FEEL 脚本先查 `handlers` 表、**D-58** 服务重试归内核外、**D-59** FEEL 结果落 `variables[nodeId]`、**D-60** 副作用按 `${nodeId}::${tokenId}` 缓存且条件取「此刻」变量快照、**D-61** 源码扫描必须去注释；**538 单测** + 探针 **69/69** | §5 / §7.3 / §9 / §10 | T17 / D-52 / D-56~D-61 | `verify` PASSED + 两个 project 类型检查 0 err（产物层双层扫描：无 `new Function` / `node:vm` / `eval(`） |
 | 2026-10-01 | **D-21 / D-31 在模型层修根因**：`floken-moddle` 的 `shouldTerminate()` 重排规则序（先按 `mode` 判，`pending === 0` 的多数决兜底只对票签生效）；引擎侧 `convergence.ts` 的 `mode:'all' && rejected>0` 短路**整块删除**，对账测试取消例外格改为逐格全一致（>300 组）；**482 单测** + 探针 **60/60** | §5 / §9 / §10 | D-19 / D-21 / D-31 | `verify` PASSED + 两个 project 类型检查 0 err（moddle 侧 299 单测全绿 + dist 已重建同步） |
@@ -1363,7 +1402,7 @@ class EngineError extends Error {
 | **D-15** | **T7 验证项里的「100 次并发 `submit`」前向引用了 T11** | 与 D-8 / D-10 同病（任务拆分把验证项写到了未来阶段） | ✅ **已收口（2026-10-01）**：改为「20 次并发 **`submit`**」，并加一条**比顺序更有价值**的断言 —— **CAS 冲突必须为 0**（串行队列是主防线，CAS 只是兜底；靠兜底才不冲突 = 主防线已失效） |
 | **D-17** | **原语「语义前置条件不满足」的错误码归类为 `ENGINE_STATE_SHAPE_INVALID`**（如 `jumpTo` 目标不在 `completedNodes`、`spawnInstances` 传入空办理人、`resume` 用在非挂起实例、未知 `tokenId`） | 四族里没有更贴切的：`ACTION_` 是动作受理语义（归 T9 `gates.ts`）、`PERSIST_` 是存储、`OPTION_` 是配置。**未新增码族**（遵守 D-7 的教训）。两层判据不同：**原语保证状态自洽，gates 保证符合设计期配置**（INV-6 ②仍归 gates） | ✅ 已落地并在 `test/primitives.test.ts` 钉死 |
 | **D-22** | **多出向路由**：一个节点有 ≥2 条 `sequenceFlow` → `nodes/graph.ts` 的 `nextOf()` **显式抛 `STATE_SHAPE_INVALID`**，不"取第一条" | 静默取第一条会让流程**走错分支**且毫无征兆 —— 这比抛错危险得多 | ✅ **T16 已实现网关侧**（`outFlowsOf` + `routeGateway` 支持并行 / 包容 / 排他）；**普通节点多出向仍抛**（细化见 **D-48**） |
-| **D-23** | **原语级审计延后**：`primitives.ts` 头注释原写「原语级审计由 T11 的 `runtime/loop.ts` 追加」（`TraceEntry.kind:'primitive'`），**T11 未实现** | 卡在 `seq` 的分配权：`plan()` 在 `apply` 之后才结审计账（先算 `seq = max+1` 再追加）。若 `apply` 内也要写审计，就得把 `seq` 分配权交给 `apply` —— 那是另一个接缝，需单独立项 | ⏳ **T18（`exportTrace`）开工前须定**；在那之前 `auditTrail` 只记**动作级**一条 |
+| **D-23** | **原语级审计（旧 `TraceEntry.kind:'primitive'`）—— 已否决** | 原卡在 `seq` 的分配权（`apply` 内写审计就得把分配权交给它），**T22 重新裁决后直接否决**，两条理由见 **D-87**；`auditTrail` 从此**只记动作级一条**，原语永不进审计 | ✅ **已闭环（2026-10-01）**：`core/primitives.ts` / `runtime/loop.ts` 头注释已改写为否决口径 |
 | **D-24** | **内置默认 `ApproverSource`**：不注入时只认 `{type:'user', value}`，其余 6 类（`role`/`dept`/`starterLeader`/`deptLeader`/`formField`/`expr`）→ 抛 `ENGINE_OPTION_INVALID` | ① 只有给默认，`AC-E13` 的「零配置跑通报销」才成立；② 又**不能**静默返回空集 —— 空集会触发 INV-13 的 `ACTION_APPROVER_EMPTY`，把「没注入 `ApproverSource`」这个**真因**包装成「解析不出人」，排查方向直接跑偏 | ✅ 已落地（两条用例：缺注入抛 `OPTION_INVALID`；注入后同一份定义即可跑通） |
 | **D-25** | **`Token` 增补 `createdAt?: string`**，且 **`advance` / `jumpTo` / `rollbackTo` 换节点时清除 `assignee` / `returnTo` / `createdAt`** | ① `TaskView.createdAt` 是超时判定的输入，拿 `state.startedAt` 顶替会让「这条待办挂了多久」永远算错；② 办理人是「**某节点上的某令牌**」的属性，不是令牌固有属性 —— 不清除则 `runToWait` 在新节点看到旧办理人 → 判「已落定」而停下 → **令牌永远走不到终点**（实测撞到，见 T11 ④） | ✅ 已落地。**✅ 已回写 `03` §3 的 `Token` + 注解**（2026-10-01） |
 | **D-26** | **`InstanceStateBody` 增补 `starter?: string`** | `ApproverCtx.starter` 是**已发布的 SPI 契约**（`{type:'deptLeader', of:'starter'}` 全靠它解析）；而 `auditTrail` 会被 `maxAuditEntries` 裁剪（INV-17）—— 拿一条**可能被裁掉的**记录去支撑一个**永久需要**的契约，是典型的"省一个字段、埋一个偶发 bug" | ✅ 已落地。**✅ 已回写 `03` §9.1 的 Body**（2026-10-01） |
@@ -1428,3 +1467,6 @@ class EngineError extends Error {
 | **D-84** | **点对点优先等待令牌、没命中才兜底问边界；广播取并集** | 消息是**点对点**（一个接收者）：等待令牌与边界事件同时命中却都触发，就变成「一条消息两个人收到」，且**谁都说不清该谁办**。信号本就**人人可收**，广播下漏掉边界事件则是「配了撤回却从来不被唤醒」 | ✅ 已落地（`runtime/deliver.ts` 的 `DeliverMode`）。点对点：有等待令牌命中 → 不触发边界；无 → 兜底触发（取第一条） |
 | **D-85** | **边界事件在**建图时**提前校验**（缺 `attachedTo` / 宿主不存在 / 没有出向 → 抛） | 与 T20 的 `catchBindingOf` 同一条理由：悬空的监听器**永远不会亮**，而运行期没有任何报错可循 —— 「超时/撤回配了却从不发生」是这类引擎最难查的缺陷。ⓐ 宿主存在性判定要接纳**内嵌作用域成员**（`Tx_1` 拍平后不是节点，只查 `nodes.has()` 会误报）；ⓑ `boundaryOf()` 要**沿作用域向上找**，挂在 `Tx_1` 上的边界要被 `Tx_1/T_A` 上的令牌看见 | ✅ 已落地（`nodes/graph.ts` 建图循环 + `boundaryOf()` 的向上回溯） |
 | **D-86** | **没有 `assignee` 的在途令牌**不**计时** | 「在途」不等于「有人在办」：刚分叉出来还没落定的令牌、停在 catch 节点上的令牌都是 `active` 却没有办理人。给它们排超时 = 产出「催办一条根本不存在的待办」。另：计时键按 `${nodeId}::${tokenId}` 而非 nodeId —— 会签组里同节点有 N 个令牌，每个人的待办**各自**计时（驳回重办后是新令牌 = 新计时） | ✅ 已落地（`runtime/timers.ts` 的 `timingKeysOf`）。断言：无 `assignee` → 键集为空；无 `timeout` 配置 → 不排程（不是"每个待办都排一次"） |
+| **D-87** | ★ **原语级审计（旧 `TraceEntry.kind:'primitive'`）正式否决**；`kind` 改为 **「审批 / 非审批」两档**（`'approval' \| 'system'`） | 原方案是把 10 个原语的调用逐条写进 `auditTrail`（**D-23**），T22 重新裁决后否决，两条理由：① **run-to-wait 的令牌推进根本不走 `advance` 原语** —— `runtime/loop.ts` 直接改 `token.nodeId`，于是"按原语记"的轨迹里**没有令牌移动**，恰恰是"轨迹"最该有的那一半（名不副实却看不出来）；② 一次提交会炸出几十条，`maxAuditEntries` 的语义会从「保留最近 N **次变更**」扭曲成「保留最近两次提交」，且裁剪会砍在**一次提交的内部**。改判之后：`kind` 的判据是「**是不是 19 项审批动作之一**」（取 `ACTION_NAMES` 而非"已知非审批名单" —— 后者会让将来新增的系统动作**静默变成 `approval`**）；`start` / `callActivityReturn` / `deliverMessage` / `deliverSignal` 一律 `system` | ✅ 已落地（`runtime/trace.ts` 的 `traceKindOf` + `SYSTEM_AUDIT_ACTIONS`）。断言：19 项逐个判 `approval`；4 个系统名逐个判 `system`；两张名单**无交集**；未知名 → `system` |
+| **D-88** | ★ **`AuditEntry` 的 `tokenId` / `from` / `to` 由 `plan()` 填**，定位令牌**只准走 `subjectTokenOf()`**（已从 `engine.ts` 收口到 `core/task.ts`） | 「谁办的、从哪到哪」是 `exportTrace()` 的全部内容，而**只有 `plan()` 同时握着推进前的 `state` 与推进后的 `next`** —— 换任何一处都拿不到完整 before/after。⚠️ 定位判据若两处各写一份（"看起来差不多"的那种），就会出现「审计说办的是 A 分支、实际推进的是 B 分支」，而两份代码单独看都对。ⓐ 认不出时**留空而不猜**（会签下猜错 = `exportTrace()` 显示"李四办了两次"）；ⓑ 令牌**终结**（`completed` / `cancelled`）**照记 `to`** —— 走到 `End_1` 正是最后一跳，只有令牌**被移除**（会签展开取代占位令牌）才缺席；ⓒ `start()` 那条也补了（`tk_start`：`Start_1 → 第一个待办`），它是轨迹第一行 | ✅ 已落地（`runtime/plan.ts` ⑦ + `runtime/engine.ts` 的 `start()`）。断言：单令牌 / 会签按 actor 认领 / 认不出留空 / 终结照记 / 移除缺席 |
+| **D-89** | ★ **`exportTrace()` 返回 `TraceResult` 而不是 `TraceEntry[]`** | 审计被 `maxAuditEntries` 裁剪之后，裸数组与完整轨迹**从数组上看不出区别** —— 宿主会把"只剩最近 3 条"当成"一共就 3 条"，这是 INV-17「不得静默丢弃」在**读侧**的同一个洞（写侧已有 `ENGINE_AUDIT_TRUNCATED` 诊断）。ⓐ 判据取「首条 `seq` 是否 > 1」（INV-4 保证 seq 从 1 起、无空洞）⇒ **不必**新增状态字段（新增就要动 `stateSchema` 与迁移表）；ⓑ `droppedFromSeq` / `droppedToSeq` 与 `plan()` 那条诊断的 `details.dropped*` **同名同口径** | ✅ 已落地（`runtime/trace.ts` 的 `traceOf`）。断言：seq 从 1 起 → `truncated:false`；首条 seq=5 → `truncated:true` + 区间 1~4；`maxAuditEntries:1` 端到端只剩 1 条却报丢 1~2 |

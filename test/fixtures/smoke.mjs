@@ -2424,6 +2424,111 @@ check('T21 · 公开面：边界事件与定时器的纯函数已导出（宿主
   eq(m.timerKeyOf('Task_1', 'tk_1'), 'Task_1::tk_1', 'timerKeyOf（按令牌而非节点）');
 });
 
+// ---------------- T22 · 令牌轨迹 exportTrace() ----------------
+
+/**
+ * ★ 这一段断言的是「**轨迹能不能当证据用**」—— T22 的失败形式不是抛错，而是
+ *   「导出来的东西看着挺全，其实少了一半 / `kind` 全标错 / 认错了令牌」：
+ *     - `kind` 把 `start` 标成 `approval` → 审批统计把发起也数进去；
+ *     - `from` / `to` 认错令牌 → 会签下张三的动作记到李四头上（"李四办了两次"）；
+ *     - 审计被裁剪却不说 → 只剩最近 3 条被当成"一共就 3 条"（INV-17 要防的那个）。
+ */
+
+/** 简版报销三段（发起 → 部门经理 → 财务 → 结束） */
+const traceDef = defOf(
+  'Process_1',
+  [
+    { id: 'Start_1', type: 'startEvent' },
+    { id: 'Task_1', type: 'userTask', extension: userApprovalOf('u_manager') },
+    { id: 'Task_2', type: 'userTask', extension: userApprovalOf('u_finance') },
+    { id: 'End_1', type: 'endEvent' },
+  ],
+  [
+    { id: 'Flow_1', from: 'Start_1', to: 'Task_1' },
+    { id: 'Flow_2', from: 'Task_1', to: 'Task_2' },
+    { id: 'Flow_3', from: 'Task_2', to: 'End_1' },
+  ],
+);
+
+check('T22 · `traceKindOf`：19 项审批动作 = approval，start / deliver* = system', () => {
+  eq(typeof m.traceKindOf, 'function', 'traceKindOf 已导出');
+  eq(m.traceKindOf('approve'), 'approval', 'approve 是审批动作');
+  eq(m.traceKindOf('reject'), 'approval', 'reject 是审批动作');
+  for (const s of m.SYSTEM_AUDIT_ACTIONS) {
+    eq(m.traceKindOf(s), 'system', `${s} 不是审批动作`);
+  }
+  sameArray([...m.SYSTEM_AUDIT_ACTIONS].sort(), ['callActivityReturn', 'deliverMessage', 'deliverSignal', 'start'], 'SYSTEM_AUDIT_ACTIONS = D-62 的四类非审批动作名');
+  // ★ 判据取**审批名单**：将来多一个系统动作也不会被静默标成 approval
+  eq(m.traceKindOf('someFutureKernelAction'), 'system', '19 项之外一律 system');
+});
+
+check('T22 · `traceOf` 是 auditTrail 的只读投影：不增不减、不补算', () => {
+  const st = m.subjectTokenOf; // 顺带确认定位口径已公开
+  eq(typeof st, 'function', 'subjectTokenOf 已导出（plan 与 submit 共用一份判据）');
+  const one = m.traceOf({
+    instanceId: 'pi_1',
+    auditTrail: [{ seq: 1, at: 'T', actor: 'u1', action: 'approve', payload: { comment: '同意' } }],
+  });
+  eq(one.entries.length, 1, '一一对应');
+  eq(one.entries[0].kind, 'approval', 'kind 标对');
+  sameArray(one.entries[0].payload, { comment: '同意' }, 'payload 原样带出');
+  sameArray(Object.keys(one.entries[0]).sort(), ['action', 'actor', 'at', 'kind', 'payload', 'seq'], 'auditTrail 里没有的字段不补算');
+  eq(one.truncated, false, 'seq 从 1 起 = 完整');
+});
+
+check('T22 · ★ 完整性：首条 seq > 1 ⇒ `truncated` 亮出来，且报出丢掉的区间', () => {
+  const r = m.traceOf({ instanceId: 'pi_1', auditTrail: [{ seq: 5, at: 'T', actor: 'u1', action: 'approve' }] });
+  eq(r.truncated, true, '被裁剪过');
+  eq(r.droppedFromSeq, 1, 'dropFrom');
+  eq(r.droppedToSeq, 4, 'dropTo');
+});
+
+await checkAsync('T22 · ★ 一条报销跑完：轨迹连成一条链，kind 全对', async () => {
+  const { engine } = engineOn(traceDef);
+  const id = await engine.start('Process_1', { definitionVersion: 1, starter: 'u_applicant' });
+  await engine.submit(id, { action: 'approve', actor: 'u_manager' });
+  await engine.submit(id, { action: 'approve', actor: 'u_finance' });
+
+  const r = await engine.exportTrace(id);
+  eq(r.truncated, false, '未裁剪');
+  sameArray(r.entries.map((e) => [e.action, e.kind]), [['start', 'system'], ['approve', 'approval'], ['approve', 'approval']], '动作序列与 kind');
+  sameArray(r.entries.map((e) => [e.from, e.to]), [['Start_1', 'Task_1'], ['Task_1', 'Task_2'], ['Task_2', 'End_1']], '★ from→to 首尾相接（轨迹真的连起来了）');
+  eq(r.entries[1].actor, 'u_manager', '第二条是部门经理办的');
+  eq(r.entries[1].tokenId, 'tk_start', 'tokenId 落上了');
+});
+
+await checkAsync('T22 · ★ 与门 2 的 `traceOf(state)` 逐字相同（两条路径不许分叉）', async () => {
+  const { engine, store } = engineOn(traceDef);
+  const id = await engine.start('Process_1', { definitionVersion: 1, starter: 'u_applicant' });
+  await engine.submit(id, { action: 'approve', actor: 'u_manager' });
+  const st = await store.load(id);
+  sameArray(await engine.exportTrace(id), m.traceOf(st), 'exportTrace === traceOf(load)');
+});
+
+await checkAsync('T22 · ★ maxAuditEntries 溢出后：轨迹仍在 + `truncated` 亮出来（INV-17）', async () => {
+  const { engine } = engineOn(traceDef, { maxAuditEntries: 1 });
+  const id = await engine.start('Process_1', { definitionVersion: 1, starter: 'u_applicant' });
+  await engine.submit(id, { action: 'approve', actor: 'u_manager' });
+  await engine.submit(id, { action: 'approve', actor: 'u_finance' });
+
+  const r = await engine.exportTrace(id);
+  eq(r.entries.length, 1, '只剩最近一条');
+  eq(r.entries[0].action, 'approve', '剩的是最后一次提交');
+  eq(r.truncated, true, '★ 必须说"不完整"，否则会被当成一共就一条');
+  eq(r.droppedFromSeq, 1, 'dropFrom');
+  eq(r.droppedToSeq, 2, 'dropTo');
+});
+
+await checkAsync('T22 · 实例不存在 → ENGINE_STATE_NOT_FOUND（不返回空数组糊过去）', async () => {
+  const { engine } = engineOn(traceDef);
+  try {
+    await engine.exportTrace('pi_nope');
+    throw new Error('应当抛错');
+  } catch (e) {
+    eq(e.code, 'ENGINE_STATE_NOT_FOUND', '错误码');
+  }
+});
+
 // ---------------- 汇总 ----------------
 
 let failed = 0;

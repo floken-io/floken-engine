@@ -9,7 +9,12 @@
  *   - 原语 = **状态变换**：只动 `tokens` / `completedNodes` / `status`；
  *   - `plan()` = **一次提交的完整演化**：`rev` / `updatedAt` / `lastAction` / `auditTrail` / `delta`。
  *   ⇒ 本文件**不碰** `rev`、时间、审计 —— 否则与 `plan()` 重复记账（INV-4：一条 seq 对应一次变更）。
- *     原语级审计由 T11 的 `runtime/loop.ts` 在调用原语时追加（`TraceEntry.kind: 'primitive'`）。
+ *     ★ **原语级审计已否决**（**D-23 / D-87**）：原语**不进** `auditTrail`，
+ *     轨迹只在**动作级**记一行（`from` / `to` / `tokenId` 由 `plan()` 填）。
+ *     否决的两条理由：① run-to-wait 的令牌推进**不走 `advance` 原语**（`runtime/loop.ts`
+ *     直接改 `token.nodeId`），按原语记出来的"轨迹"里没有令牌移动 —— 恰是最该有的那一半；
+ *     ② 一次提交炸出几十条会把 `maxAuditEntries` 的「保留最近 N **次变更**」
+ *     扭曲成「保留最近两次提交」，且裁剪会砍在一次提交的内部。
  *
  * ★ 纯函数性同 `plan()`：不读时钟、不碰存储、不改入参（先 `cloneState`）。
  *   令牌 id 由入参 `groupId` **确定性生成**（`${groupId}#${i}`）—— 纯函数不能用随机数 / 计数器。

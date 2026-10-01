@@ -46,7 +46,7 @@ export type {
 
 // ---------------- 待办视图与差分（§6.2） ----------------
 
-export { TASK_STATUSES } from '../core/task.js';
+export { TASK_STATUSES, subjectTokenOf } from '../core/task.js';
 export type { TaskStatus, TaskView, TaskDelta, TraceEntry } from '../core/task.js';
 
 // ---------------- 11 项 SPI（§7.2） ----------------
@@ -271,6 +271,20 @@ export type {
   TimerKind,
 } from '../runtime/timers.js';
 
+// ---------------- ★ 令牌轨迹（T22 · FR-E15） ----------------
+
+/**
+ * ★ 轨迹 = `auditTrail` 的**只读投影**（`03` §9.1 Plan A：审计主源就是状态里的 `auditTrail`）。
+ *
+ * `traceOf()` 是纯函数，**门 2 必须用它** —— 宿主自己持状态、自己落库时，
+ * 调它得到的必须与 `engine.exportTrace()` **逐字相同**（§7.1 两条路径不许分叉）。
+ *
+ * ⚠️ `TraceResult` 而不是裸数组：`maxAuditEntries` 裁剪过的轨迹与完整轨迹
+ *   从数组上**看不出区别** —— `truncated` / `droppedFromSeq` / `droppedToSeq` 就是为它准备的。
+ */
+export { traceOf, traceKindOf, SYSTEM_AUDIT_ACTIONS } from '../runtime/trace.js';
+export type { TraceResult, SystemAuditAction } from '../runtime/trace.js';
+
 // ---------------- ★ 边界事件（§6 事件表 · T21） ----------------
 
 /**
@@ -312,10 +326,8 @@ export type { EmitInput } from '../runtime/emit.js';
  * `start` / `submit` 是日常路径；`deliverMessage`（点对点）/ `deliverSignal`（广播）是
  * T20 的**投递入口**（唤醒停在 `intermediateCatchEvent` / `receiveTask` 上的令牌）；
  * `plan()` 是门 2（强一致自编排）的入口，
- * 引擎实例上的 `plan` 只是给它补上 `EngineConfig.clock` / `maxAuditEntries`（ADR-007）。
- *
- * ⚠️ `exportTrace`（T22）尚未实现 —— `Engine` 接口会随它的落地扩展，
- *   此处**刻意不提前声明**（声明了就得给实现）。
+ * 引擎实例上的 `plan` 只是给它补上 `EngineConfig.clock` / `maxAuditEntries`（ADR-007）；
+ * `exportTrace()`（T22）导出令牌轨迹 = `auditTrail` 的只读投影。
  */
 export { createEngine } from '../runtime/engine.js';
 export type { Engine, EngineConfig, StartOptions, DeliverInput } from '../runtime/engine.js';

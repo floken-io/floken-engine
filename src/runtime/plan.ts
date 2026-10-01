@@ -32,7 +32,7 @@ import type { EngineDiagnostic } from '../core/errors.js';
 import type { ActionRecord, AuditEntry, InstanceState } from '../core/state.js';
 import { assertRoundTrip, cloneState, headerOf, isTerminalStatus } from '../core/state.js';
 import type { TaskDelta, TaskView } from '../core/task.js';
-import { diffTasks } from '../core/task.js';
+import { diffTasks, subjectTokenOf } from '../core/task.js';
 
 /** `plan()` 的第三个入参：**不确定性一律从参数进来**（ADR-007） */
 export interface PlanOptions {
@@ -157,6 +157,30 @@ export function plan(state: InstanceState, action: ActionInput, options: PlanOpt
   if (action.comment !== undefined) entry.payload = { comment: action.comment };
   if (action.payload !== undefined) {
     entry.payload = { ...(entry.payload ?? {}), ...action.payload };
+  }
+
+  /*
+   * ★ T22 / **D-88**：把「谁办的、从哪个节点到哪个节点」填进审计 —— 这是 `exportTrace()` 的全部内容。
+   *
+   *   为什么必须在这里填（`plan()` 而不是 `submit()`）：审计由本档写，而只有本档同时握着
+   *   推进前的 `state` 与推进后的 `next` —— 换任何一处都拿不到完整的 before/after。
+   *
+   *   ⚠️ 定位令牌**只允许走 `subjectTokenOf()`**（与 `submit()` 认领令牌同一套判据）：
+   *   另写一份"看起来差不多"的定位，就会出现「审计说办的是 A 分支、实际推进的是 B 分支」
+   *   —— 两份代码单独看都对，合起来才错，是最难查的一类。
+   *
+   *   ⚠️ 认不出令牌时**留空而不猜**：宁可 `tokenId` 缺失，也不能在会签里把张三的动作
+   *   记到李四的令牌上（`exportTrace()` 会因此显示"李四办了两次"）。
+   */
+  const subject = subjectTokenOf(state, action.actor);
+  if (subject !== undefined) {
+    entry.tokenId = subject.id;
+    entry.from = subject.nodeId;
+    const after = next.tokens.find((t) => t.id === subject.id);
+    // 令牌已从 `tokens` 里移除（如会签展开时被取代的占位令牌）→ 没有"推进后落点"，`to` 缺席。
+    // ⚠️ 反过来的情形（`state` 变 `completed` / `cancelled`）**照记** ——
+    //   终结的令牌仍带着它最后所在的节点，"走到结束事件"正是轨迹要看的最后一跳。
+    if (after !== undefined) entry.to = after.nodeId;
   }
   next.auditTrail = [...state.auditTrail, entry];
 

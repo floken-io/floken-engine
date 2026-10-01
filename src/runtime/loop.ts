@@ -26,10 +26,11 @@
  *   ③④ 必须在 ⑤ **之前**：否则令牌会先被推进走，汇聚再判时组里已经没人了。
  *
  * ⚠️ **能力边界（诚实标注）**：
- *   - 原语级审计（`TraceEntry.kind:'primitive'`）→ 见 **D-23**；
+ *   - 原语级审计（旧 `TraceEntry.kind:'primitive'`）→ **已否决**，见 **D-23 / D-87**；
  *   - **T20 已落地**：`IntermediateCatchEvent` / `receiveTask` 是本循环**第三种稳定点**
  *     （前两种 = 等人办的 `userTask`、停在 `callActivity` 上等子实例）；
- *   - `exportTrace`（T22）未实现 —— 表现为**显式抛错**而非静默降级。
+ *   - **T22 已落地**：`exportTrace()` 的 `from` / `to` / `tokenId` 由 `runtime/plan.ts` 填
+ *     （定位令牌走 `subjectTokenOf()`，与本档认领令牌同一套判据）。
  *
  * ## ★ T16：并行分支在这里落地（分叉 / 汇聚两条新路径）
  *

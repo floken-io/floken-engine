@@ -29,7 +29,7 @@
  *     ① 纯执行段是 `deliverStep()`（匹配 → 唤醒 → run-to-wait）而不是 `step()`（原语 → 记票 → …）；
  *     ② 动作名是**第四类**（`deliverMessage` / `deliverSignal`），不是 19 项审批动作。
  *
- * ⚠️ `exportTrace` 属 T22，不在本档。
+ * ★ `exportTrace()`（T22）在本档只有两行 —— 投影逻辑全在 `runtime/trace.ts`（纯函数）。
  */
 
 import type { ApproverSpec } from '@floken-io/moddle';
@@ -71,6 +71,8 @@ import type {
 import type { ActionRecord, AuditEntry, InstanceParent, InstanceState, Token } from '../core/state.js';
 import { STATE_SCHEMA_VERSION, cloneState, headerOf, isTerminalStatus } from '../core/state.js';
 import type { TaskDelta } from '../core/task.js';
+import { subjectTokenOf } from '../core/task.js';
+import type { TraceResult } from './trace.js';
 import type { EngineEvent, TaskEvent } from '../core/events.js';
 import { assertTokensInGraph, createProcessGraph } from '../nodes/graph.js';
 import type { OutFlow, ProcessGraph } from '../nodes/graph.js';
@@ -98,6 +100,7 @@ import type { PlanOptions, PlanResult } from './plan.js';
 import { deliverStep } from './deliver.js';
 import type { DeliverMode } from './deliver.js';
 import { diffTimers } from './timers.js';
+import { traceOf } from './trace.js';
 import { createInstanceQueue } from './queue.js';
 import { PROBE_ASSIGNEE, step, tasksOf } from './loop.js';
 import type { LoopContext, LoopResult, StepInput, VoteCast } from './loop.js';
@@ -216,6 +219,15 @@ export interface Engine {
    * @throws `ENGINE_ACTION_TARGET_INVALID` —— 一个都没命中（完全无效果 = 静默丢弃）
    */
   deliverSignal(instanceIds: readonly string[], input: DeliverInput): Promise<TaskDelta[]>;
+  /**
+   * ★ 导出**令牌轨迹**（T22 · FR-E15）：`auditTrail` 的只读投影，**不新增存储**。
+   *
+   * ⚠️ 返回的是 `TraceResult` 而不是裸数组：`maxAuditEntries` 裁剪之后
+   *   裸数组与完整轨迹**无从区分** —— 宿主会把"只剩最近 3 条"当成"一共就 3 条"。
+   *
+   * @throws `ENGINE_STATE_NOT_FOUND` —— 实例不存在
+   */
+  exportTrace(instanceId: string): Promise<TraceResult>;
   /**
    * ★ 门 2 入口：纯函数，不碰存储。
    * 本档只补上 `EngineConfig` 里的 `clock` / `maxAuditEntries`，其余交给调用方。
@@ -622,13 +634,29 @@ export function createEngine(config: EngineConfig): Engine {
     });
     const looped = built.apply(cloneState(base));
 
+    /*
+     * ★ T22（**D-88**）：发起这条也要 `from` / `to` —— 它是轨迹的**第一行**，
+     *   没有它 `exportTrace()` 就看不出"从开始事件走到了第一个待办"。
+     *   ⚠️ 与 `plan()` 同一口径：`from` = 推进前所在节点，`to` = 推进后所在节点。
+     */
+    const startTokenId = 'tk_start';
+    const startTo = looped.tokens.find((t) => t.id === startTokenId)?.nodeId;
+    const startEntry: AuditEntry = {
+      seq: 1,
+      at,
+      actor: opts.starter,
+      action: 'start',
+      nodeId: graph.startNodeId,
+      tokenId: startTokenId,
+      from: graph.startNodeId,
+      ...(startTo !== undefined ? { to: startTo } : {}),
+    };
+
     const next: InstanceState = {
       ...looped,
       rev: 1,
       lastAction: record,
-      auditTrail: [
-        { seq: 1, at, actor: opts.starter, action: 'start', nodeId: graph.startNodeId },
-      ],
+      auditTrail: [startEntry],
     };
 
     const delta: TaskDelta = {
@@ -1278,11 +1306,28 @@ export function createEngine(config: EngineConfig): Engine {
     });
   }
 
+  /**
+   * ★ **导出令牌轨迹**（T22 · FR-E15）。
+   *
+   * 实现只有两行 —— 投影逻辑全在 `runtime/trace.ts` 的 `traceOf()`（纯函数）里，
+   * 于是门 2（宿主自编排）拿着手里的状态直接调 `traceOf()` 得到**逐字相同**的结果
+   * （§7.1：两条路径不许分叉）。
+   *
+   * ⚠️ **不走 `queue.run()`**：本方法只读不写，没有任何"同实例并发写"要串行；
+   *   套上队列只会让"导个轨迹"去排队等前面那个提交。
+   */
+  async function exportTrace(instanceId: string): Promise<TraceResult> {
+    const state = await store.load(instanceId);
+    if (state === null || state === undefined) throw stateNotFound(instanceId);
+    return traceOf(state);
+  }
+
   return {
     start,
     submit,
     deliverMessage,
     deliverSignal,
+    exportTrace,
     plan: (state, action, options) =>
       plan(state, action, {
         clock,
@@ -1514,23 +1559,14 @@ async function resolveAssigneesFor(
 }
 
 /**
- * 本次动作作用在哪个令牌上。
+ * 本次动作作用在哪个令牌上 —— **直接复用 `core/task.ts` 的 `subjectTokenOf()`**。
  *
- * 判据（**与 `compileAction.resolveToken` 同一口径**，只是这里优先按 `actor` 认领）：
- *   ① 办理人 == `actor` 的在途令牌恰好 1 个 → 它（会签下"我办我那条"就是靠这条）；
- *   ② 否则若全局在途令牌恰好 1 个 → 它；
- *   ③ 否则 → `undefined`（交给 `compileAction` 报"无法唯一定位"，或该动作本就不需要令牌）。
- *
- * ⚠️ ① 与 ② 都不命中时**不猜**：猜错令牌 = 改到了别人的待办，是最难查的一类误伤。
+ * ⚠️ **不许在这里另写一份定位**：`plan()` 填审计的 `tokenId` / `from` / `to` 用的也是它
+ *   （**D-88**）。两处各写一份"看起来差不多"的判据，就会出现
+ *   「审计说办的是 A 分支、实际推进的是 B 分支」—— 而两份代码单独看都对。
  */
 function resolveSubjectToken(state: InstanceState, input: ActionInput): string | undefined {
-  const live = state.tokens.filter((t) => LIVE_TOKEN_STATES.includes(t.state));
-  if (live.length === 0) return undefined;
-
-  const mine = live.filter((t) => t.assignee !== undefined && t.assignee === input.actor);
-  if (mine.length === 1) return (mine[0] as Token).id;
-  if (live.length === 1) return (live[0] as Token).id;
-  return undefined;
+  return subjectTokenOf(state, input.actor)?.id;
 }
 
 /** 换人类动作必须**点名**目标人；加签 / 会签未点名时展开该节点配置的办理人 */

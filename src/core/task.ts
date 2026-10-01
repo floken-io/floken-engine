@@ -6,7 +6,8 @@
  * 一句话记法：**`StateStore` = 真相（引擎的），`TaskProjection` = 视图（你的）。**
  * 引擎只吐 `TaskDelta`，**表结构归宿主** —— 所以这里只有形状，没有实现。
  */
-import type { ActionRecord, InstanceStateHeader } from './state.js';
+import { LIVE_TOKEN_STATES } from './primitives.js';
+import type { ActionRecord, InstanceState, InstanceStateHeader, Token } from './state.js';
 
 export type TaskStatus = 'active' | 'delegated' | 'suspended' | 'cancelled' | 'done';
 
@@ -60,17 +61,32 @@ export interface TaskDelta {
 
 /**
  * `exportTrace()` 的返回元素，**派生自 `auditTrail`**（不新增存储）。
- * `kind` 区分「审批动作」（19 项）与「内核原语」（10 个）—— 调试时才需要这一层。
+ *
+ * ★ **`kind` 的两档判据是「是不是 19 项审批动作之一」**，不是「谁发起的」：
+ *   `start` / `callActivityReturn` / `deliverMessage` / `deliverSignal` 一律 `system`。
+ *   ⚠️ 早期草案写的是 `'action' | 'primitive'`（原语级审计，**D-23**），**已否决** ——
+ *   理由见 `ARCHITECTURE.md` **D-87**：`run-to-wait` 的令牌推进**不走 `advance` 原语**
+ *   （`runtime/loop.ts` 直接改 `token.nodeId`），按原语记出来的"轨迹"里**没有令牌移动**，
+ *   恰恰是"轨迹"最该有的那一半；且一次提交会炸出几十条，把 `maxAuditEntries` 的
+ *   「保留最近 N 次变更」扭曲成「保留最近两次提交」。故 `kind` 只标**审批 / 非审批**这一档。
+ *
+ * ★ `from` / `to` / `tokenId` 由 `runtime/plan.ts` 填：取**动作实际作用的那个令牌**
+ *   在推进前后的节点（`subjectTokenOf()` 是唯一口径 —— 与 `submit()` 认领令牌同一套判据，
+ *   不是另写一份"看起来差不多"的定位逻辑）。
  */
 export interface TraceEntry {
   seq: number;
   at: string;
   actor: string;
   action: string;
+  kind: 'approval' | 'system';
   nodeId?: string;
+  tokenId?: string;
+  /** 推进**前**令牌所在节点（动作发生地） */
   from?: string;
+  /** 推进**后**令牌所在节点；令牌已终结则无 */
   to?: string;
-  kind: 'action' | 'primitive';
+  payload?: Record<string, unknown>;
 }
 
 /**
@@ -121,4 +137,28 @@ export function touchedTaskIds(delta: TaskDelta): string[] {
   for (const t of delta.added) push(t.taskId);
   for (const t of delta.changed) push(t.taskId);
   return out;
+}
+
+/**
+ * ★ 本次动作作用在**哪个令牌**上 —— **唯一口径**。
+ *
+ * 判据（与 `actions/compile.ts` 的 `resolveToken` 同一套，只是这里优先按 `actor` 认领）：
+ *   ① 办理人 == `actor` 的在途令牌恰好 1 个 → 它（会签下"我办我那条"就是靠这条）；
+ *   ② 否则若全局在途令牌恰好 1 个 → 它；
+ *   ③ 否则 → `undefined`（交给 `compileAction` 报"无法唯一定位"，或该动作本就不需要令牌）。
+ *
+ * ⚠️ ① 与 ② 都不命中时**不猜**：猜错令牌 = 改到了别人的待办，是最难查的一类误伤。
+ *
+ * ★ 为什么必须收口到这一处：`submit()` 用它认领令牌，`plan()` 用它填审计的
+ *   `tokenId` / `from` / `to`（**D-88**）。两处各写一份"看起来差不多"的定位逻辑，
+ *   就会出现「审计说办的是 A 分支、实际推进的是 B 分支」—— 而两份代码单独看都对。
+ */
+export function subjectTokenOf(state: InstanceState, actor: string): Token | undefined {
+  const live = state.tokens.filter((t) => LIVE_TOKEN_STATES.includes(t.state));
+  if (live.length === 0) return undefined;
+
+  const mine = live.filter((t) => t.assignee !== undefined && t.assignee === actor);
+  if (mine.length === 1) return mine[0];
+  if (live.length === 1) return live[0];
+  return undefined;
 }
