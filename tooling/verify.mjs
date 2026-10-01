@@ -65,10 +65,18 @@ const NPM_CLI = localBin(
 
 // ---------- 进程内退化实现 ----------
 
+/**
+ * ★ 类型检查跑**两个 project**（见 `ARCHITECTURE.md` 的 **D-13**）：
+ *   ① `tsconfig.json` —— 只含 `src`，按 **NodeNext** 解析（与**产物**的解析规则一致，强制 `.js` 扩展名）；
+ *   ② `tsconfig.test.json` —— 含 `src` + `test`，按 **Bundler** 解析（与 **vitest / Vite** 的解析规则一致）。
+ *   只跑 ① 时 `test/**` 从未被类型检查过（实测代价：连续三轮靠手工补跑才抓出真实类型错误）。
+ */
+const TYPECHECK_PROJECTS = ['tsconfig.json', 'tsconfig.test.json'];
+
 /** 进程内调用 TypeScript API 做类型检查；无错误返回 '' */
-async function tscInProcess() {
+async function tscInProcess(project = 'tsconfig.json') {
   const ts = await import(pathToFileURL(join(root, 'node_modules', 'typescript', 'lib', 'typescript.js')).href);
-  const cfg = ts.readConfigFile(join(root, 'tsconfig.json'), ts.sys.readFile);
+  const cfg = ts.readConfigFile(join(root, project), ts.sys.readFile);
   const parsed = ts.parseJsonConfigFileContent(cfg.config, ts.sys, root);
   const program = ts.createProgram(parsed.fileNames, { ...parsed.options, noEmit: true });
   const diags = ts.getPreEmitDiagnostics(program);
@@ -107,18 +115,21 @@ function staticPackPaths() {
   return [...listed, ...auto.filter((f) => existsSync(join(root, f)))];
 }
 
-// 1. check:types
+// 1. check:types（两个 project：源码按 NodeNext、测试按 Bundler，见 D-13）
 try {
-  try {
-    if (!TSC) throw new Error('typescript 未安装（找不到 node_modules/typescript/bin/tsc）');
-    run(TSC, ['-p', 'tsconfig.json', '--noEmit']);
-  } catch (spawnErr) {
-    if (!SPAWN_BLOCKED.test(String(spawnErr.message || spawnErr))) throw spawnErr;
-    const out = await tscInProcess();
-    if (out) throw new Error(out);
-    console.log('\u00b7 check:types \u2014 子进程不可用，已用进程内 tsc 完成');
+  if (!TSC) throw new Error('typescript 未安装（找不到 node_modules/typescript/bin/tsc）');
+  for (const project of TYPECHECK_PROJECTS) {
+    if (!existsSync(join(root, project))) throw new Error(`缺少 ${project}（D-13：测试必须参与类型检查）`);
+    try {
+      run(TSC, ['-p', project, '--noEmit']);
+    } catch (spawnErr) {
+      if (!SPAWN_BLOCKED.test(String(spawnErr.message || spawnErr))) throw spawnErr;
+      const out = await tscInProcess(project);
+      if (out) throw new Error(out);
+      console.log(`\u00b7 check:types(${project}) \u2014 子进程不可用，已用进程内 tsc 完成`);
+    }
   }
-  ok('check:types');
+  ok('check:types', `${TYPECHECK_PROJECTS.length} 个 project（src + test）`);
 } catch (e) {
   bad('check:types', 'tsc 报类型错误（见上方）');
   console.error((e.stdout?.toString?.() || '') + (e.stderr?.toString?.() || '') + (e.message || ''));
@@ -176,7 +187,7 @@ try {
   console.error((e.stdout?.toString?.() || '') + (e.stderr?.toString?.() || '') + (e.message || ''));
 }
 
-// 4. check:deps —— dist 不得含 temporal 静态引用
+// 4. check:deps —— dist 的 import 说明符体检（Q33 + 「产物引用必须已声明」）
 const dist = join(root, 'dist');
 if (existsSync(dist)) {
   const walkDir = (d) =>
@@ -184,9 +195,36 @@ if (existsSync(dist)) {
       e.isDirectory() ? walkDir(join(d, e.name)) : [join(d, e.name)],
     );
   const js = walkDir(dist).filter((f) => f.endsWith('.js'));
-  const hit = js.some((f) => /temporal-polyfill|from ['"]temporal/.test(readFileSync(f, 'utf8')));
-  if (hit) bad('check:deps', 'dist 中检出 temporal 静态引用（NFR-F12 违例）');
-  else ok('check:deps', '无 temporal 静态引用');
+  const src = js.map((f) => readFileSync(f, 'utf8')).join('\n');
+
+  // ① Q33：产物不得引用时态（`temporal-polyfill` 本体 / `@floken-io/feel/temporal` 子路径）。
+  //    口径是「**说明符**里有没有」，不是「文件里有没有 temporal 字样」——
+  //    后者会把 `TEMPORAL_FUNCTIONS` 这类无关标识符一起误报。
+  const specifiers = new Set(
+    [...src.matchAll(/(?:from|import)\s*\(?\s*['"]([^'"]+)['"]/g)].map((m) => m[1]),
+  );
+  const temporalHits = [...specifiers].filter((s) => /^temporal|^@floken-io\/feel\/temporal/.test(s));
+  if (temporalHits.length) {
+    bad('check:deps', `dist 引用了时态: ${temporalHits.join(', ')}（Q33 违例）`);
+  } else {
+    ok('check:deps', `无时态引用（扫到 ${specifiers.size} 个说明符）`);
+  }
+
+  // ② 产物引用的**外部包**必须在 package.json 的依赖里声明 ——
+  //    否则「装了 engine 却跑不起来」要等到用户那里才炸（漏声明是最常见的发布事故）。
+  const pkg = JSON.parse(readFileSync('package.json', 'utf8'));
+  const declared = new Set([
+    ...Object.keys(pkg.dependencies ?? {}),
+    ...Object.keys(pkg.peerDependencies ?? {}),
+  ]);
+  const pkgNameOf = (s) => (s.startsWith('@') ? s.split('/').slice(0, 2).join('/') : s.split('/')[0]);
+  const external = [...specifiers].filter((s) => !s.startsWith('.') && !s.startsWith('node:'));
+  const undeclared = [...new Set(external.map(pkgNameOf))].filter((n) => !declared.has(n));
+  if (undeclared.length) {
+    bad('check:deps', `产物引用了未声明的包: ${undeclared.join(', ')}（加到 dependencies）`);
+  } else {
+    ok('check:deps', `外部引用全部已声明（${[...new Set(external.map(pkgNameOf))].join(', ') || '无'}）`);
+  }
 } else {
   console.log('\u00b7 check:deps \u2014 跳过（dist 尚未构建）');
 }

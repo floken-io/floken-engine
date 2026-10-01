@@ -1,0 +1,11 @@
+{
+  "//": "★ 测试代码的类型检查（`ARCHITECTURE.md` D-13）。为什么不是复用 tsconfig.json：源码按 **NodeNext** 解析（因为产物是 Node 直跑的 ESM，相对导入必须带 .js）；而测试由 **vitest / Vite** 加载，走的是 **Bundler** 解析（无扩展名 / 目录 index / .js→.ts 都能解析）。用哪套规则检查，取决于**文件最终由谁加载** —— 所以必须分两个 project，各自贴合真实执行环境。只跑 tsconfig.json 时 test/** 完全在类型检查之外，实测已连续三轮漏掉真实类型错误。",
+  "extends": "./tooling/tsconfig.base.json",
+  "compilerOptions": {
+    "noEmit": true,
+    "rootDir": ".",
+    "module": "ESNext",
+    "moduleResolution": "Bundler"
+  },
+  "include": ["src", "test"]
+}
