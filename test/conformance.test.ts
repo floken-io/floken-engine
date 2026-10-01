@@ -5,13 +5,15 @@
  * ★ 这个文件里最值钱的不是"正向全绿"，而是**反向验收**
  * ═══════════════════════════════════════════════════════════════
  * 一个只会对着正确实现点头的套件**毫无价值** —— 它和 `expect(true).toBe(true)` 等价，
- * 却让人以为"验过了"。所以这里故意写了三个**有特定缺陷**的假实现：
+ * 却让人以为"验过了"。所以这里故意写了**五个**有特定缺陷的假实现：
  *
  * | 假实现 | 缺陷 | 它模拟的真实事故 |
  * |---|---|---|
  * | `createSilentOverwriteStore()` | 把 `expectedRev` 当提示而非约束 | 两个并发审批都"成功"，后者抹掉前者 → **少了一次审批，且没有任何报错** |
  * | `createAliasingStore()` | 存引用 / 交引用 | 宿主改一下手里那个对象，就改到了"已提交状态" → **连 CAS 都失效** |
  * | `createForgetfulProjection()` | 只处理 `added` / `changed` | 或签一人通过后其余人的待办还在 → 要等**用户投诉**才发现 |
+ * | `createVersionBlindSource()` | `getDefinition` **不看 `version`** | 在途实例跑到发起时**还不存在的节点**上 → 「昨天发起的单子今天忽然多出一个审批人」（AC-E10 头号事故） |
+ * | `createThrowingSource()` | 取不到就**抛错**而非返回 `null` | 引擎分不清「这一版没有」与「定义库挂了」→ 错误契约失守 |
  *
  * 每个假实现都断言：**套件必须点名抓出它那一条**（而不是笼统地 `ok === false`）。
  * 这样将来有人"为了让套件跑绿"而放宽某条判据时，这里会立刻变红。
@@ -24,15 +26,18 @@ import { describe, expect, it } from 'vitest';
 
 import {
   formatConformanceReport,
+  runDefinitionConformance,
   runProjectionConformance,
   runStoreConformance,
 } from '../src/entries/conformance';
-import type { ConformanceReport } from '../src/entries/conformance';
+import type { ConformanceReport, DefinitionFixture } from '../src/entries/conformance';
 import { persistAlreadyExists, persistConflict } from '../src/core/errors';
-import type { StateStore, TaskProjection } from '../src/core/spi';
+import type { DefinitionSource, StateStore, TaskProjection } from '../src/core/spi';
 import type { InstanceState } from '../src/core/state';
 import type { TaskDelta, TaskView } from '../src/core/task';
 import { createMemoryStore } from '../src/store/memory';
+import { makeDefinition, mapSource, userApproval } from './helpers/definition';
+import type { ProcessDefinition } from '@floken-io/moddle';
 import { createMemoryProjection } from './helpers/memory-projection';
 
 // ═══════════════════════════════════════════════════════════════
@@ -123,6 +128,62 @@ function createForgetfulProjection(): {
 }
 
 // ═══════════════════════════════════════════════════════════════
+// ★ `DefinitionSource` 的两个坏实现（T19 · AC-E10）
+// ═══════════════════════════════════════════════════════════════
+
+/** 同一 `processId` 的 v1 / v2：第二个节点的 id 不同 —— 这就是「version 有没有被用上」的观测点 */
+function expenseV(version: 1 | 2): ProcessDefinition {
+  const taskId = version === 1 ? 'Task_v1' : 'Task_v2';
+  return makeDefinition({
+    id: `Definitions_expense_v${version}`,
+    version,
+    processId: 'expense',
+    nodes: [
+      { id: 'Start_1', type: 'startEvent' },
+      {
+        id: taskId,
+        type: 'userTask',
+        name: `审批 v${version}`,
+        approval: userApproval(version === 1 ? 'u_1' : 'u_2'),
+      },
+      { id: 'End_1', type: 'endEvent' },
+    ],
+    flows: [
+      { from: 'Start_1', to: taskId },
+      { from: taskId, to: 'End_1' },
+    ],
+  });
+}
+
+/**
+ * ✗ **忽略 `version` 参数** —— 永远返回最新版。
+ * 这是 `AC-E10` 的头号事故：在途实例会跑到它发起时**还不存在的节点**上，且没有任何报错。
+ */
+function createVersionBlindSource(latest: ProcessDefinition): DefinitionSource {
+  return {
+    async getDefinition(processId: string): Promise<ProcessDefinition | null> {
+      // ✗ 第二个参数压根没接 —— 于是 v1 / v2 / v99 全都返回同一份
+      return processId === 'expense' ? latest : null;
+    },
+  };
+}
+
+/**
+ * ✗ 取不到就**抛错**而不是返回 `null` —— 引擎分不清「这一版没有」与「仓库挂了」，
+ * `AC-E10` 的错误契约（统一翻成 `ENGINE_STATE_DEFINITION_MISSING`）当场失守。
+ */
+function createThrowingSource(entries: Readonly<Record<string, ProcessDefinition>>): DefinitionSource {
+  return {
+    async getDefinition(processId: string, version: number): Promise<ProcessDefinition | null> {
+      const def = entries[`${processId}@${version}`];
+      // ✗ 该返回 null 的地方抛了宿主的自定义错
+      if (def === undefined) throw new Error(`definition ${processId}@${version} not found`);
+      return def;
+    },
+  };
+}
+
+// ═══════════════════════════════════════════════════════════════
 // 正向：官方实现跑套件（顶层 await —— 用例名要在收集阶段就确定）
 // ═══════════════════════════════════════════════════════════════
 
@@ -137,9 +198,25 @@ const projectionReport: ConformanceReport = await runProjectionConformance(
   { subject: 'test/helpers/memory-projection' },
 );
 
+// ★ `DefinitionSource` 套件要宿主先声明「库里这一格长这样」（定义是业务资产，套件造不出来）
+const definitionEntries: Record<string, ProcessDefinition> = {
+  'expense@1': expenseV(1),
+  'expense@2': expenseV(2),
+};
+const definitionFixtures: readonly DefinitionFixture[] = [
+  { processId: 'expense', version: 1, definition: expenseV(1) },
+  { processId: 'expense', version: 2, definition: expenseV(2) },
+];
+const definitionReport: ConformanceReport = await runDefinitionConformance(
+  mapSource(definitionEntries),
+  definitionFixtures,
+  { subject: 'test: mapSource（两个版本）' },
+);
+
 // 断言 = 规格说明书：把结论打出来，人扫一眼就知道覆盖了哪几条契约
 console.log(formatConformanceReport(storeReport));
 console.log(formatConformanceReport(projectionReport));
+console.log(formatConformanceReport(definitionReport));
 
 describe('契约测试套件 · 正向：官方实现必须全绿', () => {
   it('store 套件覆盖足够多判据（防止套件被改空后静默通过）', () => {
@@ -150,15 +227,19 @@ describe('契约测试套件 · 正向：官方实现必须全绿', () => {
     expect(projectionReport.total).toBeGreaterThanOrEqual(9);
   });
 
+  it('definition 套件覆盖足够多判据（AC-E10 的四条版本语义）', () => {
+    expect(definitionReport.total).toBeGreaterThanOrEqual(7);
+  });
+
   it('每条用例都标了规格锚点（否则失败时无法回溯到规范）', () => {
-    const missing = [...storeReport.cases, ...projectionReport.cases]
+    const missing = [...storeReport.cases, ...projectionReport.cases, ...definitionReport.cases]
       .filter((c) => c.refs.length === 0)
       .map((c) => c.name);
     expect(missing).toEqual([]);
   });
 
   it('报告计数自洽（total = passed + failed，ok ≡ failed === 0）', () => {
-    for (const r of [storeReport, projectionReport]) {
+    for (const r of [storeReport, projectionReport, definitionReport]) {
       expect(r.total).toBe(r.passed + r.failed);
       expect(r.ok).toBe(r.failed === 0);
       expect(r.cases.length).toBe(r.total);
@@ -173,6 +254,12 @@ describe('契约测试套件 · 正向：官方实现必须全绿', () => {
 
   for (const c of projectionReport.cases) {
     it(`projection · ${c.name}${c.refs.length > 0 ? ` [${c.refs.join(' ')}]` : ''}`, () => {
+      expect(c.error).toBeUndefined();
+    });
+  }
+
+  for (const c of definitionReport.cases) {
+    it(`definition · ${c.name}${c.refs.length > 0 ? ` [${c.refs.join(' ')}]` : ''}`, () => {
       expect(c.error).toBeUndefined();
     });
   }
@@ -214,6 +301,35 @@ describe('契约测试套件 · 反向验收：能抓出静默错误', () => {
     expect(report.cases.find((c) => c.name.includes('CAS 成功'))?.ok).toBe(true);
   });
 
+  it('★ 「忽略 version 参数」的 source 会被抓出（AC-E10 头号事故）', async () => {
+    const report = await runDefinitionConformance(
+      createVersionBlindSource(expenseV(2)),
+      definitionFixtures,
+      { subject: 'broken: getDefinition 不看 version（永远返回最新版）' },
+    );
+    expect(report.ok).toBe(false);
+
+    const names = failingNames(report);
+    // 必须点名到"版本没被用上"这一条，而不是笼统地红
+    expect(names).toContain('不同 version 返回不同内容');
+    expect(names).toContain('未知 version');
+    // 缺陷只在「version」这一维：未知 processId 仍返回 null，不该被误判
+    expect(report.cases.find((c) => c.name.includes('未知 processId'))?.ok).toBe(true);
+  });
+
+  it('★ 「取不到就抛错」的 source 会被抓出（应返回 null，让引擎翻成 DEFINITION_MISSING）', async () => {
+    const report = await runDefinitionConformance(createThrowingSource(definitionEntries), definitionFixtures, {
+      subject: 'broken: 未知 (pid, version) 抛错而非返回 null',
+    });
+    expect(report.ok).toBe(false);
+
+    const names = failingNames(report);
+    expect(names).toContain('未知 processId');
+    expect(names).toContain('未知 version');
+    // 已存在的格子取回是对的 —— 红得**精准**，不是"反正它错了就全红"
+    expect(report.cases.find((c) => c.name.includes('逐版本精确命中'))?.ok).toBe(true);
+  });
+
   it('「忽略 removed」的 projection 会被抓出（INV-15 · 头号静默错误）', async () => {
     const broken = createForgetfulProjection();
     const report = await runProjectionConformance(broken.projection, broken.list, {
@@ -241,7 +357,7 @@ describe('契约测试套件 · 自身约束', () => {
       .filter((e) => e.isFile() && e.name.endsWith('.ts'))
       .map((e) => e.name);
 
-    expect(files.length).toBeGreaterThanOrEqual(3); // store / projection / report
+    expect(files.length).toBeGreaterThanOrEqual(4); // store / projection / definition / report
     for (const name of files) {
       const src = readFileSync(new URL(name, dir), 'utf8');
       // ⚠️ 先剔除**注释行**再判：套件正文里恰恰在**解释**为什么不能 import vitest，
@@ -263,10 +379,11 @@ describe('契约测试套件 · 自身约束', () => {
     }
   });
 
-  it('公开面 = 3 个运行时导出（防 `export *` 把内部断言工具变成契约）', async () => {
+  it('公开面 = 4 个运行时导出（防 `export *` 把内部断言工具变成契约）', async () => {
     const mod = await import('../src/entries/conformance');
     expect(Object.keys(mod).sort()).toEqual([
       'formatConformanceReport',
+      'runDefinitionConformance',
       'runProjectionConformance',
       'runStoreConformance',
     ]);

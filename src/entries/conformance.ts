@@ -25,5 +25,16 @@ export type {
   ProjectionReadback,
 } from '../conformance/projection.js';
 
+/**
+ * ★ 三套里唯一需要宿主**额外交输入**的：`DefinitionSource` 是只读线，套件没法自己造定义
+ * （定义是业务资产），所以由宿主声明「库里这一格长这样」再逐格取回比对。
+ * 详见 `conformance/definition.ts` 文件头。
+ */
+export { runDefinitionConformance } from '../conformance/definition.js';
+export type {
+  DefinitionFixture,
+  DefinitionConformanceOptions,
+} from '../conformance/definition.js';
+
 export { formatConformanceReport } from '../conformance/report.js';
 export type { ConformanceCase, ConformanceReport } from '../conformance/report.js';

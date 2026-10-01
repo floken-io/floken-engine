@@ -42,7 +42,7 @@ export interface ConformanceCase {
 
 /** 一次契约测试的完整结果（`ok` = 全绿） */
 export interface ConformanceReport {
-  /** 套件名：`'store'` | `'projection'` */
+  /** 套件名：`'store'` | `'projection'` | `'definition'` */
   suite: string;
   /** 被测实现的自述（宿主传入，便于日志里区分多套实现） */
   subject?: string;

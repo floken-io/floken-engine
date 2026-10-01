@@ -388,6 +388,7 @@ interface ConvergeCtx {
 | INV-16 | `CallActivity` 子实例的 `definitionVersion` = 设计期**显式绑定**的版本，不等于宿主最新版本 | 子实例创建时 | `nodes/activities.ts`（`callTargetOf`）/ `runtime/engine.ts`（`doStartChild`） | 版本绑定断言 ✅ **T18 已验**（绑定 v1 而 v2 存在 → 子实例仍是 v1；未绑定 → 抛） |
 | INV-17 | `auditTrail.length ≤ maxAuditEntries`（配置后）；溢出部分走 `EventSink`，**不得静默丢弃** | 每次追加后 | `runtime/plan.ts` | 上限测试 + 溢出可见性断言 |
 | INV-18 | `pendingProjectionRev` 存在 ⟺ 该 `rev` 的投影尚未追平；`load()` 发现该键 → **必须先 `sync()` 补做**，完成后删除键 | `load()` 时 | `runtime/engine.ts` | 补偿路径测试（模拟 apply 失败） |
+| INV-19 | 实例的 `definitionVersion` **终身不变**（改版只影响之后发起的实例；`AC-E10`）。`null` 版本（`getDefinition` 取不到）= `ENGINE_STATE_DEFINITION_MISSING`，**绝不回退**到别版 | 每次 `plan()` 后 / 每次取图 | `runtime/plan.ts`（守卫：`options.apply` 不得改 `definitionVersion`）+ `runtime/engine.ts`（`graphOf`） | `AC-E10` + 「改版后在途仍走旧图」「绑定版被下线 → 抛错」✅ **T19 已验** |
 
 ### 6.5 设计期数据约束（静态配置）
 
@@ -506,6 +507,18 @@ interface Scheduler { schedule(req: ScheduleRequest): Promise<string>; cancel(ha
 
 **★ 越界抛错的归属**：`03` §7.2 的「越界语法抛错」是**默认 `conditionHandler`（内置 feel）**的契约；宿主注入自定义实现后判定权移交，
 但引擎对**任何**实现都保留一条第 0 层要求：**求值失败必须抛错，不得静默返回 `false`**（`AC-E9`，无豁免）。
+
+**★ `DefinitionSource` 的版本语义（T19 钉死 —— 四条即 `AC-E10` 的全部，详见 `core/spi.ts`）**：
+
+| # | 语义 | 破了会怎样 |
+|---|---|---|
+| ① | **版本精确**：查的是「第 v 版」，不是「≤ v 的最新一版」、更不是「最新版」；禁止就近取整 | 在途实例跑到发起时**还不存在的节点**上 |
+| ② | **不存在 = `null`**（不得抛自定义错、不得返回任一其他版本）→ 引擎翻成 `ENGINE_STATE_DEFINITION_MISSING` | 引擎分不清「这版没有」与「定义库挂了」 |
+| ③ | **不得改内容**：同一 `(pid, v)` 反复取回必须一致（发布即冻结） | 在途实例**中途变图** |
+| ④ | `version` 由引擎保证 ≥ 1 整数（`assertStartOptions` / `callTargetOf`）；异常入参返回 `null` 即可 | 非法入参让宿主的取图逻辑炸在引擎调用栈里 |
+
+自检工具：`runDefinitionConformance()`（`./conformance`，T19 新增）—— 它是三套里唯一要宿主**额外交 `fixtures`** 的
+（`DefinitionSource` 是只读线，套件造不出定义；与 `TaskProjection` 要交 `readback` 同理）。
 
 ### 7.3 事件与钩子（两张网，别混）
 
@@ -1161,11 +1174,24 @@ class EngineError extends Error {
 
 ### 阶段 E7 · 子流程 / 调用活动深化（v1.x）
 
-- [ ] **T19 `DefinitionSource` 版本语义与在途实例绑定**
-  组件：`runtime/engine.ts` + `core/spi.ts`
+- [x] **T19 `DefinitionSource` 版本语义与在途实例绑定**
+  组件：`runtime/engine.ts` + `core/spi.ts` + `conformance/definition.ts`
   依赖：T11, T18
   验证：`AC-E10` —— 记录 `definitionVersion` 后改版，在途实例仍按**旧版本**执行；conformance 断言「`getDefinition` 必须按 `version` 返回不同内容」（**防忽略 version 的静默错误**）；
   **冒烟**：同一 `processId` 存两个版本，分别启动两个实例，断言走的是各自的图
+  ✅ **已落地（2026-10-01）**：
+  ① **`core/spi.ts` 把版本语义写成四条硬约定**（版本精确 / 不存在 = `null` 不得回退 / 不得改内容 / 异常入参返回 `null`），
+     并交代「宿主抛自定义错 → 引擎分不清『这版没有』与『仓库挂了』」（与 `StateStore` 必须用 `persistConflict()` 同一条理由）。
+  ② **新增 INV-19** + 在 `plan()` 的 `apply` 接缝落守卫：`next.definitionVersion !== state.definitionVersion` → 抛 `STATE_SHAPE_INVALID`。
+     ★ 放这里是有意的：`plan()` 是 `submit()` 与门 2 的**唯一**演化入口，一条守卫同时护住两条路（与 `rev` 守卫同位）。
+  ③ **新增 `conformance/definition.ts`**（`runDefinitionConformance`）—— 7 条判据，头号目标是「忽略 `version` 参数」；
+     ★ 它是三套里唯一要宿主**额外交 `fixtures`** 的：定义是业务资产，套件造不出来（见 §7.2 那条表）。
+  ④ 反向验收补两个坏实现：`createVersionBlindSource()`（不看 version）/ `createThrowingSource()`（取不到就抛），
+     各断言**点名**抓到对应判据，且缺陷维度之外仍然绿（证明红得精准）。
+  ⑤ 端到端：v1 = 两段审批、v2 中间**插入** `Task_new` —— 在途实例改版后仍走 `Task_b`；绑定版被下线 → `STATE_DEFINITION_MISSING`
+     （且失败提交不留下半截状态：`rev` 不前进、令牌仍在原节点）。
+  ⑥ 顺手修了 `test/helpers/expect.ts`：`expectCodeAsync` 原只收 Promise，误传 thunk 时 `await` 正常返回 →
+     「期望抛错」的断言**永远通过却什么都没验**（T19 写测试时踩到），现两种都收且形状不对就炸。
 
 ### 阶段 E8 · 边界事件 / 补偿 / 事件驱动（v1.x）
 
@@ -1209,6 +1235,7 @@ class EngineError extends Error {
 | 2026-09-30 | **D-13 落地**：测试代码纳入类型检查 —— 新增 `tsconfig.test.json`（Bundler 解析），`check:types` 改跑 **2 个 project**；`06` §3/§6 写死形制。**反向验收**：注入类型错误 → 新口径红、旧口径不红 | §9 / §10 / `06` | D-13 | `verify` 输出「check:types — 2 个 project（src + test）」 |
 | 2026-09-30 | **T9 落地**：`actions/{catalog,compile,gates}.ts` —— 19 项动作映射表（20 个可提交名字）、设计期开关校验（DV-2/3/5、AC-E2/E15）；与 `03` §4 主表**逐字对账**；公开面只导出动作名与 `enabledActionNames` | §5 / §9 / §10 | T9 / D-18 | `verify` PASSED + 探针 **29/29** + **274 单测** + `src+test` 类型检查 0 err（本轮 D-13 抓出 5 处写错的码名） |
 | 2026-10-01 | **T16 落地**：`nodes/events.ts`（事件 6 类）+ `nodes/gateways.ts`（网关 5 类）+ `runtime/loop.ts` 的分叉 / 汇聚 + `runtime/engine.ts` 的条件接线；**D-49** 汇聚判据改为图可达性（包容网关不再死锁）、**D-50** 合流必须在推进之前、**D-51** 条件走惰性解析 + `ConditionUnresolved` 哨兵重跑、**D-53** `Token.branch` 收口 **D-47**（并行下 `rollbackTo` 只撤本分支）、**D-55** `payload` 在探测之前并入；**482 单测** + 探针 **60/60** | §5 / §9 / §10 | T16 / D-42 / D-47 / D-48~D-55 | `verify` PASSED + 两个 project 类型检查 0 err |
+| 2026-10-01 | **T19 落地**：`DefinitionSource` 版本语义与在途实例绑定（`AC-E10`）。`core/spi.ts` 把版本语义写成四条硬约定（版本精确 / 不存在 = `null` **绝不回退** / 不得改内容 / 异常入参返回 `null`）；新增 **INV-19** + 在 `plan()` 的 `apply` 接缝落守卫（★ 放这里是因 `plan()` 为两条路径唯一演化入口，一条守卫护住 `submit()` 与门 2）；新增 `conformance/definition.ts`（`runDefinitionConformance`，7 条判据，头号目标是「忽略 `version` 参数」；三套里唯一要宿主交 `fixtures` —— 定义是业务资产、套件造不出来）；反向验收补「不看 version」「取不到就抛」两个坏实现并断言**点名**抓到。端到端用「v1 两段审批 / v2 中间插入 `Task_new`」做观测点：改版后在途仍走 `Task_b`、绑定版下线 → `DEFINITION_MISSING` 且不留下半截状态。顺手修 `expectCodeAsync` 误传 thunk 时断言静默失效（D-70）。**591 单测** + 探针 **77/77** | §6.4 / §7.2 / §9 / §10 | T19 / INV-19 / D-67~D-70 | `verify` PASSED + 两个 project 类型检查 0 err |
 | 2026-10-01 | **T18 落地**：`nodes/activities.ts`（活动 / 子流程 4 类）+ `nodes/graph.ts` 接入内嵌展开 + `runtime/engine.ts` 的子实例链路。内嵌子流程**在建图时拍平**（内嵌 `endEvent` → `subProcessExit`，否则令牌会被判终结、出口后的节点永远走不到）；`CallActivity` = **子实例 + 等待 + 自动回归**（子实例 id 确定性、父令牌 `waiting`、子实例终态唤醒父实例、父实例终态连坐终止子实例）；★ 后续动作一律放在 `queue.run()` **之外**（否则「子实例一建就跑完 → 回头唤醒父实例」= 自锁）；版本绑定读 `extension['floken:call'].version`，**缺即抛**（INV-16）；`AdHocSubProcess` / `Transaction` / 事件子流程显式抛并指名 FR-E18 / FR-E13 / FR-E24。另补 **AC-E1 巡检**（20 个可提交名逐个不得抛 `ACTION_UNKNOWN` + 反证）；**572 单测** + 探针 **73/73** | §5 / §6.1 / §7.1 / §9 / §10 | T18 / INV-16 / D-62~D-66 | `verify` PASSED + 两个 project 类型检查 0 err |
 | 2026-10-01 | **T17 落地**：`nodes/tasks.ts`（任务 8 类）+ `nodes/flows.ts`（连线与数据 4 类）+ `eval/script.ts`（FEEL 脚本求值）+ 副作用接线（`LoopContext.effectsOf` + `NodeEffectUnresolved` 哨兵重跑）；**D-56** `sendTask` 与 `intermediateThrowEvent` 同处置（显式抛错，ADR-006 事件集定死 10 个）、**D-57** 非 FEEL 脚本先查 `handlers` 表、**D-58** 服务重试归内核外、**D-59** FEEL 结果落 `variables[nodeId]`、**D-60** 副作用按 `${nodeId}::${tokenId}` 缓存且条件取「此刻」变量快照、**D-61** 源码扫描必须去注释；**538 单测** + 探针 **69/69** | §5 / §7.3 / §9 / §10 | T17 / D-52 / D-56~D-61 | `verify` PASSED + 两个 project 类型检查 0 err（产物层双层扫描：无 `new Function` / `node:vm` / `eval(`） |
 | 2026-10-01 | **D-21 / D-31 在模型层修根因**：`floken-moddle` 的 `shouldTerminate()` 重排规则序（先按 `mode` 判，`pending === 0` 的多数决兜底只对票签生效）；引擎侧 `convergence.ts` 的 `mode:'all' && rejected>0` 短路**整块删除**，对账测试取消例外格改为逐格全一致（>300 组）；**482 单测** + 探针 **60/60** | §5 / §9 / §10 | D-19 / D-21 / D-31 | `verify` PASSED + 两个 project 类型检查 0 err（moddle 侧 299 单测全绿 + dist 已重建同步） |
@@ -1289,3 +1316,7 @@ class EngineError extends Error {
 | **D-64** ⚠️ | **内嵌 `endEvent` 在展开时改写为 `subProcessExit`** | 不改的话 `runToWait` 一见 `endEvent` 就把令牌判**终结** —— 子流程出口后面的节点永远走不到，且没有任何报错（比抛错难查得多）。这是"拍平"方案唯一的语义陷阱 | ✅ 已落地（`SUBPROCESS_EXIT_TYPE`，落到自动直通）。测试钉住「内嵌结束事件的 `type` **不是** `endEvent`」 |
 | **D-65** ⚠️ | **`CallActivity` 的后续动作必须在 `queue.run()` 之外**（`followUp()`） | 子实例**一建就跑完**（被调用流程里没有人工节点）是常态，于是要回头唤醒父实例。若这段留在父实例的队列里就是「父等子、子等父」的**自锁** —— 而 `runtime/queue.ts` 档首写明**刻意不做重入检测**，并点名"应在 engine 层拦" | ✅ 已落地（`submit` = `queue.run(doSubmit)` → `followUp`；`startChild` / `resumeParent` 各自入**自己的**队列）。顺序：父队列已返回 → 建子实例 → 子实例终态 → 再入父队列唤醒 |
 | **D-66** ⚠️ | **父实例终态必须连坐终止在跑的子实例**（`haltLiveChildren`） | 父实例一终止，`resumeParent()` 就**永远不会**再触发 —— 子实例会继续产生待办，而宿主看主流程已是终态。「案子都撤了、子流程还在催人审批」是这类引擎的典型事故，且**没有任何报错** | ✅ 已落地（终止子实例 + 取消在途令牌 + 投影移除待办 + 递归到孙实例） |
+| **D-67** ⚠️ | **`getDefinition` 取不到第 v 版时必须返回 `null`，**绝不**回退到别版** | 「回退到最新版」听起来是容错，实际是**静默换图**：在途实例会跑到发起时还不存在的节点上 —— 「昨天发起的单子今天忽然多出一个审批人」，且没有任何报错可循。返回 `null` 才让引擎把它翻成 `ENGINE_STATE_DEFINITION_MISSING`（可观测、可告警）。`AC-E10` 的全部内容其实就是这条 + 「忽略 `version` 参数」 | ✅ 已落地（`core/spi.ts` 版本语义 ②；`graphOf()` 拿 `null` 即抛）。测试钉住「v1 被下线而 v2 存在 → 抛 `DEFINITION_MISSING`，且 `rev` 不前进、令牌仍在原节点」 |
+| **D-68** ⚠️ | **INV-19 的守卫放在 `plan()` 的 `apply` 接缝里**（不是 `engine.ts`） | `plan()` 是 `submit()` 与门 2 自编排的**唯一**演化入口 —— 放这里**一条守卫同时护住两条路**；放 `engine.ts` 则门 2 完全裸奔，而「两条路径不得分叉」正是 §7.1 写死的东西。与同处已有的 `rev` 守卫（INV-1）完全同位 | ✅ 已落地（`runtime/plan.ts`：`next.definitionVersion !== state.definitionVersion` → `STATE_SHAPE_INVALID`）。反证用例：同版本提交照常通过（防守卫变成"永远抛错"） |
+| **D-69** | **`DefinitionSource` 契约套件必须由宿主交 `fixtures`**（三套里唯一） | `StateStore` 的用例能自己造假状态（状态是引擎的数据），但**定义是业务资产** —— 随包发布的套件不可能知道宿主库里有哪些流程。硬要自造就得给套件内置"示例流程"，那等于给引擎塞业务资产并背上 semver 约束（与 `test/helpers/definition.ts` 刻意不放进 `src/` 同一条理由） | ✅ 已落地（`runDefinitionConformance(source, fixtures, options)`；与 `TaskProjection` 要交 `readback` 同理）。套件**第一条用例就是 `fixtures` 自检**：同 pid 须 ≥2 个版本且内容互不相同，否则「忽略 version」根本无法被观测 |
+| **D-70** | **`expectCodeAsync` 必须拒收非 Promise**（误传 thunk 会让断言静默失效） | 原签名只收 Promise。误传 `() => engine.start(...)` 时 `await` 一个函数**正常返回**，于是「应当抛错」的断言**永远通过却什么都没验** —— 而这个助手存在的唯一意义就是防假断言（`toThrow(码名)` 匹配不上 message 却也不报错，详见它自己的档首）。T19 写测试时踩到 | ✅ 已落地（`test/helpers/expect.ts`：接受 Promise 与 thunk 两种，形状不对就 `throw TypeError`） |

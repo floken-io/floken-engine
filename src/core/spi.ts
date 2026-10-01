@@ -49,6 +49,27 @@ export interface StateStore {
  *
  * ★ 必填。理由：`AC-E10` 要求「v1.0 改版后，在途实例仍按**旧版本**定义执行」——
  * 定义必须能被按 `(processId, version)` 取回，而不是每次 `submit()` 由宿主递进来。
+ *
+ * ═══════════════════════════════════════════════════════════════
+ * ★★ 版本语义（T19 钉死 —— 这四条就是 `AC-E10` 的全部内容）
+ * ═══════════════════════════════════════════════════════════════
+ *
+ * ① **版本精确**：`getDefinition(pid, v)` 是「第 v 版」的**等值查询**，不是「≤ v 的最新一版」，
+ *    更不是「最新版」。宿主**不得**做就近取整（`Math.round`）或"取不到就退到上一版"。
+ *    理由：一次静默回退 = 在途实例跑到了它发起时**还不存在的节点**上。
+ *
+ * ② **不存在 = `null`**：该 `(pid, v)` 不在库里就返回 `null`（不得抛错、不得返回任一其他版本）。
+ *    引擎侧统一把 `null` 翻成 `ENGINE_STATE_DEFINITION_MISSING`。
+ *    ⚠️ 宿主若抛自定义错，引擎就**分不清**「这版没有」与「仓库挂了」—— 与 `StateStore`
+ *    必须用 `persistConflict()` 抛错（见 `report.ts`）同一条理由。
+ *
+ * ③ **不得改内容**：同一 `(pid, v)` 反复取回必须内容一致（发布即冻结）。
+ *    「改一版的定义而不升版本号」会让在途实例**中途变图**，这是 `AC-E10` 的头号破防方式。
+ *
+ * ④ **`version` 由引擎保证 ≥ 1 的整数**（`assertStartOptions` 与 `callTargetOf` 各自校验），
+ *    宿主不必重复校验；但对**异常入参**（0 / 负数 / 小数 / `NaN`）应返回 `null` 而非抛错。
+ *
+ * 契约自检：`runDefinitionConformance()`（`./conformance`）把这四条变成可跑的判据。
  */
 export interface DefinitionSource {
   getDefinition(processId: string, version: number): Promise<ProcessDefinition | null>;

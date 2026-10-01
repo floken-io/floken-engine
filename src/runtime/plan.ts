@@ -120,6 +120,16 @@ export function plan(state: InstanceState, action: ActionInput, options: PlanOpt
         got: next.rev,
       });
     }
+    // ★ 接缝不得偷改 `definitionVersion`（INV-19 / AC-E10）：
+    //   实例一旦绑定版本就**终身不变**，改版只影响之后发起的实例。
+    //   这里放行一次「改版即换图」，在途实例就会**中途跑到新版本的节点上** ——
+    //   症状是「昨天发起的单子今天忽然多出一个审批人」，且**没有任何报错**。
+    if (next.definitionVersion !== state.definitionVersion) {
+      throw stateShapeInvalid(
+        'options.apply must not touch definitionVersion (INV-19: an instance is bound to its version for life)',
+        { expected: state.definitionVersion, got: next.definitionVersion },
+      );
+    }
   }
 
   // ⑤ rev + 1（INV-1 单调）。与 `store/memory.ts` 的归一化口径一致：写入恒取 `expectedRev + 1`

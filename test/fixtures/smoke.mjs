@@ -282,11 +282,48 @@ check('./conformance 子路径解析落在 dist/conformance.js（三处同步生
 
 const conf = await import('@floken-io/engine/conformance');
 
-check('conformance 公开面 = 3 个运行时导出（内部断言工具未泄漏成契约）', () => {
+check('conformance 公开面 = 4 个运行时导出（内部断言工具未泄漏成契约）', () => {
   sameArray(
     Object.keys(conf).sort(),
-    ['formatConformanceReport', 'runProjectionConformance', 'runStoreConformance'],
+    [
+      'formatConformanceReport',
+      'runDefinitionConformance',
+      'runProjectionConformance',
+      'runStoreConformance',
+    ],
     '导出键',
+  );
+});
+
+/**
+ * ★ T19：三套里唯一要宿主**额外交输入**的（`DefinitionSource` 是只读线，套件造不出定义）。
+ *   探针直接拿自己造的两版定义跑一遍 —— 既验公开面，也验「套件在真实产物上跑得动」。
+ */
+await checkAsync('T19 · `runDefinitionConformance` 可跑：合规实现全绿，忽略 version 的必红', async () => {
+  const v1 = { schemaVersion: '1.0.0', id: 'D1', version: 1, processes: [{ id: 'probe', nodes: [], flows: [] }] };
+  const v2 = { schemaVersion: '1.0.0', id: 'D2', version: 2, processes: [{ id: 'probe', nodes: [{ id: 'X', type: 'userTask' }], flows: [] }] };
+  const fixtures = [
+    { processId: 'probe', version: 1, definition: v1 },
+    { processId: 'probe', version: 2, definition: v2 },
+  ];
+
+  const good = await conf.runDefinitionConformance(
+    { async getDefinition(pid, v) { return pid === 'probe' ? (v === 1 ? v1 : v === 2 ? v2 : null) : null; } },
+    fixtures,
+    { subject: 'probe: 合规实现' },
+  );
+  eq(good.ok, true, `合规实现应全绿，实得 ${good.failed} 条失败：${good.cases.filter((c) => !c.ok).map((c) => c.name).join(' / ')}`);
+
+  // ✗ 永远返回最新版（不看 version）—— AC-E10 的头号事故
+  const blind = await conf.runDefinitionConformance(
+    { async getDefinition(pid) { return pid === 'probe' ? v2 : null; } },
+    fixtures,
+    { subject: 'probe: 忽略 version' },
+  );
+  eq(blind.ok, false, '忽略 version 的实现必须被判不合格');
+  assert(
+    blind.cases.some((c) => !c.ok && c.name.includes('不同 version 返回不同内容')),
+    `必须点名「不同 version 返回不同内容」，实得失败项：${blind.cases.filter((c) => !c.ok).map((c) => c.name).join(' / ')}`,
   );
 });
 
@@ -1818,6 +1855,109 @@ check('T18 · 门 2 需要的两个出口已公开；`nodes/activities` 其余�
     'CALL_EXT_KEY',
   ].filter((k) => k in m);
   eq(leaked.length, 0, `被意外导出：${leaked.join(', ') || '无'}`);
+});
+
+// ---------------- T19 · DefinitionSource 版本语义与在途绑定（AC-E10） ----------------
+
+/**
+ * 同一 processId 的两版：**v2 在中间插入了 `Task_new`**。
+ * 于是「走的是哪一版」一眼可辨 —— 在途实例若跑到 `Task_new`，就是偷偷换了图。
+ */
+function expenseVersioned(version) {
+  const nodes = [
+    { id: 'Start_1', type: 'startEvent' },
+    { id: 'Task_a', type: 'userTask', extension: userApprovalOf('u_a') },
+    ...(version === 2
+      ? [{ id: 'Task_new', type: 'userTask', extension: userApprovalOf('u_new') }]
+      : []),
+    { id: 'Task_b', type: 'userTask', extension: userApprovalOf('u_b') },
+    { id: 'End_1', type: 'endEvent' },
+  ];
+  const flows =
+    version === 1
+      ? [
+          { id: 'f1', from: 'Start_1', to: 'Task_a' },
+          { id: 'f2', from: 'Task_a', to: 'Task_b' },
+          { id: 'f3', from: 'Task_b', to: 'End_1' },
+        ]
+      : [
+          { id: 'f1', from: 'Start_1', to: 'Task_a' },
+          { id: 'f2', from: 'Task_a', to: 'Task_new' },
+          { id: 'f3', from: 'Task_new', to: 'Task_b' },
+          { id: 'f4', from: 'Task_b', to: 'End_1' },
+        ];
+  return { schemaVersion: '1.0.0', id: `Def_expense_v${version}`, version, processes: [{ id: 'expense', nodes, flows }] };
+}
+
+/** 可增删版本的 source（改版 / 下线只能靠它模拟）；取不到即 `null`，**不做任何回退** */
+function versionedSource(initial) {
+  const entries = { ...initial };
+  return {
+    entries,
+    async getDefinition(pid, v) {
+      return entries[`${pid}@${v}`] ?? null;
+    },
+  };
+}
+
+const activeNodesOf = (state) => state.tokens.filter((t) => t.state === 'active').map((t) => t.nodeId);
+
+await checkAsync('T19 · 冒烟：同一 processId 两个版本各启一个实例，走的是各自的图', async () => {
+  const store = m.createMemoryStore();
+  const engine = m.createEngine({
+    definitionSource: versionedSource({ 'expense@1': expenseVersioned(1), 'expense@2': expenseVersioned(2) }),
+    store,
+    clock: () => T18,
+  });
+
+  const oldOne = await engine.start('expense', { definitionVersion: 1, starter: 'u_0' });
+  const newOne = await engine.start('expense', { definitionVersion: 2, starter: 'u_0' });
+
+  await engine.submit(oldOne, { action: 'approve', actor: 'u_a', at: T18 });
+  await engine.submit(newOne, { action: 'approve', actor: 'u_a', at: T18 });
+
+  sameArray(activeNodesOf(await store.load(oldOne)), ['Task_b'], 'v1 实例的下一步');
+  sameArray(activeNodesOf(await store.load(newOne)), ['Task_new'], 'v2 实例的下一步');
+});
+
+await checkAsync('T19 · 改版不影响在途：发布 v2 后，v1 实例仍按旧图走完（不去 Task_new）', async () => {
+  const store = m.createMemoryStore();
+  const source = versionedSource({ 'expense@1': expenseVersioned(1) });
+  const engine = m.createEngine({ definitionSource: source, store, clock: () => T18 });
+
+  const id = await engine.start('expense', { definitionVersion: 1, starter: 'u_0' });
+  source.entries['expense@2'] = expenseVersioned(2); // 改版
+
+  await engine.submit(id, { action: 'approve', actor: 'u_a', at: T18 });
+  sameArray(activeNodesOf(await store.load(id)), ['Task_b'], '改版后在途实例的下一步');
+
+  await engine.submit(id, { action: 'approve', actor: 'u_b', at: T18 });
+  const done = await store.load(id);
+  eq(done.status, 'completed', '实例状态');
+  assert(!done.completedNodes.includes('Task_new'), '在途实例不得经过 v2 新增的节点');
+});
+
+await checkAsync('T19 · 绑定的版本被下线 → 抛 DEFINITION_MISSING（绝不静默改跑 v2）', async () => {
+  const source = versionedSource({ 'expense@1': expenseVersioned(1), 'expense@2': expenseVersioned(2) });
+  const store = m.createMemoryStore();
+  const engine = m.createEngine({ definitionSource: source, store, clock: () => T18 });
+
+  const id = await engine.start('expense', { definitionVersion: 1, starter: 'u_0' });
+  delete source.entries['expense@1']; // v1 下线，库里只剩 v2
+
+  let err = null;
+  try {
+    await engine.submit(id, { action: 'approve', actor: 'u_a', at: T18 });
+  } catch (e) {
+    err = e;
+  }
+  eq(err?.code, 'ENGINE_STATE_DEFINITION_MISSING', '错误码');
+  eq(err?.details?.definitionVersion, 1, 'details.definitionVersion（仍指向绑定的那一版）');
+
+  // 失败的提交不得留下半截状态
+  const after = await store.load(id);
+  sameArray(activeNodesOf(after), ['Task_a'], '失败后仍停在原节点');
+  eq(after.rev, 1, '失败后 rev 不得前移');
 });
 
 // ---------------- 汇总 ----------------
