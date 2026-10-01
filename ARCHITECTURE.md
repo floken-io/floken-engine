@@ -310,6 +310,12 @@ interface Token {
   vote?: 'approved' | 'rejected';        // 组内表态（`state` 管在不在途，本字段管投了什么）
   createdAt?: string;                    // 落到等待节点的时刻（超时判定的输入）
   branch?: string;                       // 并行分支标记（D-47 / D-53）
+  race?: string;                         // ★ T21：`EventBasedGateway` 的竞速组标记（`${nodeId}#${tokenId}`）
+                                         //   ⚠️ 与 `branch` **正交**：branch 管"并行分支的范围"，
+                                         //   race 管"同一批等待里谁赢了"；赢家离开等待节点即**退出**竞速
+                                         //   （`clearAssignment()` 里删 —— 不删会让下一次投递误取消无关分支）
+  timerHandles?: string[];                // ★ T21：本令牌上已排程的定时 handle（取消凭证，形状由调度方定）
+                                         //   ⚠️ **只能由不纯层** `cancel()` 后删除 —— 纯函数里删了就记不住"要取消谁"
 }
 
 interface AuditEntry {
@@ -399,6 +405,9 @@ interface ConvergeCtx {
 | INV-18 | `pendingProjectionRev` 存在 ⟺ 该 `rev` 的投影尚未追平；`load()` 发现该键 → **必须先 `sync()` 补做**，完成后删除键 | `load()` 时 | `runtime/engine.ts` | 补偿路径测试（模拟 apply 失败） |
 | INV-19 | 实例的 `definitionVersion` **终身不变**（改版只影响之后发起的实例；`AC-E10`）。`null` 版本（`getDefinition` 取不到）= `ENGINE_STATE_DEFINITION_MISSING`，**绝不回退**到别版 | 每次 `plan()` 后 / 每次取图 | `runtime/plan.ts`（守卫：`options.apply` 不得改 `definitionVersion`）+ `runtime/engine.ts`（`graphOf`） | `AC-E10` + 「改版后在途仍走旧图」「绑定版被下线 → 抛错」✅ **T19 已验** |
 | INV-20 | `Token.awaiting` 存在 ⟺ 该令牌**停在等待节点上等外部投递**；投递唤醒 = 摘掉 `awaiting` **并离开该节点**（`leaveWait`）。唤醒前令牌不得自己走过去；唤醒后不得被原地重新停车 | 每次 `run-to-wait` / 每次投递 | `nodes/catch.ts`（`catchBindingOf`）+ `runtime/loop.ts`（`parkCatch` / 停车判定）+ `runtime/deliver.ts`（`leaveWait`） | 「不投递再跑一次推进，令牌纹丝不动」+「唤醒后走到下一节点」两向断言 ✅ **T20 已验** |
+| INV-21 | **边界事件不持有令牌**：它「武装」⟺ 宿主活动上有在途令牌（含其内嵌作用域）；触发后宿主（中断时）与其作用域内**全部**在途令牌退场，并**另起一条**令牌走边界出向。⚠️ 因此命中集合必须**两个来源求并**（`matchingTokens` + `armedBoundaries`），只看 `Token.awaiting` 会把边界事件整个漏掉 | 每次投递 / 每次建图 | `nodes/boundary.ts`（`boundaryBindingOf` / `armedBoundaries` / `cancelTargetsOf`）+ `nodes/graph.ts`（`boundaryOf`，向上走内嵌作用域） | 「点对点命中等待令牌时不触发边界」「图里只有边界事件时仍能命中」「`details.waiting` 列出 `boundary:*`」✅ **T21 已验** |
+| INV-22 | 同一 `Token.race` 内**至多一个赢家**：`EventBasedGateway` 分叉出的等待令牌共享 `race`，先被唤醒者赢、其余**取消**；赢家离开等待节点后即**退出**竞速（`race` 被清除） | 竞速分叉后至赢家离开前 | `runtime/loop.ts`（EBG 分叉写 `race`）+ `runtime/deliver.ts`（`pickRaceWinners` / `resolveRace`） | 「投递 A → B 分支 `cancelled`」+「反过来同样成立」+「赢家 `race === undefined`」✅ **T21 已验** |
+| INV-23 | **内核不定时**：它只产出「该排什么 / 该取消什么」的**意图**（`TimerDiff`），`dueAt` 由调度方按工作日历算；不注入 `Scheduler` = **不排程**（不是"用默认实现假装做了"）。已排 handle 必须写回 `Token.timerHandles`，离开节点时由不纯层 `cancel()` 后删除 | 每次状态推进（save 之前） | `runtime/timers.ts`（纯 diff）+ `runtime/engine.ts`（`reconcileTimers`，唯一不纯处） | 「逐条 `actions` 排程」+「`dueAt` 不存在」+「办完 → `cancel()` 旧 handle 且不残留」+「不注入 → 无 handle 但流程照跑」✅ **T21 已验** |
 
 ### 6.5 设计期数据约束（静态配置）
 
@@ -1140,8 +1149,9 @@ class EngineError extends Error {
   **⑤ `Token.branch` 收口 D-47**：并行分叉写入、合流清除；`rollbackTo` 据此把"撤销下游"
   收缩到**本分支**（按**相等**判定，不用前缀匹配 —— 否则嵌套并行会把兄弟分支算进来）。
 
-  ⚠️ **能力边界（诚实标注）**：`boundaryEvent` / `implicitThrowEvent` /
-  `complexGateway` / `eventBasedGateway` 四类**显式抛错**并指名归属 FR（T21 / FR-E24 / FR-E17 / FR-E14）；
+  ⚠️ **能力边界（诚实标注）**：★ **`boundaryEvent` 与 `eventBasedGateway` 已随 T21 落地**
+  （见 §9 阶段 E8 的 T21 那一行）；`implicitThrowEvent` / `complexGateway` 两类仍**显式抛错**
+  并指名归属 FR（FR-E24 / FR-E17）；
   ★ **`intermediateCatchEvent` 已随 T20 落地**（只认 message / signal；等 `timer` / `error` 仍抛，归 T21）；
   **普通节点**多出向仍抛（D-22：隐式排他 / 隐式包容无规格依据）；
   `endEvent` 的 `eventDefinition`（terminate / message）尚未区分，随 T21 落地。
@@ -1201,8 +1211,9 @@ class EngineError extends Error {
      于是要回头唤醒父实例；若这段留在父实例的队列里就是「父等子、子等父」的**自锁**
      （`runtime/queue.ts` 档首写明不支持重入，且要求"在 engine 层拦"）。
   ⑤ **版本绑定读 `extension['floken:call'].version`，缺即抛**（INV-16）—— 绝不回退到"最新版"。
-  ⑥ `AdHocSubProcess` / `Transaction` / 事件子流程（`triggeredByEvent`）→ 显式抛并指名归属
-     FR-E18 / FR-E13 / FR-E24。
+  ⑥ `AdHocSubProcess` / 事件子流程（`triggeredByEvent`）→ 显式抛并指名归属 FR-E18 / FR-E24。
+     ★ **`Transaction` 的 `cancel` 半边已随 T21 落地**（与 `SubProcess` 同样在建图时拍平，
+       取消范围靠 `Tx_1/` 前缀判定）；`compensate` 半边仍属 v1.x（`03` §11）。
 
 ### 阶段 E7 · 子流程 / 调用活动深化（v1.x）
 
@@ -1252,11 +1263,39 @@ class EngineError extends Error {
   ⑦ `buildApply()` 的入参从 `stepInput` 改为 **`run`（纯执行段接缝）**：探测跑与真值跑由此
      **共用同一段代码**，「探测问错落点」从结构上不可能发生（D-76）。
 
-- [ ] **T21 边界事件 / 补偿 / `EventBasedGateway`**
-  组件：`nodes/events.ts` / `nodes/activities.ts`
+- [x] **T21 边界事件 / 补偿 / `EventBasedGateway`** ✅ 2026-10-01
+  组件：`nodes/boundary.ts` + `nodes/graph.ts`（`boundaryOf`）+ `nodes/gateways.ts`（EBG 路由）
+        + `runtime/deliver.ts`（命中集合 / 竞速）+ `runtime/timers.ts`（纯 diff）+ `runtime/engine.ts`（`reconcileTimers`）
   依赖：T20
-  验证：`BoundaryEvent` 按 `cancelActivity` 决定中断 / 继续；`Transaction` 的 `cancel`/`compensate`；
-  `EventBasedGateway` 只走**第一个**到达的事件且其余分支取消；超时经 `Scheduler` SPI（fake scheduler 单测）
+  验证：`BoundaryEvent` 按 `cancelActivity` 决定中断 / 继续 ✅；`Transaction` 的 `cancel` ✅（`compensate` 仍 v1.x）；
+  `EventBasedGateway` 只走**第一个**到达的事件且其余分支取消 ✅；超时经 `Scheduler` SPI（fake scheduler 单测）✅；
+  **661 单测** + 冷启动探针 **91/91** ✅
+
+  **实现要点**：
+  ① ★ **边界事件是"挂在活动上的监听器"，不持有令牌**（D-77）—— 它**不会**出现在 `Token.awaiting` 里，
+     所以「谁在监听什么」必须**两个来源求并**（`matchingTokens` + `armedBoundaries`）。
+     只看前者，挂在审批上的撤回消息**永远收不到**，且没有任何报错。
+     「武装」判据 = 宿主活动上有在途令牌；`armedNamesOf()` 供未命中报错给**合法取值**（`boundary:{kind}:{name}`）。
+  ② **中断（`cancelActivity` 缺省 `true`）= 宿主令牌 + 其内嵌作用域内全部在途令牌退场**（D-78）。
+     ⚠️ 判据是**拍平后的前缀** `${hostId}/`：事务/子流程在建图时已经展开，宿主 `Tx_1` 本身**不是节点**了，
+     只取消"宿主那条"会漏掉作用域里的并行兄弟 —— 也就不需要第二棵令牌树。
+     非中断则宿主**不退场**，另起一条走边界出向（可**重复**触发，令牌 id 附 `#N` 防互相覆盖 —— D-83）。
+  ③ ★ **命中集合的两种口径**（D-84）：**点对点**优先等待令牌、**没命中才兜底**问边界事件
+     （消息只有一个接收者，两边都触发就变成"一条消息两个人收到"）；**广播取并集**（信号本就人人可收）。
+  ④ **`EventBasedGateway` = 分叉全部出向 + 竞速**（D-80）：分叉时给两条等待令牌写**同一个** `race`
+     （`${nodeId}#${tokenId}`），先被唤醒者赢、其余 `cancelled`；赢家离开等待节点即**退出**竞速
+     （`race` 在 `clearAssignment()` 里删 —— 不删会让下一次投递误取消无关分支）。
+     ⚠️ `race` 与 `branch` **正交**：branch 管并行分支的范围，race 管同一批等待里谁赢了。
+  ⑤ ★ **内核不定时**（INV-23 / D-81）：`runtime/timers.ts` 是**纯 diff**，只产出「该排什么 / 该取消什么」；
+     `reconcileTimers()` 是唯一不纯处，在 `store.save()` **之前**兑现（先 `cancel()` 旧的、再写回新 handle，
+     顺序反了会把刚排上的 handle 一并删掉）。
+     ⚠️ **`ScheduleRequest` 去掉 `dueAt`、改交 `fromAt` + 原始 `TimeoutSpec`**：
+     Q33 禁止时态库进 `dist`，而 `03` F-1 的「3 个工作日」必须跳节假日 —— 节假日表是**业务数据**，
+     把 `dueAt` 留在内核里，等于逼内核要么违反 Q33、要么静默退化成 7×24。
+     ⚠️ 计时判据要 **有 `assignee`**（D-86）：在途 ≠ 有人在办，给刚分叉还没落定的令牌排催办 = 催一条不存在的待办。
+  ⑥ **`Transaction` 的 `cancel` 半边**随本任务落地（与 `SubProcess` 同形态拍平）；`compensate` 仍属 v1.x（`03` §11）。
+  ⑦ 建图时**提前**校验边界事件（D-85）：缺 `attachedTo` / 宿主不存在 / 没有出向 → 建图即抛。
+     理由同 T20 的 `catchBindingOf`：悬空的监听器**永远不会亮**，且运行时没有任何报错可循。
 
 - [ ] **T22 令牌轨迹导出 `exportTrace()`**
   组件：`runtime/engine.ts`
@@ -1288,6 +1327,7 @@ class EngineError extends Error {
 | 2026-10-01 | **T16 落地**：`nodes/events.ts`（事件 6 类）+ `nodes/gateways.ts`（网关 5 类）+ `runtime/loop.ts` 的分叉 / 汇聚 + `runtime/engine.ts` 的条件接线；**D-49** 汇聚判据改为图可达性（包容网关不再死锁）、**D-50** 合流必须在推进之前、**D-51** 条件走惰性解析 + `ConditionUnresolved` 哨兵重跑、**D-53** `Token.branch` 收口 **D-47**（并行下 `rollbackTo` 只撤本分支）、**D-55** `payload` 在探测之前并入；**482 单测** + 探针 **60/60** | §5 / §9 / §10 | T16 / D-42 / D-47 / D-48~D-55 | `verify` PASSED + 两个 project 类型检查 0 err |
 | 2026-10-01 | **T19 落地**：`DefinitionSource` 版本语义与在途实例绑定（`AC-E10`）。`core/spi.ts` 把版本语义写成四条硬约定（版本精确 / 不存在 = `null` **绝不回退** / 不得改内容 / 异常入参返回 `null`）；新增 **INV-19** + 在 `plan()` 的 `apply` 接缝落守卫（★ 放这里是因 `plan()` 为两条路径唯一演化入口，一条守卫护住 `submit()` 与门 2）；新增 `conformance/definition.ts`（`runDefinitionConformance`，7 条判据，头号目标是「忽略 `version` 参数」；三套里唯一要宿主交 `fixtures` —— 定义是业务资产、套件造不出来）；反向验收补「不看 version」「取不到就抛」两个坏实现并断言**点名**抓到。端到端用「v1 两段审批 / v2 中间插入 `Task_new`」做观测点：改版后在途仍走 `Task_b`、绑定版下线 → `DEFINITION_MISSING` 且不留下半截状态。顺手修 `expectCodeAsync` 误传 thunk 时断言静默失效（D-70）。**591 单测** + 探针 **77/77** | §6.4 / §7.2 / §9 / §10 | T19 / INV-19 / D-67~D-70 | `verify` PASSED + 两个 project 类型检查 0 err |
 | 2026-10-01 | **T20 落地**：投递入口 `deliverMessage`（点对点）/ `deliverSignal`（广播）。等待语义单开 `nodes/catch.ts`（**横跨事件族与任务族**：`intermediateCatchEvent` + `receiveTask`，放哪一族都会长出第二份「怎么取名 / 怎么匹配 / 怎么唤醒」）；新增 `Token.awaiting` + **INV-20**（第三类稳定点：不投递绝不自己走过去）；★ **唤醒 = 摘等待态 + 离开等待节点**（只摘会被 `runToWait` 原地重新停车，D-73）；纯执行段 `runtime/deliver.ts` 的 `deliverStep()` 公开给门 2；`buildApply()` 入参改为 `run`（探测跑与真值跑共用同一段代码，D-76）；投递未命中 → `ACTION_TARGET_INVALID` 且 `details.waiting` 给合法取值（**不新增第 20 个码**，D-74）；广播候选集归宿主（`StateStore` 无查询接口，D-71），未命中跳过、**全落空才抛**；★ 收口 **D-56 的第二半**：`intermediateThrowEvent` 与 `sendTask` 同处置 → 显式抛错（无 `MessageSink` 出口，D-72）。**625 单测** + 探针 **82/82** | §6.4 / §7.1 / §9 / §10 | T20 / INV-20 / D-71~D-76 | `verify` PASSED + 两个 project 类型检查 0 err |
+| 2026-10-01 | **T21 落地**：边界事件 / 事务取消 / `EventBasedGateway` 竞速 / 超时经 `Scheduler`。新增 `nodes/boundary.ts`（判据单开，理由同 `nodes/catch.ts`：边界事件横跨"事件族的语法"与"任务族的宿主"）；★ **边界事件是监听器、不持有令牌**（故不在 `Token.awaiting` 里，命中集合必须 `matchingTokens` + `armedBoundaries` **取并**，否则挂审批上的撤回消息永远收不到，D-77）；中断 = 宿主 + 其内嵌作用域内**全部**在途令牌退场（拍平后靠 `Tx_1/` 前缀判，D-78），非中断则宿主不退场且可重复触发（令牌 id 附 `#N`，D-83）；★ **点对点优先等待令牌、没命中才兜底问边界**，广播取并集（D-84）；`EventBasedGateway` = 分叉全部出向 + 竞速，新增 `Token.race`（与 `branch` 正交，赢家离开等待节点即退出，D-80）；`Transaction` 的 `cancel` 半边落地（`compensate` 仍 v1.x）；★ **内核不定时**（INV-23）：新增纯 `runtime/timers.ts` 只产意图，`reconcileTimers()` 在 `save()` 前兑现（先 cancel 旧、再写回新 handle）；`ScheduleRequest` **去掉 `dueAt`**、改交 `fromAt` + 原始 `TimeoutSpec`（Q33 禁时态库 + `03` F-1 工作日历是业务数据，D-81），handle 落 `Token.timerHandles`（只能由不纯层删，D-82），无 `assignee` 不计时（D-86）。新增 **INV-21 / INV-22 / INV-23**。**661 单测** + 探针 **91/91** | §6.1 / §6.4 / §9 / §10 | T21 / INV-21~23 / D-77~D-86 | `verify` PASSED + 两个 project 类型检查 0 err |
 | 2026-10-01 | **T18 落地**：`nodes/activities.ts`（活动 / 子流程 4 类）+ `nodes/graph.ts` 接入内嵌展开 + `runtime/engine.ts` 的子实例链路。内嵌子流程**在建图时拍平**（内嵌 `endEvent` → `subProcessExit`，否则令牌会被判终结、出口后的节点永远走不到）；`CallActivity` = **子实例 + 等待 + 自动回归**（子实例 id 确定性、父令牌 `waiting`、子实例终态唤醒父实例、父实例终态连坐终止子实例）；★ 后续动作一律放在 `queue.run()` **之外**（否则「子实例一建就跑完 → 回头唤醒父实例」= 自锁）；版本绑定读 `extension['floken:call'].version`，**缺即抛**（INV-16）；`AdHocSubProcess` / `Transaction` / 事件子流程显式抛并指名 FR-E18 / FR-E13 / FR-E24。另补 **AC-E1 巡检**（20 个可提交名逐个不得抛 `ACTION_UNKNOWN` + 反证）；**572 单测** + 探针 **73/73** | §5 / §6.1 / §7.1 / §9 / §10 | T18 / INV-16 / D-62~D-66 | `verify` PASSED + 两个 project 类型检查 0 err |
 | 2026-10-01 | **T17 落地**：`nodes/tasks.ts`（任务 8 类）+ `nodes/flows.ts`（连线与数据 4 类）+ `eval/script.ts`（FEEL 脚本求值）+ 副作用接线（`LoopContext.effectsOf` + `NodeEffectUnresolved` 哨兵重跑）；**D-56** `sendTask` 与 `intermediateThrowEvent` 同处置（显式抛错，ADR-006 事件集定死 10 个）、**D-57** 非 FEEL 脚本先查 `handlers` 表、**D-58** 服务重试归内核外、**D-59** FEEL 结果落 `variables[nodeId]`、**D-60** 副作用按 `${nodeId}::${tokenId}` 缓存且条件取「此刻」变量快照、**D-61** 源码扫描必须去注释；**538 单测** + 探针 **69/69** | §5 / §7.3 / §9 / §10 | T17 / D-52 / D-56~D-61 | `verify` PASSED + 两个 project 类型检查 0 err（产物层双层扫描：无 `new Function` / `node:vm` / `eval(`） |
 | 2026-10-01 | **D-21 / D-31 在模型层修根因**：`floken-moddle` 的 `shouldTerminate()` 重排规则序（先按 `mode` 判，`pending === 0` 的多数决兜底只对票签生效）；引擎侧 `convergence.ts` 的 `mode:'all' && rejected>0` 短路**整块删除**，对账测试取消例外格改为逐格全一致（>300 组）；**482 单测** + 探针 **60/60** | §5 / §9 / §10 | D-19 / D-21 / D-31 | `verify` PASSED + 两个 project 类型检查 0 err（moddle 侧 299 单测全绿 + dist 已重建同步） |
@@ -1378,3 +1418,13 @@ class EngineError extends Error {
 | **D-74** | **投递没命中复用 `ACTION_TARGET_INVALID`**（**不新增第 20 个错误码**） | 错误码是稳定契约（`AGENTS.md` §5），每加一个都要全量回写。投递失败的本质就是「**目标**不存在」—— 与驳回目标非法同类，差别只在 `details` 形状（`waiting` = 此刻在等什么，即**合法取值**） | ✅ 已落地（`core/errors.ts` 的 `deliverNoTarget()`）。⚠️ 抛出码仍是 **19 个**，报数时别说 20 |
 | **D-75** | **广播下「终态 / 挂起」的候选跳过而非抛**（点对点则严格抛） | 候选集本质是「**可能**订阅者的一个**超集**」，里面躺着刚跑完 / 被冻结的实例是**正常**的（订阅表总比状态滞后一拍）。为一行过期数据让整批广播失败，是拿可用性换一条本来就不紧急的提示；真正不能吞的是「**一个都没命中**」 | ✅ 已落地（`doDeliver` 的 `onMiss:'skip'`：终态 / 挂起 / 不在等 → 跳过；点对点 `onMiss:'throw'` 仍按 INV-2 / INV-5 抛） |
 | **D-76** | **`buildApply()` 的入参是 `run`（纯执行段）而不是 `stepInput`** | 投递的纯执行段是 `deliverStep()` 而非 `step()`。若继续传 `stepInput`，就得给 `buildApply` 加一堆「投递用不到的可选参数」或复制一份重试循环。改成传**执行段本身**，探测跑与真值跑由此**共用同一段代码**，「探测问错落点」从结构上不可能发生 | ✅ 已落地（`runtime/engine.ts`：调用方闭包 `run: (s, ctx) => step(s, ctx, stepInput)` / `run: (s, ctx) => deliverStep(s, ctx, match)`） |
+| **D-77** ⚠️ | **边界事件是"挂在活动上的监听器"，**不持有令牌**；命中集合 = `matchingTokens` ∪ `armedBoundaries`** | 让它持令牌会与「宿主活动上也有令牌」冲突（一个节点两条令牌、用途不同），且 `Token.awaiting` 的语义（INV-20：令牌**停在那儿等**）会被稀释。代价是：光读 `Token.awaiting` **根本看不到边界事件** —— 表现为「挂在审批上的撤回消息永远收不到」，且没有任何报错。故「谁在监听什么」必须**两个来源求并**，并额外公开 `armedBoundaries()` / `armedNamesOf()` 给宿主做订阅表（判据只有一份） | ✅ 已落地（`nodes/boundary.ts`）。武装判据 = 宿主上有 `active` 令牌；`details.waiting` 会列出 `boundary:{kind}:{name}` |
+| **D-78** ⚠️ | **中断的取消范围 = 宿主令牌 + 其内嵌作用域内**全部**在途令牌**（拍平后按 `${hostId}/` 前缀判） | 事务 / 子流程在建图时已**拍平**（D-64 那条路），宿主 `Tx_1` 本身不再是一个节点。只取消"宿主那条"会漏掉作用域里的并行兄弟 —— 「事务取消了，里面两个人还在办」正是这类引擎的典型事故。用前缀判就**不需要第二棵令牌树**（拍平的红利在此兑现） | ✅ 已落地（`nodes/boundary.ts` 的 `inScopeOf` / `cancelTargetsOf`）。断言：事务内两条并行令牌**一并**退场 |
+| **D-79** | **`Transaction` 的 `cancel` 半边随 `SubProcess` 一起拍平落地；`compensate` 仍属 v1.x** | `Transaction` = `SubProcess` + 取消/补偿协议。取消半边**不需要任何新机制**（同拍平 + D-78 的前缀判据）；补偿半边要「已完成活动的**逆操作**登记与排序」，那是 `03` §11 明确划到 v1.x 的范围。把两半绑在一起做 = 用 v1.x 的东西挡住 v1.0 能做的 | ✅ 已落地（`nodes/activities.ts` 的 `isExpandable()` 接纳 `transaction`） |
+| **D-80** ⚠️ | **`EventBasedGateway` = 分叉**全部**出向 + 竞速（`Token.race`）** | 它与 `parallelGateway` 的**形状**相同（都全部分叉），差别只在语义：并行要等齐，竞速是**先到者赢、其余取消**。复用并行的路由 + 新增 `race` 标记即可，不需要第四套路由逻辑。⚠️ `race` 与 `branch` **正交**：branch 管"并行分支的范围"（D-53），race 管"同一批等待里谁赢了"；赢家离开等待节点必须**退出**竞速（`clearAssignment()` 里删），否则下一次投递会误取消与本次无关的分支 | ✅ 已落地（`runtime/loop.ts` 写 `race`、`runtime/deliver.ts` 的 `pickRaceWinners` / `resolveRace`）。广播下两条同时命中仍只走**第一条**（保序、可重放） |
+| **D-81** ⚠️ | **`ScheduleRequest` 去掉 `dueAt`，改交 `fromAt` + **原始** `TimeoutSpec`** | 两个硬约束同时指向"内核不能算到期时刻"：① **Q33** 禁止时态库进 `dist`，内核连 `P3D` 都解不了；② 即便能解，`03` F-1 要求「3 个工作日」**必须**跳过周末与法定节假日，而节假日表是**业务数据**（属宿主 / 调度方）。留着 `dueAt` 等于逼内核要么违反 Q33、要么静默退化成 7×24 —— 后者正是 F-1 点名禁止的 | ✅ 已落地（`core/spi.ts` + `runtime/timers.ts` 的 `timeoutSpecOf`）。`workCalendar` 只透传 **id**，内核不解释内容 |
+| **D-82** ⚠️ | **定时 handle 写回 `Token.timerHandles`，且**只能由不纯层** `cancel()` 后删除** | `Scheduler.schedule()` 返回的 handle 形状由**调度方**定（SPI 的耦合边界），故取消必须**拿着它** —— 内核自己拼一个确定性 handle 等于规定调度方的数据形状。⚠️ 为什么不在 `clearAssignment()` 里删：那是**纯函数**，删了就没处记"要取消谁"，定时器会在待办办完之后照样触发（最典型的「已办结还在催办」） | ✅ 已落地（`runtime/engine.ts` 的 `reconcileTimers`：先 `cancel()` 旧的 → 再写回新 handle，顺序反了会把刚排上的一并删掉）。断言：办完后旧 handle 一条不落被 cancel、且不残留在状态里 |
+| **D-83** | **非中断边界**重复**触发必须产生**不同**的令牌 id（附 `#N`）** | 非中断边界的宿主不退场，同一条边界可以被触发多次（"催一次办、再催一次"）。若沿用宿主令牌 id 派生，两条令牌会**互相覆盖** —— 表现为「第二条待办把第一条顶掉，且没有任何报错」 | ✅ 已落地（`nodes/boundary.ts` 的 `boundaryTokenIdOf`）。断言：两次触发后令牌 id 集合无重复，且宿主与两条边界待办同时在途 |
+| **D-84** | **点对点优先等待令牌、没命中才兜底问边界；广播取并集** | 消息是**点对点**（一个接收者）：等待令牌与边界事件同时命中却都触发，就变成「一条消息两个人收到」，且**谁都说不清该谁办**。信号本就**人人可收**，广播下漏掉边界事件则是「配了撤回却从来不被唤醒」 | ✅ 已落地（`runtime/deliver.ts` 的 `DeliverMode`）。点对点：有等待令牌命中 → 不触发边界；无 → 兜底触发（取第一条） |
+| **D-85** | **边界事件在**建图时**提前校验**（缺 `attachedTo` / 宿主不存在 / 没有出向 → 抛） | 与 T20 的 `catchBindingOf` 同一条理由：悬空的监听器**永远不会亮**，而运行期没有任何报错可循 —— 「超时/撤回配了却从不发生」是这类引擎最难查的缺陷。ⓐ 宿主存在性判定要接纳**内嵌作用域成员**（`Tx_1` 拍平后不是节点，只查 `nodes.has()` 会误报）；ⓑ `boundaryOf()` 要**沿作用域向上找**，挂在 `Tx_1` 上的边界要被 `Tx_1/T_A` 上的令牌看见 | ✅ 已落地（`nodes/graph.ts` 建图循环 + `boundaryOf()` 的向上回溯） |
+| **D-86** | **没有 `assignee` 的在途令牌**不**计时** | 「在途」不等于「有人在办」：刚分叉出来还没落定的令牌、停在 catch 节点上的令牌都是 `active` 却没有办理人。给它们排超时 = 产出「催办一条根本不存在的待办」。另：计时键按 `${nodeId}::${tokenId}` 而非 nodeId —— 会签组里同节点有 N 个令牌，每个人的待办**各自**计时（驳回重办后是新令牌 = 新计时） | ✅ 已落地（`runtime/timers.ts` 的 `timingKeysOf`）。断言：无 `assignee` → 键集为空；无 `timeout` 配置 → 不排程（不是"每个待办都排一次"） |

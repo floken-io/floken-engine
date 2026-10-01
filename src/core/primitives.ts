@@ -270,6 +270,16 @@ export function clearAssignment(t: Token): void {
   // ★ T20：等待态同样是**节点级**属性 —— 换了节点，旧的"等什么"立即作废
   //   （留着会让令牌在新节点上被判成稳定点而**永远推不动**）
   delete t.awaiting;
+  /*
+   * ★ T21：竞速标记同样是**节点级**属性 —— 赢了这场竞速、离开等待节点之后就退出了竞速。
+   *   ⚠️ 不删会怎样：下一次投递命中它新的等待节点时，`resolveRace()` 仍按旧 race 把
+   *   「同批」的令牌取消 —— 而那一批早就走完了。表现为「第二次投递把不相干的分支取消了」。
+   *
+   * ⚠️ `timerHandles` **刻意不在这里删**：它是**不纯层**用来 `cancel()` 的凭据，
+   *   由 `runtime/engine.ts` 在取消成功后删 —— 在这里删掉就等于"没地方记着要取消谁"，
+   *   定时器会在待办办完之后照样触发。
+   */
+  delete t.race;
 }
 
 const isLive = (t: Token): boolean => LIVE_TOKEN_STATES.includes(t.state);

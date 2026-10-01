@@ -155,7 +155,10 @@ describe('@floken-io/engine SPI 契约', () => {
       const handle = await fakes.Scheduler.schedule({
         instanceId: 'pi_1',
         nodeId: 'UserTask_1',
-        dueAt: '2026-10-01T00:00:00Z',
+        tokenId: 'tk_1',
+        // ★ T21：`dueAt` 不再是入参 —— 内核交「起点 + 原始配置」，到期时刻由调度方按工作日历算
+        fromAt: '2026-10-01T00:00:00Z',
+        timeout: { duration: 'P3D' },
         kind: 'remind',
       });
       expect(typeof handle).toBe('string');

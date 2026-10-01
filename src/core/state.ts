@@ -144,6 +144,30 @@ export interface Token {
    */
   awaiting?: TokenAwait;
   branch?: string;
+  /**
+   * ★ **竞速组**（T21 · `eventBasedGateway`）。
+   *
+   * 事件网关分叉出来的令牌共享同一个 `race` 值；**其中一个被唤醒**时，同组其余在途令牌
+   * 一律**取消**（BPMN：只走第一个到达的事件）。没有本字段 = 不参与竞速。
+   *
+   * ⚠️ 为什么不能复用 `branch`：`branch` 是「并行分支」标记，`rollbackTo` 靠它把"撤销下游"
+   *   收缩到本分支（D-47）。竞速与它是**两件正交的事** —— 一个并行分支内部可以再有一次竞速，
+   *   混用会让"取消同批竞速分支"变成"取消整条并行分支"。
+   */
+  race?: string;
+  /**
+   * ★ **已排程的超时 handle**（T21 · `Scheduler`）。
+   *
+   * 由 `runtime/engine.ts`（**不纯层**）在 `schedule()` 之后回填 ——
+   * 纯循环**拿不到** handle（那是调度方返回的外部标识）。
+   *
+   * ⚠️ 为什么不自己拼一个确定性的 handle：`Scheduler.schedule()` 的契约是「**返回**可取消的
+   *   handle」，即形状由**调度方**决定（BullMQ 的 jobId 与内存实现的计数器显然不同）。
+   *   引擎自己拼一个等于反过来规定调度方的数据形状 —— 那正是 SPI 要避免的耦合。
+   *
+   * ⚠️ 令牌离开该节点（办完 / 被取消 / 被撤销）时由不纯层 `cancel()` 后**删除本字段**。
+   */
+  timerHandles?: string[];
 }
 
 /**
@@ -494,6 +518,20 @@ export function assertInstanceState(state: InstanceState, path = '$'): void {
     }
     if (t.branch !== undefined && !isNonEmptyString(t.branch)) {
       fail(`tokens[${i}].branch must be a non-empty string when present`, { value: t.branch });
+    }
+    if (t.race !== undefined && !isNonEmptyString(t.race)) {
+      fail(`tokens[${i}].race must be a non-empty string when present`, { value: t.race });
+    }
+    if (t.timerHandles !== undefined) {
+      const hs: unknown = t.timerHandles;
+      if (!Array.isArray(hs)) {
+        fail(`tokens[${i}].timerHandles must be an array when present`);
+      }
+      for (let k = 0; k < hs.length; k += 1) {
+        if (!isNonEmptyString(hs[k])) {
+          fail(`tokens[${i}].timerHandles[${k}] must be a non-empty string`, { value: hs[k] });
+        }
+      }
     }
   }
 

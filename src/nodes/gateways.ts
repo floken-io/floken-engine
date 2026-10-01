@@ -14,10 +14,24 @@
  * | `exclusiveGateway` | 取**第一条**为真的出向；全假 → `default`；都没有 → **抛** | **不等**（先到先过） |
  * | `parallelGateway` | **全部**出向（不判条件 —— 规范里它的条件是被忽略的） | 等**全部**入向 |
  * | `inclusiveGateway` | **所有**为真的出向；全假 → `default`；都没有 → **抛** | 只等**被激活**的入向 |
+ * | ★ `eventBasedGateway`（T21） | **全部**出向（不判条件）→ **竞速** | **不等**（赢家自己走下去） |
  *
  * ⚠️ `exclusive` 的"第一条"：BPMN 规范说条件互斥，多条为真时取哪条**未定义**。
  *    我们按**定义里的顺序**取第一条并**保持确定性**（纯函数不能靠 `Math.random`），
  *    这与 Camunda / Flowable 的实际行为一致。
+ *
+ * ## ★ `eventBasedGateway` 为什么是「全部分叉 + 竞速」而不是「选一条」
+ *
+ *   它的语义是「**等第一个到达的事件**，其余分支**取消**」—— 谁先到在**运行期**才知道，
+ *   路由时无从判断（那要预知未来）。故：
+ *     ① 路由阶段与并行网关同形（全部分叉，每条分支上的等待节点各自停住）；
+ *     ② **唤醒阶段**取消同批的其余分支 —— 判据是 `Token.race`（同一次分叉的令牌共享一个值），
+ *        落点在 `runtime/deliver.ts`。
+ *   ⚠️ 少了 ② 会变成「两个事件都到了、流程走了两条分支」，而 BPMN 明确只走一条 ——
+ *      且它**不会报错**，只是流程莫名地多出一条待办。
+ *
+ *   ⚠️ 它**不汇聚**（`isConverging` 不含它）：竞速的赢家直接沿自己的分支继续，
+ *   不存在「等其他人到齐」这回事 —— 让它汇聚就是永久卡死。
  *
  * ## ★ 汇聚判据为什么是「还有没有人能来」而不是「来了几个」
  *
@@ -48,7 +62,7 @@ import type { ProcessGraph } from './graph.js';
 /**
  * 网关族的全部 5 类（`01-moddle` §5.3 的登记名，**顺序即契约**）。
  *
- * ⚠️ L3 只承诺其中 3 类；`complexGateway`（FR-E17）/ `eventBasedGateway`（FR-E14）归 v1.x。
+ * ⚠️ L3 只承诺其中 3 类；`complexGateway`（FR-E17）归 v1.x；★ `eventBasedGateway` 已随 **T21** 落地（竞速）。
  */
 export const GATEWAY_TYPES = [
   'exclusiveGateway',
@@ -60,11 +74,16 @@ export const GATEWAY_TYPES = [
 
 export type GatewayType = (typeof GATEWAY_TYPES)[number];
 
-/** ★ 可执行的 3 类（FR-E11 的落点：5 − 2 = 3） */
+/**
+ * ★ 可执行的 **4 类**（T21 起 `eventBasedGateway` 已落地；只剩 `complexGateway` 归 FR-E17）
+ *
+ * ⚠️ 不手列第二份：数字 4 由 `EXECUTABLE_GATEWAY_TYPES.length` 得出，不另记。
+ */
 export const EXECUTABLE_GATEWAY_TYPES: readonly string[] = [
   'exclusiveGateway',
   'parallelGateway',
   'inclusiveGateway',
+  'eventBasedGateway',
 ];
 
 export function isGatewayType(type: string | undefined): boolean {
@@ -129,18 +148,25 @@ export function routeGateway(input: RouteInput): readonly RoutedFlow[] {
     throw definitionMissing(nodeId, 0);
   }
 
-  // —— 未实现的 2 类：显式抛，绝不静默取第一条 ——
-  if (type === 'complexGateway' || type === 'eventBasedGateway') {
+  // —— 未实现的 1 类：显式抛，绝不静默取第一条 ——
+  if (type === 'complexGateway') {
     throw stateShapeInvalid(`gateway '${nodeId}' ('${type}') is not executable yet`, {
       nodeId,
       type,
-      owner: type === 'complexGateway' ? 'FR-E17（自定义表达式，C 级）' : 'FR-E14（事件驱动路由，S 级）',
+      owner: 'FR-E17（自定义表达式，C 级）',
       hint: '该网关已知但归 v1.x；引擎刻意不把它降级成「取第一条出向」（那会静默走错分支）',
     });
   }
 
-  // —— parallelGateway：全部出向，**不判条件**（规范里它的条件被忽略）——
-  if (type === 'parallelGateway') {
+  /*
+   * —— parallelGateway / eventBasedGateway：全部出向，**不判条件** ——
+   *
+   * ⚠️ 二者在此同形，但**语义完全不同**：并行是「都要走完并汇聚」，
+   *   事件网关是「谁先到谁走、其余取消」（落点在 `runtime/deliver.ts` 的竞速）。
+   *   ⚠️ 事件网关的出向**应当**通向等待节点（catch / receiveTask）—— 否则「竞速」无从发生：
+   *   分支尽头不是等待节点时令牌会一路走到终结，其余分支在唤醒时被取消（不会卡死，也不是错误）。
+   */
+  if (type === 'parallelGateway' || type === 'eventBasedGateway') {
     return outFlows.map((f) => ({ flowId: f.id, to: f.to }));
   }
 

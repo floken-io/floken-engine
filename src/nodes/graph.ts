@@ -13,12 +13,13 @@
  *
  * ⚠️ **T16 / T17 / T18 落地后的能力边界（诚实标注，勿含糊成"支持"）**：
  *   - 认得全部 **6 类事件 + 5 类网关 + 8 类任务**（分类与可达性见图适配层），但其中
- *     `intermediateThrowEvent` / `boundaryEvent` / `implicitThrowEvent` /
- *     `complexGateway` / `eventBasedGateway` / `sendTask` 一律**显式抛错**
- *     （分属 T20 / T21 / FR-E24 / FR-E17 / FR-E14）；
+ *     `intermediateThrowEvent` / `implicitThrowEvent` /
+ *     `complexGateway` / `sendTask` 一律**显式抛错**（分属 T20 / FR-E24 / FR-E17 / T20）；
  *   - ★ **T20 起 `intermediateCatchEvent` / `receiveTask` 可执行**：令牌停在它们上面
  *     **等外部投递**（`deliverMessage` / `deliverSignal`）；但等 `timer` / `error` 之类
- *     仍抛（归 T21），没写 `messageRef` / `signalRef` 也抛（等不到 = 永久卡死）；
+ *     仍抛（归 v1.x），没写 `messageRef` / `signalRef` 也抛（等不到 = 永久卡死）；
+ *   - ★ **T21 起 `boundaryEvent` / `eventBasedGateway` 可执行**：前者挂在活动上监听、
+ *     按 `cancelActivity` 决定中断与否；后者**竞速**（第一个到达的事件赢，其余分支取消）；
  *   - **单出向的普通节点**（`userTask` 等）有多条 `sequenceFlow` → 仍抛 `D-22`
  *     （"隐式排他 / 隐式包容"没有规格依据，不发明）；多出向**只**在网关上被路由；
  *   - **T18 起内嵌子流程在建图时展开**（`nodes/activities.ts` 的 `expandSubProcesses`），
@@ -31,8 +32,10 @@ import { normalizeApproval } from '@floken-io/moddle';
 import type { Flow, FlowNode, NormalizedApproval, ProcessDefinition } from '@floken-io/moddle';
 
 import { definitionMissing, stateShapeInvalid, tokenOrphan } from '../core/errors.js';
-import { callTargetOf, expandSubProcesses } from './activities.js';
+import { SUBPROCESS_PATH_SEP, callTargetOf, expandSubProcesses } from './activities.js';
 import type { CallTarget } from './activities.js';
+import { boundaryBindingOf } from './boundary.js';
+import type { BoundaryBinding } from './boundary.js';
 import { catchBindingOf } from './catch.js';
 import type { CatchBinding } from './catch.js';
 
@@ -175,6 +178,15 @@ export interface ProcessGraph {
    * ⚠️ 判据不在本档而在 `nodes/catch.ts`：等待语义**横跨**事件族与任务族。
    */
   catchOf(nodeId: string): CatchBinding | undefined;
+  /**
+   * ★ 挂在 `nodeId` 上的**边界事件**（T21）。没有 → 空数组（**不是** `undefined`，
+   * 免得每个调用点都要判空）。
+   *
+   * ⚠️ 索引在**建图时**建好并**eager 校验**（与 `expandSubProcesses` 同口径）：
+   * 边界事件的定义缺陷（悬空 / 触发种类不可投递 / 没有出向）在建图时就会抛出，
+   * 而不是等触发 —— 那时已经写了一半状态。
+   */
+  boundaryOf(nodeId: string): readonly BoundaryBinding[];
 }
 
 /**
@@ -247,6 +259,46 @@ export function createProcessGraph(
   }
 
   const approvalCache = new Map<string, NormalizedApproval | undefined>();
+  /**
+   * ★ 边界事件索引：`attachedTo` → 挂在它上面的边界事件（T21）。
+   *
+   * 为什么**建图时**就建好而不是投递时按需扫全图：投递是在热路径上
+   *   （每个候选实例、每次 `deliverSignal` 都要问一遍"谁在等"），每次扫全图是 O(节点)。
+   */
+  const boundaries = new Map<string, BoundaryBinding[]>();
+  for (const n of flatNodes) {
+    if (n === null || typeof n !== 'object' || n.type !== 'boundaryEvent') continue;
+    // ① 绑定本身的缺陷（悬空 / 不可投递的触发种类）在此抛出 —— 定义错就是定义错
+    const b = boundaryBindingOf(n);
+    if (b === undefined) continue;
+    /*
+     * ② 宿主必须存在：挂到一个不存在的活动上 = 这盏监听器永远不会亮。
+     *
+     * ⚠️ 判据要认**内嵌作用域**：`transaction` / `subProcess` 在拍平后**自身已不在图里**
+     *   （它变成了 `Tx_1/...` 那一批节点）。挂在 `Tx_1` 上的边界事件因此
+     *   「宿主不存在」是**正常的** —— 它管的正是那一整片作用域。
+     *   若这里只认 `nodes.has()`，所有事务边界事件都会在建图时报"宿主不存在"。
+     */
+    const scopeSep = `${b.attachedTo}${SUBPROCESS_PATH_SEP}`;
+    const inScope = [...nodes.keys()].some((id) => id === b.attachedTo || id.startsWith(scopeSep));
+    if (!inScope) {
+      throw stateShapeInvalid(
+        `boundaryEvent '${b.nodeId}' is attached to unknown node '${b.attachedTo}'`,
+        { nodeId: b.nodeId, attachedTo: b.attachedTo, processId },
+      );
+    }
+    // ③ 必须有且只有一条出向：边界事件触发后**只有一个去向**，0 条 = 触发即断线
+    const outCount = (out.get(b.nodeId) ?? []).length;
+    if (outCount !== 1) {
+      throw stateShapeInvalid(
+        `boundaryEvent '${b.nodeId}' must have exactly one outgoing flow (found ${outCount})`,
+        { nodeId: b.nodeId, found: outCount, processId },
+      );
+    }
+    const list = boundaries.get(b.attachedTo);
+    if (list === undefined) boundaries.set(b.attachedTo, [b]);
+    else list.push(b);
+  }
   /**
    * 可达性缓存（`${from}→${to}`）。
    * 图是**只读**的（本文件不持有、也不改 `ProcessDefinition`），故缓存不会失效。
@@ -360,6 +412,27 @@ export function createProcessGraph(
     callTargetOf: (nodeId) => callTargetOf(nodes.get(nodeId)),
 
     catchOf: (nodeId) => catchBindingOf(nodes.get(nodeId)),
+
+    /*
+     * ★ 为什么要**沿内嵌作用域向上找**：`transaction` / `subProcess` 拍平后自身不在图里，
+     *   令牌停的是 `Tx_1/Task_a`。挂在 `Tx_1` 上的边界事件必须能被**它里面的令牌**看见 ——
+     *   否则事务边界事件永远不会被触发（而它唯一的意义就是管这一整片作用域）。
+     *   逐段去掉 `/` 后缀向上找，嵌套几层都成立。
+     */
+    boundaryOf: (nodeId) => {
+      const out: BoundaryBinding[] = [];
+      const push = (key: string): void => {
+        for (const b of boundaries.get(key) ?? []) out.push(b);
+      };
+      push(nodeId);
+      let cut = nodeId.lastIndexOf(SUBPROCESS_PATH_SEP);
+      while (cut > 0) {
+        const scope = nodeId.slice(0, cut);
+        push(scope);
+        cut = scope.lastIndexOf(SUBPROCESS_PATH_SEP);
+      }
+      return out;
+    },
   };
 }
 

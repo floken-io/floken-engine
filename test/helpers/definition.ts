@@ -56,6 +56,16 @@ export interface TestNode {
    */
   eventDefinition?: Record<string, unknown>;
   /**
+   * T21：`attachedTo`（`boundaryEvent` 挂在哪個活动上）。
+   * 缺它 → `boundaryBindingOf()` 抛（悬空的监听器永远不会触发）。
+   */
+  attachedTo?: string;
+  /**
+   * T21：`cancelActivity`（`boundaryEvent` 触发后是否取消宿主活动）。
+   * ⚠️ **缺省 `true`**（与 BPMN 规范一致）—— 不给就是"中断"。
+   */
+  cancelActivity?: boolean;
+  /**
    * `floken:call` 扩展（`callActivity` 的**版本绑定**，INV-16）。
    * 缺它 → 建图 / 推进时抛（引擎**不**替宿主取最新版）。
    */
@@ -87,6 +97,8 @@ function buildNodes(list: readonly TestNode[]): FlowNode[] {
     if (n.operationRef !== undefined) node.operationRef = n.operationRef;
     if (n.triggeredByEvent !== undefined) node.triggeredByEvent = n.triggeredByEvent;
     if (n.calledElement !== undefined) node.calledElement = n.calledElement;
+    if (n.attachedTo !== undefined) node.attachedTo = n.attachedTo;
+    if (n.cancelActivity !== undefined) node.cancelActivity = n.cancelActivity;
     if (n.messageRef !== undefined) node.messageRef = n.messageRef;
     if (n.eventDefinition !== undefined) node.eventDefinition = n.eventDefinition;
     if (n.nodes !== undefined) node.nodes = buildNodes(n.nodes);

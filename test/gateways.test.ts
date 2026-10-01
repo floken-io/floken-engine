@@ -70,15 +70,15 @@ const flow = (id: string, to: string, expression?: string): OutFlow =>
 // ---------------- 分类 ----------------
 
 describe('网关 5 类的分类（`01-moddle` §5.3 · gateway 族）', () => {
-  it('GATEWAY_TYPES 恰好 5 类，其中可执行的 3 类（FR-E11）', () => {
+  it('GATEWAY_TYPES 恰好 5 类，其中可执行的 **4** 类（T21 起 eventBasedGateway 已落地）', () => {
     expect(GATEWAY_TYPES).toHaveLength(5);
-    expect(EXECUTABLE_GATEWAY_TYPES).toHaveLength(3);
+    expect(EXECUTABLE_GATEWAY_TYPES).toHaveLength(4);
     for (const g of EXECUTABLE_GATEWAY_TYPES) {
       expect(GATEWAY_TYPES).toContain(g);
     }
-    // 未实现的两类各自有 FR 兜底（FR-E17 / FR-E14），不留悬空
+    // ★ T21：eventBasedGateway 从"未实现"移入"可执行"；只剩 complexGateway 归 FR-E17
+    expect(EXECUTABLE_GATEWAY_TYPES).toContain('eventBasedGateway');
     expect(GATEWAY_TYPES).toContain('complexGateway');
-    expect(GATEWAY_TYPES).toContain('eventBasedGateway');
   });
 
   it('`isConverging`：parallel / inclusive 是汇聚点，exclusive 不是', () => {
@@ -210,17 +210,25 @@ describe('routeGateway · 分叉语义', () => {
     ).toEqual([{ flowId: 'F1', to: 'A' }]);
   });
 
-  it('未实现的 2 类网关 → 抛，且错误里点名归属 FR', () => {
-    for (const [type, owner] of [
-      ['complexGateway', 'FR-E17'],
-      ['eventBasedGateway', 'FR-E14'],
-    ] as const) {
-      const err = expectCode(
-        () => route(type, [flow('F1', 'A')], { F1: true }),
-        ENGINE_ERROR_CODES.STATE_SHAPE_INVALID,
-      );
-      expect(String(err.details?.owner)).toContain(owner);
-    }
+  it('★ 未实现的只剩 1 类网关 → 抛，且错误里点名归属 FR（eventBasedGateway 已随 T21 落地）', () => {
+    const err = expectCode(
+      () => route('complexGateway', [flow('F1', 'A')], { F1: true }),
+      ENGINE_ERROR_CODES.STATE_SHAPE_INVALID,
+    );
+    expect(String(err.details?.owner)).toContain('FR-E17');
+  });
+
+  it('★ `eventBasedGateway` 已可执行：全部出向、不判条件（竞速的落点在 deliver）', () => {
+    const routed = route(
+      'eventBasedGateway',
+      [flow('F1', 'A', 'condA'), flow('F2', 'B', 'condB')],
+      { F1: false, F2: false },
+    );
+    // 条件**不参与**路由：哪怕全假也照走全部出向（与 parallelGateway 同形）
+    expect(routed).toEqual([
+      { flowId: 'F1', to: 'A' },
+      { flowId: 'F2', to: 'B' },
+    ]);
   });
 
   it('没有出向的网关 → 抛 `DEFINITION_MISSING`（定义不完整）', () => {

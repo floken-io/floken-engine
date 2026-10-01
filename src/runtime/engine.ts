@@ -82,6 +82,7 @@ import {
   matchingTokens,
   waitingNamesOf,
 } from '../nodes/catch.js';
+import { armedBoundaries, armedNamesOf } from '../nodes/boundary.js';
 import type { CatchKind, DeliverMatch } from '../nodes/catch.js';
 import type { NodeEffect, TaskEffectKind } from '../nodes/tasks.js';
 import {
@@ -95,6 +96,8 @@ import {
 import { plan } from './plan.js';
 import type { PlanOptions, PlanResult } from './plan.js';
 import { deliverStep } from './deliver.js';
+import type { DeliverMode } from './deliver.js';
+import { diffTimers } from './timers.js';
 import { createInstanceQueue } from './queue.js';
 import { PROBE_ASSIGNEE, step, tasksOf } from './loop.js';
 import type { LoopContext, LoopResult, StepInput, VoteCast } from './loop.js';
@@ -360,6 +363,14 @@ export function createEngine(config: EngineConfig): Engine {
   const store: StateStore = config.store ?? createMemoryStore();
   const { definitionSource } = config;
   const projection: TaskProjection | undefined = config.projection;
+  /**
+   * ★ 超时排程（`Scheduler`，T21）。**不注入 = 不排程** —— 与 `projection` 同款：
+   *   超时是**内核外**的 2 项动作之一（19 项 = 17 内核原生 + 2 内核外），
+   *   内核的职责到此为止 = 如实告诉调度方「该排了 / 该取消了」。
+   *   ⚠️ 内核**不**内置一个"假的"调度器去假装排程 —— 那会让「配了超时却永远不会提醒」
+   *   变成一个没有报错的静默事实（与 D-54 同一条纪律）。
+   */
+  const scheduler: Scheduler | undefined = config.scheduler;
   const approverSource: ApproverSource = config.approverSource ?? DEFAULT_APPROVER_SOURCE;
   /**
    * 条件求值（网关分支 / 顺序流）。不注入 = 内置 `@floken-io/feel`（NFR-E10 零配置可跑）。
@@ -629,6 +640,7 @@ export function createEngine(config: EngineConfig): Engine {
       instance: headerOf(next),
     };
 
+    await reconcileTimers(base, next, graph);
     await store.save(next, 0); // INSERT
     if (projection !== undefined) await projection.apply(instanceId, delta);
 
@@ -741,6 +753,7 @@ export function createEngine(config: EngineConfig): Engine {
       apply: built.apply,
       tasks: (s) => tasksOf(s, graph),
     });
+    await reconcileTimers(state, result.next, graph);
 
     /*
      * 槽位 5 / 8 共用的只读上下文。
@@ -894,10 +907,28 @@ export function createEngine(config: EngineConfig): Engine {
       throw stateSuspended(state.instanceId, actionName);
     }
 
+    // 槽位 2 的前置：图纸与图（INV-3 的判定点）
+    const graph = await graphOf(state);
+    assertTokensInGraph(state, graph);
+
     const match: DeliverMatch = { kind, name: input.name };
-    const matches = matchingTokens(state, match);
-    if (matches.length === 0) {
-      const names = waitingNamesOf(state);
+    /**
+     * ★ T21：命中集合有**两类来源**（等待令牌 + 边界事件），按投递种类区别对待。
+     *   故"有没有命中"不能只看 `matchingTokens()` —— 边界事件**不持有令牌**，
+     *   只看等待令牌的话，挂在活动上的消息边界事件**永远收不到消息**。
+     */
+    const mode: DeliverMode = onMiss === 'throw' ? 'point' : 'broadcast';
+    const waiters = matchingTokens(state, match);
+    const armed = armedBoundaries(state, graph, match);
+    const hitCount =
+      mode === 'point'
+        ? waiters.length > 0 || armed.length > 0
+          ? 1
+          : 0
+        : waiters.length + armed.length;
+
+    if (hitCount === 0) {
+      const names = [...waitingNamesOf(state), ...armedNamesOf(state, graph)];
       if (waitingSink !== undefined) for (const n of names) if (!waitingSink.includes(n)) waitingSink.push(n);
       if (onMiss === 'skip') return null;
       // ★「不得静默丢弃」的落点：一个都没命中 → 抛，并把此刻在等什么列给宿主
@@ -906,9 +937,6 @@ export function createEngine(config: EngineConfig): Engine {
 
     // 槽位 3（ADR-007）
     const at = input.at ?? now();
-    // 槽位 2 的前置：图纸与图（INV-3 的判定点）
-    const graph = await graphOf(state);
-    assertTokensInGraph(state, graph);
 
     const before = tasksOf(state, graph);
     const record: ActionRecord = { name: actionName, actor: input.actor, at };
@@ -917,7 +945,7 @@ export function createEngine(config: EngineConfig): Engine {
       actor: input.actor,
       at,
       // 审计要记「唤醒了哪儿」：多个命中时取第一个（保序，可重放）
-      target: (matches[0] as { nodeId: string }).nodeId,
+      target: (waiters[0]?.nodeId ?? armed[0]?.boundary.nodeId) as string,
       ...(input.payload !== undefined ? { payload: input.payload } : {}),
     };
 
@@ -926,7 +954,7 @@ export function createEngine(config: EngineConfig): Engine {
       graph,
       at,
       record,
-      run: (s, ctx) => deliverStep(s, ctx, match),
+      run: (s, ctx) => deliverStep(s, ctx, match, mode),
     });
     const result = plan(state, ai, {
       clock,
@@ -934,6 +962,7 @@ export function createEngine(config: EngineConfig): Engine {
       apply: built.apply,
       tasks: (s) => tasksOf(s, graph),
     });
+    await reconcileTimers(state, result.next, graph);
 
     const hookCtx = freezeActionContext({
       action: result.delta.action,
@@ -963,6 +992,56 @@ export function createEngine(config: EngineConfig): Engine {
     );
 
     return { next: result.next, pendingCalls: built.pendingCalls, delta: result.delta };
+  }
+
+  /**
+   * ★ 超时排程的**兑现**（T21）—— 唯一不纯的一段，故只在本文件里。
+   *
+   * 顺序：先 `cancel()` 旧的（待办已经不在了），再 `schedule()` 新的（新落地的待办）。
+   * ⚠️ 必须在 `store.save()` **之前**调用：`schedule()` 返回的 handle 要写进 `next` 才留得住，
+   *   先存库再排程 = 状态里没有 handle ⇒ 待办办完时**无从取消**（最典型的"已办结还在催办"）。
+   *
+   * ⚠️ 与 `hooks` 同一条容错口径：这里**不**做补偿事务（引擎内不做事务，见 §3b）。
+   *   `schedule()` 失败 = 本次提交失败（状态尚未落库，故不会留下半截状态）。
+   */
+  async function reconcileTimers(
+    prev: InstanceState,
+    next: InstanceState,
+    graph: ProcessGraph,
+  ): Promise<void> {
+    if (scheduler === undefined) return;
+    const diff = diffTimers(prev, next, graph);
+
+    const gained = new Map<string, string[]>();
+    for (const p of diff.schedule) {
+      const handles: string[] = [];
+      for (const kind of p.kinds) {
+        handles.push(
+          await scheduler.schedule({
+            instanceId: next.instanceId,
+            nodeId: p.nodeId,
+            tokenId: p.tokenId,
+            fromAt: p.fromAt,
+            timeout: p.timeout,
+            kind,
+          }),
+        );
+      }
+      gained.set(p.tokenId, handles);
+    }
+
+    for (const c of diff.cancel) {
+      for (const h of c.handles) await scheduler.cancel(h);
+      const t = next.tokens.find((x) => x.id === c.tokenId);
+      if (t !== undefined) delete t.timerHandles;
+    }
+
+    // ★ 写回必须在取消之后：否则刚排上的 handle 会被上面那一步一并删掉
+    for (const [tokenId, handles] of gained) {
+      const t = next.tokens.find((x) => x.id === tokenId);
+      if (t === undefined) continue;
+      t.timerHandles = [...(t.timerHandles ?? []), ...handles];
+    }
   }
 
   // ---------------- ★ CallActivity：子实例的创建 / 回归 / 连坐终止（T18） ----------------
@@ -1062,6 +1141,7 @@ export function createEngine(config: EngineConfig): Engine {
       instance: headerOf(next),
     };
 
+    await reconcileTimers(base, next, graph);
     await store.save(next, 0); // INSERT
     if (projection !== undefined) await projection.apply(spec.instanceId, delta);
     // 与 `start()` 同款：**不触发门 1 `hooks`**（D-27）
@@ -1120,6 +1200,7 @@ export function createEngine(config: EngineConfig): Engine {
       apply: (draft) => built.apply(callReturnOf(draft, p, to)),
       tasks: (s) => tasksOf(s, graph),
     });
+    await reconcileTimers(parent, result.next, graph);
 
     await store.save(result.next, parent.rev);
     if (projection !== undefined) await projection.apply(p.instanceId, result.delta);

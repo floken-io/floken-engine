@@ -2098,6 +2098,332 @@ check('T20 · 公开面：投递所需的纯函数已导出，`wakeTokens` 未�
   eq(m.wakeTokens, undefined, 'wakeTokens 不得导出（单独用会把令牌原地重新停车）');
 });
 
+// ---------------- T21 · 边界事件 / 事务取消 / 竞速 / 超时经 Scheduler ----------------
+
+/**
+ * ★ 这一段断言的是「**会不会静默地什么都不发生**」—— T21 这四件事的失败形式全是
+ *   「没报错，但流程的行为跟图上画的不一样」，比抛错难查得多：
+ *     - 边界事件没触发 → 撤回/超时配了却永远不发生；
+ *     - 非中断边界把宿主也取消了 → 正在办的人凭空少一条待办；
+ *     - 竞速没取消其余分支 → 流程莫名走出两条；
+ *     - 超时没排程 / 没取消 → 该催的不催、已办结的还在催。
+ */
+const liveAt = (state, nodeId) =>
+  (state?.tokens ?? []).filter((t) => t.nodeId === nodeId && t.state === 'active');
+
+/** 记录型假 `Scheduler`：不真的定时，只记「排了什么 / 取消了什么」 */
+const fakeScheduler = () => {
+  const scheduled = [];
+  const cancelled = [];
+  let seq = 0;
+  return {
+    scheduled,
+    cancelled,
+    async schedule(req) {
+      scheduled.push(req);
+      seq += 1;
+      return `h${seq}`;
+    },
+    async cancel(h) {
+      cancelled.push(h);
+    },
+  };
+};
+
+const approvalWithTimeout = (who) => ({
+  'floken:approval': {
+    approvers: [{ type: 'user', value: who }],
+    timeout: { duration: 'P3D', actions: [{ type: 'remind' }, { type: 'autoApprove' }] },
+  },
+});
+
+/** `Task_1` 上挂一个消息边界事件（`cancelActivity` 不给 = 中断） */
+const bndDefOf = (cancelActivity) =>
+  defOf(
+    'Process_1',
+    [
+      { id: 'Start_1', type: 'startEvent' },
+      { id: 'Task_1', type: 'userTask', extension: userApprovalOf('u1') },
+      { id: 'End_1', type: 'endEvent' },
+      {
+        id: 'Bnd_1',
+        type: 'boundaryEvent',
+        attachedTo: 'Task_1',
+        ...(cancelActivity === undefined ? {} : { cancelActivity }),
+        eventDefinition: { type: 'message', messageRef: 'Msg_cancel' },
+      },
+      { id: 'Task_2', type: 'userTask', extension: userApprovalOf('u2') },
+      { id: 'End_2', type: 'endEvent' },
+    ],
+    [
+      { id: 'Flow_1', from: 'Start_1', to: 'Task_1' },
+      { id: 'Flow_2', from: 'Task_1', to: 'End_1' },
+      { id: 'Flow_b', from: 'Bnd_1', to: 'Task_2' },
+      { id: 'Flow_3', from: 'Task_2', to: 'End_2' },
+    ],
+  );
+
+await checkAsync('T21 · ★ 中断边界事件（缺省 `cancelActivity`）：宿主待办消失，流程改走边界事件的出向', async () => {
+  const { engine, store } = engineOn(bndDefOf());
+  const id = await engine.start('Process_1', { definitionVersion: 1, starter: 'u0' });
+  eq((await store.load(id)).tokens[0].nodeId, 'Task_1', '启动后停在宿主任务');
+
+  const delta = await engine.deliverMessage(id, { name: 'Msg_cancel', actor: 'crm' });
+  // ⚠️ `removed` 是**真删**的 taskId 列表（`${nodeId}:${tokenId}`），不是 `TaskView`
+  eq(delta.removed.length, 1, '宿主待办被删掉一条');
+  eq(String(delta.removed[0]).includes('Task_1:'), true, '删的是宿主那条');
+  sameArray(delta.added.map((t) => t.assignee), ['u2'], '新增边界出向的待办');
+
+  const st = await store.load(id);
+  eq(liveAt(st, 'Task_1').length, 0, '宿主不再在途');
+  eq(liveAt(st, 'Task_2').length, 1, '走到边界出向');
+  eq(st.tokens.find((t) => t.nodeId === 'Task_1').state, 'cancelled', '宿主是**被打断**而非办完');
+});
+
+await checkAsync('T21 · ★ 非中断边界事件（`cancelActivity:false`）：宿主待办**还在**，另起一条', async () => {
+  const { engine, store } = engineOn(bndDefOf(false));
+  const id = await engine.start('Process_1', { definitionVersion: 1, starter: 'u0' });
+
+  const delta = await engine.deliverMessage(id, { name: 'Msg_cancel', actor: 'crm' });
+  sameArray(delta.removed, [], '宿主待办一条都不许删');
+  sameArray(delta.added.map((t) => t.assignee), ['u2'], '新增边界出向的待办');
+
+  const st = await store.load(id);
+  eq(liveAt(st, 'Task_1').length, 1, '宿主还在办');
+  eq(liveAt(st, 'Task_2').length, 1, '边界那条并行在办');
+  eq(st.status, 'running', '实例仍在跑');
+});
+
+await checkAsync('T21 · ★ 事务取消：作用域内**全部**在途令牌一并退场（拍平后靠 `Tx_1/` 前缀判）', async () => {
+  const def = defOf(
+    'Process_1',
+    [
+      { id: 'Start_1', type: 'startEvent' },
+      {
+        id: 'Tx_1',
+        type: 'transaction',
+        nodes: [
+          { id: 'T_S', type: 'startEvent' },
+          { id: 'T_P', type: 'parallelGateway' },
+          { id: 'T_A', type: 'userTask', extension: userApprovalOf('u1') },
+          { id: 'T_B', type: 'userTask', extension: userApprovalOf('u2') },
+          { id: 'T_E', type: 'endEvent' },
+        ],
+        flows: [
+          { id: 'ft1', from: 'T_S', to: 'T_P' },
+          { id: 'ft2', from: 'T_P', to: 'T_A' },
+          { id: 'ft3', from: 'T_P', to: 'T_B' },
+          { id: 'ft4', from: 'T_A', to: 'T_E' },
+          { id: 'ft5', from: 'T_B', to: 'T_E' },
+        ],
+      },
+      { id: 'End_1', type: 'endEvent' },
+      {
+        id: 'Bnd_tx',
+        type: 'boundaryEvent',
+        attachedTo: 'Tx_1',
+        eventDefinition: { type: 'message', messageRef: 'Msg_cancel' },
+      },
+      { id: 'Task_esc', type: 'userTask', extension: userApprovalOf('u_esc') },
+      { id: 'End_2', type: 'endEvent' },
+    ],
+    [
+      { id: 'f1', from: 'Start_1', to: 'Tx_1' },
+      { id: 'f2', from: 'Tx_1', to: 'End_1' },
+      { id: 'f3', from: 'Bnd_tx', to: 'Task_esc' },
+      { id: 'f4', from: 'Task_esc', to: 'End_2' },
+    ],
+  );
+  const { engine, store } = engineOn(def);
+  const id = await engine.start('Process_1', { definitionVersion: 1, starter: 'u0' });
+  eq(
+    (await store.load(id)).tokens.filter((t) => t.state === 'active').length,
+    2,
+    '事务内两条并行在途',
+  );
+
+  await engine.deliverMessage(id, { name: 'Msg_cancel', actor: 'erp' });
+  const st = await store.load(id);
+  sameArray(
+    st.tokens.filter((t) => t.nodeId.startsWith('Tx_1/') && t.state === 'active'),
+    [],
+    '作用域内不准留下任何在途令牌（只取消宿主会漏掉并行那条）',
+  );
+  eq(liveAt(st, 'Task_esc').length, 1, '走到边界出向');
+});
+
+await checkAsync('T21 · ★ `EventBasedGateway` 竞速：投递 A → A 分支走下去，B 分支取消', async () => {
+  const def = defOf(
+    'Process_1',
+    [
+      { id: 'Start_1', type: 'startEvent' },
+      { id: 'EG_1', type: 'eventBasedGateway' },
+      { id: 'C_A', type: 'intermediateCatchEvent', eventDefinition: { type: 'message', messageRef: 'Msg_A' } },
+      { id: 'C_B', type: 'intermediateCatchEvent', eventDefinition: { type: 'message', messageRef: 'Msg_B' } },
+      { id: 'Task_A', type: 'userTask', extension: userApprovalOf('u_a') },
+      { id: 'Task_B', type: 'userTask', extension: userApprovalOf('u_b') },
+      { id: 'End_1', type: 'endEvent' },
+    ],
+    [
+      { id: 'f0', from: 'Start_1', to: 'EG_1' },
+      { id: 'F_A', from: 'EG_1', to: 'C_A' },
+      { id: 'F_B', from: 'EG_1', to: 'C_B' },
+      { id: 'f1', from: 'C_A', to: 'Task_A' },
+      { id: 'f2', from: 'C_B', to: 'Task_B' },
+      { id: 'f3', from: 'Task_A', to: 'End_1' },
+      { id: 'f4', from: 'Task_B', to: 'End_1' },
+    ],
+  );
+  const { engine, store } = engineOn(def);
+  const id = await engine.start('Process_1', { definitionVersion: 1, starter: 'u0' });
+
+  const parked = (await store.load(id)).tokens.filter((t) => t.awaiting !== undefined);
+  sameArray(parked.map((t) => t.nodeId).sort(), ['C_A', 'C_B'], '两条分支都停下等');
+  eq(new Set(parked.map((t) => t.race)).size, 1, '★ 两条分支**共享**同一个 `race`（否则取消不了对手）');
+
+  const delta = await engine.deliverMessage(id, { name: 'Msg_A', actor: 'erp' });
+  sameArray(delta.added.map((t) => t.assignee), ['u_a'], '赢家产出待办');
+
+  const st = await store.load(id);
+  eq(liveAt(st, 'Task_A').length, 1, 'A 分支走下去');
+  eq(liveAt(st, 'Task_B').length, 0, 'B 分支不得也走下去');
+  eq(st.tokens.find((t) => t.nodeId === 'C_B').state, 'cancelled', 'B 分支被取消');
+  eq(st.tokens.find((t) => t.nodeId === 'Task_A').race, undefined, '赢家离开等待节点后退出竞速');
+});
+
+await checkAsync('T21 · ★ 超时经 `Scheduler`：按 `actions` 逐条排程，且内核**不**算 `dueAt`（Q33）', async () => {
+  const def = defOf(
+    'Process_1',
+    [
+      { id: 'Start_1', type: 'startEvent' },
+      { id: 'Task_1', type: 'userTask', extension: approvalWithTimeout('u1') },
+      { id: 'Task_2', type: 'userTask', extension: approvalWithTimeout('u2') },
+      { id: 'End_1', type: 'endEvent' },
+    ],
+    [
+      { id: 'f1', from: 'Start_1', to: 'Task_1' },
+      { id: 'f2', from: 'Task_1', to: 'Task_2' },
+      { id: 'f3', from: 'Task_2', to: 'End_1' },
+    ],
+  );
+  const sched = fakeScheduler();
+  const { engine, store } = engineOn(def, { scheduler: sched });
+  const id = await engine.start('Process_1', { definitionVersion: 1, starter: 'u0' });
+
+  sameArray(sched.scheduled.map((r) => r.kind), ['remind', 'autoApprove'], '两个动作各排一次（可并存）');
+  eq(sched.scheduled[0].instanceId, id, 'instanceId');
+  eq(sched.scheduled[0].nodeId, 'Task_1', 'nodeId');
+  eq(typeof sched.scheduled[0].tokenId, 'string', '★ tokenId（取消时要能定位到"哪条待办"）');
+  eq(sched.scheduled[0].fromAt, T20, 'fromAt = 待办创建时刻');
+  eq(sched.scheduled[0].timeout.duration, 'P3D', 'timeout = 定义上的**原始配置**（原样透传）');
+  eq(
+    typeof sched.scheduled[0].timeout.workCalendar,
+    'string',
+    '★ 工作日历只透传 id，内核不解释内容（`03` F-1：不得退化成 7×24）',
+  );
+  for (const r of sched.scheduled) {
+    eq(r.dueAt, undefined, '★ 内核不得交 `dueAt`（Q33 禁止时态库；工作日历是业务数据）');
+  }
+
+  eq((await store.load(id)).tokens[0].timerHandles.length, 2, '★ handle 落进状态（否则办完时无从取消）');
+});
+
+await checkAsync('T21 · ★ 待办办完 → `cancel()` 掉旧 handle 并**清空** `timerHandles`', async () => {
+  const def = defOf(
+    'Process_1',
+    [
+      { id: 'Start_1', type: 'startEvent' },
+      { id: 'Task_1', type: 'userTask', extension: approvalWithTimeout('u1') },
+      { id: 'Task_2', type: 'userTask', extension: approvalWithTimeout('u2') },
+      { id: 'End_1', type: 'endEvent' },
+    ],
+    [
+      { id: 'f1', from: 'Start_1', to: 'Task_1' },
+      { id: 'f2', from: 'Task_1', to: 'Task_2' },
+      { id: 'f3', from: 'Task_2', to: 'End_1' },
+    ],
+  );
+  const sched = fakeScheduler();
+  const { engine, store } = engineOn(def, { scheduler: sched });
+  const id = await engine.start('Process_1', { definitionVersion: 1, starter: 'u0' });
+  const first = (await store.load(id)).tokens[0].timerHandles ?? [];
+
+  await engine.submit(id, { action: 'approve', actor: 'u1', at: T20 });
+  sameArray(sched.cancelled, first, '★ 旧 handle 一条不落（否则"已办结还在催办"）');
+
+  /*
+   * ⚠️ 令牌是**被复用**的（`tk_start` 从 `Task_1` 推进到 `Task_2`），所以不能写
+   *   「找 `nodeId === 'Task_1'` 的令牌、其 `timerHandles` 应为 undefined」——
+   *   那样"令牌整个消失"也会被判成对。这里钉死的是：**新 handle 在、旧 handle 不在**。
+   */
+  const now = (await store.load(id)).tokens.find((t) => t.state === 'active');
+  eq(now?.nodeId, 'Task_2', '令牌被复用到下一个节点');
+  eq(now?.timerHandles.length, 2, '新节点重新排了两条');
+  for (const h of first) eq((now?.timerHandles ?? []).includes(h), false, `旧 handle ${h} 不得残留`);
+  eq(sched.scheduled.filter((r) => r.nodeId === 'Task_2').length, 2, '新待办重新排程');
+});
+
+await checkAsync('T21 · ★ 不注入 `scheduler` = 不排程（超时是内核外能力，内核不假装做了）', async () => {
+  const def = defOf(
+    'Process_1',
+    [
+      { id: 'Start_1', type: 'startEvent' },
+      { id: 'Task_1', type: 'userTask', extension: approvalWithTimeout('u1') },
+      { id: 'End_1', type: 'endEvent' },
+    ],
+    [
+      { id: 'f1', from: 'Start_1', to: 'Task_1' },
+      { id: 'f2', from: 'Task_1', to: 'End_1' },
+    ],
+  );
+  const { engine, store } = engineOn(def);
+  const id = await engine.start('Process_1', { definitionVersion: 1, starter: 'u0' });
+  const st = await store.load(id);
+  eq(st.tokens[0].timerHandles, undefined, '没有 handle');
+  eq(st.tokens[0].nodeId, 'Task_1', '流程照常推进（不注入只是没定时，不是不能跑）');
+});
+
+await checkAsync('T21 · ★ 投递未命中的报错要列出**边界事件**的等待（`details.waiting` 给合法取值）', async () => {
+  const { engine } = engineOn(bndDefOf());
+  const id = await engine.start('Process_1', { definitionVersion: 1, starter: 'u0' });
+  let err = null;
+  try {
+    await engine.deliverMessage(id, { name: 'Msg_typo', actor: 'crm' });
+  } catch (e) {
+    err = e;
+  }
+  eq(err?.code, 'ENGINE_ACTION_TARGET_INVALID', '错误码');
+  eq(
+    err?.details?.waiting.includes('boundary:message:Msg_cancel'),
+    true,
+    '★ 边界事件**不持有令牌**，只看 `Token.awaiting` 会把它整个漏掉',
+  );
+});
+
+check('T21 · 公开面：边界事件与定时器的纯函数已导出（宿主做订阅表要能枚举「谁在监听什么」）', () => {
+  for (const k of [
+    'BOUNDARY_TYPE',
+    'boundaryBindingOf',
+    'boundaryTokenIdOf',
+    'armedBoundaries',
+    'armedNamesOf',
+    'cancelTargetsOf',
+    'inScopeOf',
+    'diffTimers',
+    'timingKeysOf',
+    'timeoutSpecOf',
+    'timerKeyOf',
+  ]) {
+    const want = k === 'BOUNDARY_TYPE' ? 'string' : 'function';
+    eq(typeof m[k], want, `导出 ${k}`);
+  }
+  eq(m.BOUNDARY_TYPE, 'boundaryEvent', 'BOUNDARY_TYPE');
+  eq(m.inScopeOf('Task_1', 'Task_1'), true, 'inScopeOf：自己是自己的作用域');
+  eq(m.inScopeOf('Tx_1/T_A', 'Tx_1'), true, 'inScopeOf：内嵌节点在宿主作用域里');
+  eq(m.inScopeOf('Task_2', 'Task_1'), false, 'inScopeOf：别的节点不在');
+  eq(m.timerKeyOf('Task_1', 'tk_1'), 'Task_1::tk_1', 'timerKeyOf（按令牌而非节点）');
+});
+
 // ---------------- 汇总 ----------------
 
 let failed = 0;

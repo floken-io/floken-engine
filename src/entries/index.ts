@@ -252,7 +252,44 @@ export {
 export type { CatchKind, CatchBinding, CatchNodeLike, DeliverMatch } from '../nodes/catch.js';
 
 export { deliverStep } from '../runtime/deliver.js';
-export type { DeliverResult } from '../runtime/deliver.js';
+export type { DeliverMode, DeliverResult, FiredBoundary } from '../runtime/deliver.js';
+
+// ---------------- ★ 超时排程（§7.1 · T21 · 内核外能力的内核侧） ----------------
+
+/**
+ * ★ 为什么**必须公开** `diffTimers()` / `timingKeysOf()`：门 2（宿主自编排）自己落库时，
+ *   也得自己问「谁刚停下（该排程） / 谁刚离开（该取消）」—— 若这份判据只活在
+ *   `submit()` 里，门 2 要么复制一份、要么干脆不排程（表现为"门 2 路径下超时全部失效"）。
+ *
+ * ⚠️ 内核只**算意图**，不调 `Scheduler`：那是 `runtime/engine.ts` 的不纯职责。
+ */
+export { diffTimers, timingKeysOf, timeoutSpecOf, timerKeyOf } from '../runtime/timers.js';
+export type {
+  PendingCancel,
+  PendingTimeout,
+  TimerDiff,
+  TimerKind,
+} from '../runtime/timers.js';
+
+// ---------------- ★ 边界事件（§6 事件表 · T21） ----------------
+
+/**
+ * ★ 为什么**必须公开** `boundaryBindingOf()` / `armedBoundaries()`：与 `matchingTokens()`
+ *   同一条理由 —— 宿主做**订阅表**时要知道"谁在监听什么"，而边界事件**不持有令牌**，
+ *   光读 `Token.awaiting` 会把它整个漏掉（表现为"挂在审批上的撤回消息永远收不到"）。
+ *
+ *   `armedNamesOf()` 供"投递未命中"的报错给**合法取值**（`AGENTS.md` §5.4）。
+ */
+export {
+  BOUNDARY_TYPE,
+  boundaryBindingOf,
+  boundaryTokenIdOf,
+  armedBoundaries,
+  armedNamesOf,
+  cancelTargetsOf,
+  inScopeOf,
+} from '../nodes/boundary.js';
+export type { BoundaryBinding, BoundaryFire, BoundaryNodeLike } from '../nodes/boundary.js';
 
 // ---------------- 事件派生与投递（§7.3 · ADR-006） ----------------
 

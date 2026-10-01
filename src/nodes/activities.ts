@@ -12,9 +12,21 @@
  * | 类型 | 处置 | 理由 |
  * |---|---|---|
  * | `SubProcess` | **内嵌展开**（建图时拍平进父图） | 它没有自己的实例、自己的 rev、自己的待办；所谓"子令牌树"在本引擎里就是**令牌走进展开后的那几个节点**。拍平后 `nextOf` / `reachable` / 汇聚 / `completedNodes` 全部照旧工作，不需要第二套遍历 |
+ * | ★ `Transaction`（T21） | **内嵌展开**（与 `SubProcess` **同处置**） | 它在 BPMN 里就是"带事务语义的子流程"，**拍平这部分与 `SubProcess` 毫无区别**。它剩下的意义（补偿）在**边界事件**那一侧 —— 见下 |
  * | `CallActivity` | **子实例 + 等待 + 自动回归** | 被调用的是**另一个 processId**：它有自己的版本绑定（INV-16）、自己的实例 id、自己的待办 —— 这三件事拍平都表达不了，必须另起实例 |
  * | `AdHocSubProcess` | **显式抛错**（FR-E18，C 级） | "由运行时决定执行哪些节点"是一整套编排语义，本引擎尚未定义它的输入 |
- * | `Transaction` | **显式抛错**（FR-E13 / T21） | 它的全部意义在**补偿**，而补偿要靠边界事件（`cancel` / `compensate`），那是 T21 |
+ *
+ * ## ★ `Transaction` 的「cancel / compensate」拆成两半（T21 的真实边界）
+ *
+ *   - **`cancel`（事务取消）已落地** —— 而且**不需要**为事务单独写一套：
+ *     事务拍平后，内部节点 id 带 `Tx_1/` 前缀；挂在事务上的**中断边界事件**触发时，
+ *     按 `nodes/boundary.ts` 的 `inScopeOf()` **前缀判据**取消作用域内**全部**在途令牌
+ *     —— 这正是 BPMN 里「事务被取消、里面正在办的全部撤销」的效果。
+ *   - **`compensate`（补偿处理器）仍归 v1.x** —— `03` §11 明确把
+ *     `compensateEventDefinition` 登记为 FR-E13 的 S 级例外：补偿要维护"已完成的活动
+ *     及其补偿处理器"的调用链（含顺序与幂等），那是一整套独立语义。
+ *     ⚠️ 故 `<compensateEventDefinition>` 的边界事件**仍显式抛错**并指名归属，
+ *     绝不降级成"可触发但什么都不做"。
  *
  * ## ★ 内嵌展开的三条硬规则
  *
@@ -102,7 +114,7 @@ export function assertActivitySupported(
   const owner: Record<string, string> = {
     subProcess: 'FR-E24 / T21（事件子流程 triggeredByEvent）',
     adHocSubProcess: 'FR-E18（运行时编排）',
-    transaction: 'FR-E13 / T21（边界事件与补偿）',
+    transaction: 'FR-E13 / T21（transaction 必须含内嵌节点才能展开；补偿处理器 compensate 归 v1.x）',
   };
   throw stateShapeInvalid(`node '${nodeId}' is a '${type}', which is not executable yet`, {
     nodeId,
@@ -134,7 +146,7 @@ export interface FlattenedProcess {
 }
 
 /**
- * ★ 把一份定义里的内嵌子流程**递归拍平**。
+ * ★ 把一份定义里的内嵌子流程 / 事务子流程**递归拍平**。
  *
  * @throws `ENGINE_STATE_SHAPE_INVALID` —— 内嵌子流程缺节点 / 缺 `startEvent` / 缺 `endEvent`
  *         （这三条都是"画不出来却说跑了"的定义缺陷，必须在**建图时**就报出来，
@@ -147,10 +159,15 @@ export function expandSubProcesses(
   return flatten(nodes, flows, '');
 }
 
-/** 只展这一类：普通内嵌子流程（**不是**事件子流程） */
+/**
+ * ★ 只展这一类：**普通内嵌子流程 / 事务子流程**（**不是**事件子流程）。
+ *
+ * ⚠️ `transaction` 与 `subProcess` 在此同处置：拍平只关心"它有没有内嵌节点"，
+ *   事务语义不体现在**图的形状**上（它体现在边界事件的取消范围上，见档首）。
+ */
 function isExpandable(n: FlowNode): boolean {
   return (
-    n.type === 'subProcess' &&
+    (n.type === 'subProcess' || n.type === 'transaction') &&
     n.triggeredByEvent !== true &&
     Array.isArray(n.nodes) &&
     n.nodes.length > 0

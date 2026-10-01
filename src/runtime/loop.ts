@@ -441,7 +441,10 @@ function restIdsOf(state: InstanceState, groupId: string): string[] {
  *   - 等待节点（`userTask`）→ 落定办理人后停下（`Token.createdAt` 此时才填）；
  *     解析出**多个**办理人 → **展开成汇聚组**（会签 / 或签 / 票签，T13）；
  *   - **等外部投递**（`intermediateCatchEvent` / `receiveTask`，T20）→ 记下 `Token.awaiting` 后停下，
- *     由 `deliverMessage()` / `deliverSignal()` 唤醒；
+ *     由 `deliverMessage()` / `deliverSignal()` 唤醒；★ **T21 起亦可由边界事件触发**
+ *     （`nodes/boundary.ts`：它挂在活动上监听，触发时**夺走或另造**令牌）；
+ *   - **`eventBasedGateway`**（T21）→ 全部分叉并标 `Token.race`，谁先被唤醒谁赢、
+ *     其余分支在 `runtime/deliver.ts` 里被取消；
  *   - 结束事件 → 该令牌 `completed`；
  *   - **网关**（T16）→ 先判要不要**汇聚等待**，再按类型路由：
  *     一条出向 = 直通过去；多条 = **令牌分裂**（见档首 `forkToken`）；
@@ -543,7 +546,7 @@ function advanceTokens(
           parkCatch(token, ctx);
           break;
         }
-        // 'start' → 落到下面的自动直通
+        // 'start' / 'pass'（boundaryEvent）→ 落到下面的自动直通
       }
 
       // ② 网关（T16）
@@ -562,13 +565,20 @@ function advanceTokens(
         // ★ 离开网关也要记账（D-28 同口径）
         markCompleted(next, token.nodeId);
 
+        /*
+         * ★ T21：事件网关分叉出的令牌**同批竞速**（`Token.race`）——
+         *   谁先被唤醒谁赢，其余在 `runtime/deliver.ts` 里被取消。
+         *   ⚠️ 单出向也要标记：那一条分支同样参加了竞速（赢家可能就地被取消）。
+         */
+        const race = type === 'eventBasedGateway' ? `${token.nodeId}#${token.id}` : undefined;
         if (routed.length === 1) {
           token.nodeId = (routed[0] as RoutedFlow).to;
           clearAssignment(token);
+          if (race !== undefined) token.race = race;
           continue;
         }
         // 多条出向 → 令牌分裂。第 0 条沿用原令牌，故此处 `continue` 接着推它
-        forkToken(next, token, i, routed);
+        forkToken(next, token, i, routed, race);
         continue;
       }
 
@@ -682,6 +692,7 @@ function forkToken(
   token: Token,
   index: number,
   routed: readonly RoutedFlow[],
+  race?: string | undefined,
 ): void {
   const first = routed[0] as RoutedFlow;
   const root = token.branch ?? token.id;
@@ -689,6 +700,8 @@ function forkToken(
   token.nodeId = first.to;
   token.branch = `${root}#${first.flowId}`;
   clearAssignment(token);
+  // ⚠️ `clearAssignment` 会摘 `race`，故**必须在它之后**写回（顺序反了就白标）
+  if (race !== undefined) token.race = race;
 
   const created: Token[] = [];
   for (let j = 1; j < routed.length; j += 1) {
@@ -698,6 +711,7 @@ function forkToken(
       nodeId: r.to,
       state: 'active',
       branch: `${root}#${r.flowId}`,
+      ...(race === undefined ? {} : { race }),
     });
   }
   next.tokens = [

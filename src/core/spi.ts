@@ -224,14 +224,40 @@ export interface EventSink {
   emit(event: EngineEvent): void | Promise<void>;
 }
 
-/** 定时请求：`03-engine` §4 的 `timeout.actions[]` 四选（可并存，故 `kind` 是单值、可多次 schedule） */
+/** 到点后做什么 —— `03` §4 的 `timeout.actions[]` 四选（可并存，故 `kind` 是单值、可多次 schedule） */
+export type ScheduleKind = 'remind' | 'autoApprove' | 'autoReject' | 'escalate';
+
+/**
+ * ★ **原始**超时配置（`03` §4 的 `TimeoutConfig` 三选一 + 工作日历）。
+ *
+ * ⚠️ 为什么这里传的是**配置**而不是算好的 `dueAt`：
+ *   ① **Q33** 硬性规定引擎 `dist` 不得出现时态库 —— 内核连 `P3D` 都解不了；
+ *   ② 就算能解，`03` F-1 要求「3 个工作日」**必须**跳过周末与法定节假日，
+ *      而节假日表是**业务配置**，属于宿主/调度方。
+ *   ⇒ 内核只能如实交出「从什么时候开始 + 定义上写的什么」，**到期时刻由调度方算**。
+ *      把 `dueAt` 留在内核里，等于逼内核要么违反 Q33、要么静默退化成 7×24。
+ */
+export interface TimeoutSpec {
+  /** ISO-8601 duration：'P3D' / 'PT4H' */
+  readonly duration?: string | undefined;
+  /** 绝对时间 */
+  readonly date?: string | undefined;
+  /** 周期 */
+  readonly cycle?: string | undefined;
+  /** 工作日历 id；不给 = 调度方自己的默认（`03` F-1：不得退化成 7×24） */
+  readonly workCalendar?: string | undefined;
+}
+
 export interface ScheduleRequest {
   instanceId: string;
   nodeId: string;
-  /** 触发时间（ISO 8601，按工作日历算出） */
-  dueAt: string;
-  /** 到点后做什么 —— 属**内核外**实现，由调度层调内核入口 */
-  kind: 'remind' | 'autoApprove' | 'autoReject' | 'escalate';
+  /** ★ 待办对应的令牌（`cancel` 要能定位到"哪条待办"） */
+  tokenId: string;
+  /** ★ 待办**创建**的时刻（ISO 8601）—— 调度方按工作日历**从它**推算真实到期时刻 */
+  fromAt: string;
+  /** ★ 定义上写的超时配置（内核**不**算 `dueAt`，理由见 {@link TimeoutSpec}） */
+  timeout: TimeoutSpec;
+  kind: ScheduleKind;
   payload?: Record<string, unknown>;
 }
 
@@ -241,7 +267,7 @@ export interface ScheduleRequest {
  * 不注入 = 内置 `createMemoryScheduler()` 零依赖进程内实现。
  */
 export interface Scheduler {
-  /** 返回可取消的 handle */
+  /** 返回可取消的 handle（形状由**调度方**决定，引擎不得假定） */
   schedule(req: ScheduleRequest): Promise<string>;
   cancel(handle: string): Promise<void>;
 }

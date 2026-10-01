@@ -58,12 +58,13 @@ describe('事件 6 类的分类（`01-moddle` §5.3 · event 族）', () => {
     }
   });
 
-  it('行为归类：start=入口 / end=终点 / catch=等投递 / 其余 3 类=未实现', () => {
+  it('行为归类：start=入口 / end=终点 / catch=等投递 / boundary=直通 / 其余 2 类=未实现', () => {
     expect(eventBehaviorOf('startEvent')).toBe('start');
     expect(eventBehaviorOf('endEvent')).toBe('terminal');
     expect(eventBehaviorOf('intermediateCatchEvent')).toBe('catch');
+    // ★ T21：boundaryEvent 已落地 —— 它不持有令牌，触发产生的令牌落在它上面时**直通**到出向
+    expect(eventBehaviorOf('boundaryEvent')).toBe('pass');
     expect(eventBehaviorOf('intermediateThrowEvent')).toBe('unsupported');
-    expect(eventBehaviorOf('boundaryEvent')).toBe('unsupported');
     expect(eventBehaviorOf('implicitThrowEvent')).toBe('unsupported');
   });
 
@@ -77,10 +78,9 @@ describe('事件 6 类的分类（`01-moddle` §5.3 · event 族）', () => {
   /**
    * ★ 反向断言：未实现的三类必须**抛**，且错误里点名归属 FR（照着就能排期）。
    */
-  it('未实现的 3 类：`assertEventSupported` 一律抛 `STATE_SHAPE_INVALID`', () => {
+  it('未实现的 2 类：`assertEventSupported` 一律抛 `STATE_SHAPE_INVALID`', () => {
     for (const [type, owner] of [
       ['intermediateThrowEvent', 'FR-E14'],
-      ['boundaryEvent', 'FR-E13'],
       ['implicitThrowEvent', 'FR-E24'],
     ] as const) {
       let err: unknown;
@@ -94,10 +94,11 @@ describe('事件 6 类的分类（`01-moddle` §5.3 · event 族）', () => {
     }
   });
 
-  it('已实现的 3 类：`assertEventSupported` 是 no-op', () => {
+  it('已实现的 4 类：`assertEventSupported` 是 no-op', () => {
     expect(() => assertEventSupported('endEvent', 'End_1', 'terminal')).not.toThrow();
     expect(() => assertEventSupported('startEvent', 'Start_1', 'start')).not.toThrow();
     expect(() => assertEventSupported('intermediateCatchEvent', 'Ev_1', 'catch')).not.toThrow();
+    expect(() => assertEventSupported('boundaryEvent', 'Ev_b', 'pass')).not.toThrow();
   });
 });
 
