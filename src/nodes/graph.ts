@@ -130,6 +130,23 @@ export interface ProcessGraph {
    * 用于区分「没配」与「配了但归一化失败」—— 后者由 `normalizeApproval` 自己抛。
    */
   hasApproval(nodeId: string): boolean;
+  // —— T17：任务类节点的取参（`nodes/tasks.ts` 的分类决定要不要读）——
+  /** `<bpmn:script>` 子元素（`scriptTask`）；未配 / 空白 → `undefined` */
+  scriptOf(nodeId: string): string | undefined;
+  /** `scriptFormat`（`scriptTask`）；未配 → `undefined`（⇒ 不是 FEEL，走 `handlers` 表） */
+  scriptFormatOf(nodeId: string): string | undefined;
+  /**
+   * ★ `serviceTask` / 非 FEEL 的 `scriptTask` 在 `handlers` 表里的**查找键**。
+   *
+   * 三级回退：`implementation`（非 `##` 前缀的内置标识）→ `operationRef` → **`nodeId`**。
+   *
+   * ⚠️ 为什么 `##unspecified` / `##WebService` 不算：那是 BPMN 的**实现标识**，
+   *    不是宿主处理器的名字 —— 拿它去查 `handlers` 必然查不到，报错还会指错方向。
+   *
+   * ⚠️ 为什么最后回退到 `nodeId`：让「每个服务节点一个 handler」成为零配置可用形态
+   *    （`AC-E13` 的精神），而不是逼宿主为每个节点写一遍 `implementation`。
+   */
+  handlerRefOf(nodeId: string): string;
 }
 
 /**
@@ -278,6 +295,27 @@ export function createProcessGraph(
     },
 
     hasApproval: (nodeId) => nodes.get(nodeId)?.extension?.[APPROVAL_EXT_KEY] !== undefined,
+
+    scriptOf: (nodeId) => {
+      const s = nodes.get(nodeId)?.script;
+      if (typeof s !== 'string') return undefined;
+      const trimmed = s.trim();
+      return trimmed === '' ? undefined : trimmed;
+    },
+
+    scriptFormatOf: (nodeId) => {
+      const f = nodes.get(nodeId)?.scriptFormat;
+      return typeof f === 'string' && f.trim() !== '' ? f : undefined;
+    },
+
+    handlerRefOf(nodeId) {
+      const node = nodes.get(nodeId);
+      const impl = node?.implementation;
+      if (typeof impl === 'string' && impl.length > 0 && !impl.startsWith('##')) return impl;
+      const op = node?.operationRef;
+      if (typeof op === 'string' && op.length > 0) return op;
+      return nodeId;
+    },
   };
 }
 

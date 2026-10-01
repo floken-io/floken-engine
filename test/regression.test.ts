@@ -19,6 +19,7 @@ import { compileAction } from '../src/actions/compile';
 import type { ActionInput } from '../src/core/action';
 import { ENGINE_ERROR_CODES } from '../src/core/errors';
 import { createProcessGraph } from '../src/nodes/graph';
+import { NO_EFFECT } from '../src/nodes/tasks';
 import { createEngine } from '../src/runtime/engine';
 import { applyPost, step } from '../src/runtime/loop';
 import { createMemoryStore } from '../src/store/memory';
@@ -423,7 +424,7 @@ describe('D-34 组内回退 —— 整组重来，不留幽灵待办', () => {
     // 施加后：只剩 1 个在途令牌，且它没有组
     const after = step(
       state,
-      { graph, at: T0, assigneesOf: (n) => (n === 'Task_sign' ? ['u1', 'u2', 'u3'] : ['u9']), conditionsOf: () => true },
+      { graph, at: T0, assigneesOf: (n) => (n === 'Task_sign' ? ['u1', 'u2', 'u3'] : ['u9']), conditionsOf: () => true, effectsOf: () => NO_EFFECT },
       { calls: compiled.calls, post: compiled.post },
     ).next;
     const live = after.tokens.filter((t) => t.state === 'active' || t.state === 'waiting');

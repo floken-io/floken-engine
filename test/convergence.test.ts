@@ -171,18 +171,16 @@ describe('② 反向提前终止（`03` §5.3 三条规则）', () => {
 
 // ---------------- ③ 与模型层对账（D-19：适配层不得改语义） ----------------
 
-/**
- * D-21 的那一格：会签 + 有驳回 —— 引擎**刻意**不跟模型层一致（见 `convergence.ts` 注释）。
- *
- * ⚠️ **不看 `onReject`**（D-31）：模型层在这里用的是"多数决"，与会签的全票决冲突；
- *    引擎侧一律判 `rejected`，`onReject` 只决定要不要**提前**终止。
- */
-const isD21Cell = (mode: ApprovalMode, rejected: number): boolean => mode === 'all' && rejected > 0;
-
 describe('③ ★ 与 `@floken-io/moddle` 对账（单一事实源）', () => {
   const votes: (VoteSpec | undefined)[] = [undefined, { threshold: 0.5 }, { count: 2 }];
 
-  it('穷举全部 (mode × total × approved × rejected × onReject × vote)：**除 D-21 那一格**外必须一致', () => {
+  /**
+   * ★ **无例外格** —— 曾经这里有一格例外（`mode:'all' && rejected > 0`，D-21）：
+   * 模型层把会签的「2 通过 1 驳回」误判为 approved，引擎侧加了一段短路兜住。
+   * 2026-10-01 模型层已修正（`shouldTerminate` 规则序），短路随之删除，例外格一并取消。
+   * 若将来模型层再退化，这条会红 —— 那正是我们想要的信号。
+   */
+  it('穷举全部 (mode × total × approved × rejected × onReject × vote)：**逐格全一致**', () => {
     let checked = 0;
     for (const mode of ['all', 'any', 'vote'] as const) {
       for (const vote of votes) {
@@ -192,7 +190,6 @@ describe('③ ★ 与 `@floken-io/moddle` 对账（单一事实源）', () => {
           for (let total = 1; total <= 6; total += 1) {
             for (let approved = 0; approved <= total; approved += 1) {
               for (let rejected = 0; rejected <= total - approved; rejected += 1) {
-                if (isD21Cell(mode, rejected)) continue;
                 const extra: Partial<ConvergeCtx> = { onReject };
                 if (vote && 'count' in vote) extra.count = vote.count;
                 if (vote && 'threshold' in vote) extra.threshold = vote.threshold;
@@ -218,13 +215,17 @@ describe('③ ★ 与 `@floken-io/moddle` 对账（单一事实源）', () => {
   });
 
   /**
-   * ★ D-21 的存在性证明：把「模型层确实在这里判错」钉成断言。
-   * 将来 moddle 修好了，这条会**红** —— 那正是我们想要的信号（届时删掉上面的短路）。
+   * ★ D-21 的**回归钉子**：模型层修好后，这一格必须与引擎（= 模型层）一致判 `rejected`。
+   * 原来是「证明模型层判错」的存在性断言，现在是「证明它没退回多数决」的回归断言。
    */
-  it('D-21：模型层把会签「2 通过 1 驳回」误判为 approved（引擎侧已修正）', () => {
-    const theirs = modelShouldTerminate('all', 3, 2, 1, { onReject: 'abort' });
-    expect(theirs.outcome).toBe('approved'); // ← 模型层的缺陷，如实记录
-    expect(evaluateConvergence(ctx('all', 3, 2, 1)).outcome).toBe('rejected'); // ← 引擎侧修正
+  it('D-21（已修）：会签「2 通过 1 驳回」两侧同判 rejected，不再按多数决', () => {
+    for (const onReject of ['abort', 'wait'] as const) {
+      const theirs = modelShouldTerminate('all', 3, 2, 1, { onReject });
+      expect(theirs.outcome, onReject).toBe('rejected');
+      expect(evaluateConvergence(ctx('all', 3, 2, 1, { onReject })).outcome).toBe(theirs.outcome);
+    }
+    // 对照：票签才按多数定（3 人 2 通过 1 驳回 → approved）
+    expect(evaluateConvergence(ctx('vote', 3, 2, 1, { ...VOTE_HALF })).outcome).toBe('approved');
   });
 
   it('`requiredOf` 与 `requiredVotes` 同口径', () => {

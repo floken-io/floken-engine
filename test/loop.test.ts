@@ -12,6 +12,8 @@ import { STATE_SCHEMA_VERSION } from '../src/core/state';
 import type { InstanceState, Token } from '../src/core/state';
 import { createProcessGraph } from '../src/nodes/graph';
 import type { OutFlow, ProcessGraph } from '../src/nodes/graph';
+import type { NodeEffect } from '../src/nodes/tasks';
+import { NO_EFFECT } from '../src/nodes/tasks';
 import { PROBE_ASSIGNEE, applyPrimitiveCalls, runToWait, tasksOf } from '../src/runtime/loop';
 import { makeDefinition, userApproval } from './helpers/definition';
 import { expectCode } from './helpers/expect';
@@ -57,15 +59,20 @@ const linearGraph = (): ProcessGraph =>
 /**
  * T16 起 `LoopContext` 必须有 `conditionsOf`（网关分支的真值来源）。
  * 缺省 = **无条件恒真** —— 与「顺序流没写 `conditionExpression`」同义（D-42）。
+ *
+ * T17 起还要有 `effectsOf`（任务副作用的来源）。缺省 = **无副作用** ——
+ * 本档测的是推进 / 汇聚 / 事件，服务与脚本另有专测。
  */
 const ctxOf = (
   graph: ProcessGraph,
   assigneesOf: (n: string) => readonly string[],
   conditionsOf: (f: OutFlow) => boolean = () => true,
+  effectsOf: () => NodeEffect = () => NO_EFFECT,
 ) => ({
   graph,
   assigneesOf,
   conditionsOf,
+  effectsOf,
   at: T,
 });
 

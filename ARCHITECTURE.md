@@ -946,10 +946,12 @@ class EngineError extends Error {
   - **算法不在这里** —— 复用 `@floken-io/moddle` 的 `shouldTerminate()` / `requiredVotes()`（**D-19**）。
     `01-moddle` §4.4.1 原话：「这三条写在模型层是为了让**引擎没有自由心证的空间**」。
     本文件只做三件事：`ConvergeCtx` 形状校验 / 结果语义翻译（补 `required`）/ INV-9 的 `restTokenIds()`。
-  - 两条**穷举测试**（不是样例）：① 与模型层对账（>300 组，除 D-21 那一格外全一致）；
+  - 两条**穷举测试**（不是样例）：① 与模型层对账（>300 组，**逐格全一致、无例外格**）；
     ② INV-10 死锁回归（穷举 total 1~6 × 全部表态分布，断言不存在"该结束却不结束"）。
-  - ⚠️ **实测抓出模型层的真实缺陷 D-21**：会签 3 人 2 通过 1 驳回（驳回者最后表态）→
-    moddle 判 **approved**，与「会签 = 全部通过才推进」及 INV-11 冲突。引擎侧已按规格顺序修正（规则一优先）。
+  - ⚠️ **实测抓出模型层的真实缺陷 D-21**：会签 3 人 2 通过 1 驳回 → moddle 判 **approved**，
+    与「会签 = 全部通过才推进」及 INV-11 冲突。**2026-10-01 已在模型层修根因**
+    （`shouldTerminate()` 规则序：先按 `mode` 判，"全员已表态"的多数决兜底只对票签生效）；
+    引擎侧当初那段 `mode:'all' && rejected>0` 的**短路随即删除** —— 保留即两份事实源（D-19 的教训）。
 
 - [x] **T11 `createEngine` + `start` / `submit` + run-to-wait 循环** ✅ 2026-10-01
   组件：`runtime/engine.ts` / `runtime/loop.ts` / `nodes/graph.ts`
@@ -1023,9 +1025,11 @@ class EngineError extends Error {
   **④ 承接令牌另造、不复用投票者的令牌**：组内令牌是**投票记录**，复用就得抹掉 `vote`，
   于是"谁投了什么"在状态里就没了 —— 省一个对象、赔掉整条审计链。
 
-  **⑤ D-31（实测暴露）**：会签 + `onReject:'wait'` 也是 D-21 的漏网之鱼 ——
+  **⑤ D-31（实测暴露，2026-10-01 已随 D-21 一并修根因）**：会签 + `onReject:'wait'` 也是 D-21 的漏网之鱼 ——
   模型层的"多数决"让「2 通过 1 驳回」判成 approved。`onReject` 只决定**要不要提前终止**，
   不决定**最后按什么定**；会签下只要有人驳回，结果就必须是 `rejected`。
+  现模型层已按此重排规则序（`wait` + 仍有未表态 → `pending`；全员表态 → `rejected`），
+  引擎侧不再有特判分支（对账测试已去掉例外格，模型层再退化会立即红）。
 
   **⑥ `step()` 必须导出**：一次动作的完整推进 = 原语 → **微调** → 记票 → 串行接力 → 汇聚 → run-to-wait。
   它若只活在 `submit()` 里，门 2 自编排就得复制一份，§7.1「两条路径不得分叉」
@@ -1093,11 +1097,41 @@ class EngineError extends Error {
   **普通节点**多出向仍抛（D-22：隐式排他 / 隐式包容无规格依据）；
   `endEvent` 的 `eventDefinition`（terminate / message）尚未区分，随 T20 / T21 落地。
 
-- [ ] **T17 任务 8 类 + 连线与数据 4 类**
-  组件：`nodes/tasks.ts` / `nodes/flows.ts`
+- [x] **T17 任务 8 类 + 连线与数据 4 类** ✅ 2026-10-01
+  组件：`nodes/tasks.ts` / `nodes/flows.ts` + `eval/script.ts` + `runtime/{loop,engine}.ts`（副作用接线）
   依赖：T11, T12
-  验证：`ScriptTask` 禁 `eval`/`new Function`/`node:vm`（**源码扫描 + 运行期探针**）；`ScriptTask` 非 FEEL 格式 → 报错并指向 `handlers`；
-  `SendTask` 走 `EventSink`；`ManualTask` 发 `taskCreated`+`taskCompleted` 而裸 `Task` **不发事件**（差别 = 是否留痕）；`BusinessRuleTask` 未注入 `decisionHandler` → 报"未配置"
+  验证：`ScriptTask` 禁 `eval`/`new Function`/`node:vm`（**源码扫描 + 产物扫描**双层）✅；
+  `ScriptTask` 非 FEEL 且 `handlers` 无注册 → 报错并指向 `handlers` ✅；
+  `ManualTask` 发 `taskCreated`+`taskCompleted` 而裸 `Task` **不发事件**（差别 = 是否留痕）✅；
+  `BusinessRuleTask` 未注入 `decisionHandler` → 报"未配置" ✅
+
+  ✅ **实测**：`test/tasks.test.ts` **45 例** + `test/flows.test.ts` **11 例**全绿；
+  `verify` PASSED（**538 单测**）；冷启动探针 **69/69**（8 类任务与数据守门在产物层端到端复现）。
+
+  **① ★ 副作用必须外源解析 + 缓存（D-60）**：`ServiceHandler` / `DecisionHandler` 是异步且带
+  真实副作用（发邮件 / 建单），而 `runToWait()` 必须同步纯 —— 与办理人、条件同一套路：
+  闭包缺值时抛 `NodeEffectUnresolved` 哨兵 → `engine.ts` 解析 → **重跑**。
+  ⚠️ **缓存键必须含 `tokenId`**：并行分支上两个令牌会同时到达同一个 `serviceTask`，
+  按 nodeId 缓存会让第二个令牌拿到第一个的结果；不缓存则会**每重跑一轮就调一次宿主**。
+  三者缺一就是"同一次提交发了 N 封邮件"。
+
+  **② ★ 条件上下文取「此刻」的变量快照（D-60）**：`ConditionUnresolved` 哨兵从此携带
+  `variables`。不带的后果是「`scriptTask` 把 `amount` 改成 9000、网关却按旧值走分支」——
+  §7.2 要防的头号事故换了一副面孔出现。探针与单测各有一条端到端断言钉住它。
+
+  **③ `sendTask` 与 `intermediateThrowEvent` 同处置：显式抛错（D-56）**：`03` 自己写明二者同构，
+  而后者在 T16 就是因为 **ADR-006 把事件集定死 10 个、其中没有"抛出事件"** 才推迟的。
+  只剩两条路可走：偷偷加第 11 个事件（须先改 ADR，不能靠代码），或复用
+  `taskCreated`+`taskCompleted`（⇒ 与 `manualTask` **完全同形**，把两条规格写明的语义静默合并成一条）。
+  两条都不接受 ⇒ 抛错并指名 FR-E14 / T20。
+
+  **④ 连线的语义收口在 `nodes/flows.ts`（D-52 的落点）**：`flowPasses()` 是「这条流通不通」的
+  **唯一口径**（无条件恒真且不进求值器），`nodes/gateways.ts` 改为复用它 —— 此前网关里那份
+  `taken()` 是同一判定的第二份写法，必然漂移。
+
+  ⚠️ **能力边界（诚实标注）**：`receiveTask`（等消息）随 **T20** 的 `deliverMessage` 落地；
+  `serviceTask` 的**失败重试属内核外**（D-58，与超时 / 暂存同族 —— 内核内重试会让 `plan()` 不纯
+  且放大副作用），由宿主在 handler 内或经 `Scheduler` 自行实现。
 
 - [ ] **T18 活动 / 子流程 4 类**
   组件：`nodes/activities.ts`
@@ -1154,6 +1188,8 @@ class EngineError extends Error {
 | 2026-09-30 | **D-13 落地**：测试代码纳入类型检查 —— 新增 `tsconfig.test.json`（Bundler 解析），`check:types` 改跑 **2 个 project**；`06` §3/§6 写死形制。**反向验收**：注入类型错误 → 新口径红、旧口径不红 | §9 / §10 / `06` | D-13 | `verify` 输出「check:types — 2 个 project（src + test）」 |
 | 2026-09-30 | **T9 落地**：`actions/{catalog,compile,gates}.ts` —— 19 项动作映射表（20 个可提交名字）、设计期开关校验（DV-2/3/5、AC-E2/E15）；与 `03` §4 主表**逐字对账**；公开面只导出动作名与 `enabledActionNames` | §5 / §9 / §10 | T9 / D-18 | `verify` PASSED + 探针 **29/29** + **274 单测** + `src+test` 类型检查 0 err（本轮 D-13 抓出 5 处写错的码名） |
 | 2026-10-01 | **T16 落地**：`nodes/events.ts`（事件 6 类）+ `nodes/gateways.ts`（网关 5 类）+ `runtime/loop.ts` 的分叉 / 汇聚 + `runtime/engine.ts` 的条件接线；**D-49** 汇聚判据改为图可达性（包容网关不再死锁）、**D-50** 合流必须在推进之前、**D-51** 条件走惰性解析 + `ConditionUnresolved` 哨兵重跑、**D-53** `Token.branch` 收口 **D-47**（并行下 `rollbackTo` 只撤本分支）、**D-55** `payload` 在探测之前并入；**482 单测** + 探针 **60/60** | §5 / §9 / §10 | T16 / D-42 / D-47 / D-48~D-55 | `verify` PASSED + 两个 project 类型检查 0 err |
+| 2026-10-01 | **T17 落地**：`nodes/tasks.ts`（任务 8 类）+ `nodes/flows.ts`（连线与数据 4 类）+ `eval/script.ts`（FEEL 脚本求值）+ 副作用接线（`LoopContext.effectsOf` + `NodeEffectUnresolved` 哨兵重跑）；**D-56** `sendTask` 与 `intermediateThrowEvent` 同处置（显式抛错，ADR-006 事件集定死 10 个）、**D-57** 非 FEEL 脚本先查 `handlers` 表、**D-58** 服务重试归内核外、**D-59** FEEL 结果落 `variables[nodeId]`、**D-60** 副作用按 `${nodeId}::${tokenId}` 缓存且条件取「此刻」变量快照、**D-61** 源码扫描必须去注释；**538 单测** + 探针 **69/69** | §5 / §7.3 / §9 / §10 | T17 / D-52 / D-56~D-61 | `verify` PASSED + 两个 project 类型检查 0 err（产物层双层扫描：无 `new Function` / `node:vm` / `eval(`） |
+| 2026-10-01 | **D-21 / D-31 在模型层修根因**：`floken-moddle` 的 `shouldTerminate()` 重排规则序（先按 `mode` 判，`pending === 0` 的多数决兜底只对票签生效）；引擎侧 `convergence.ts` 的 `mode:'all' && rejected>0` 短路**整块删除**，对账测试取消例外格改为逐格全一致（>300 组）；**482 单测** + 探针 **60/60** | §5 / §9 / §10 | D-19 / D-21 / D-31 | `verify` PASSED + 两个 project 类型检查 0 err（moddle 侧 299 单测全绿 + dist 已重建同步） |
 | 2026-10-01 | **T15 落地**：`CompiledAction.post` + `runtime/loop.ts` 的 `applyPost()` —— **AC-E6 委派回归**（B 办完回到 A、节点不变、A 再办才推进）、**AC-E7 转办**（`nodeId` 不变、不留回归路径）、`takeBack` / `revoke` 回滚下游（截断 + 取消在途 + 差分精确点名）；**D-34 收口**（组内回退 = 整组重来 + 解散组）；**440 单测** + 探针 **56/56** | §7.1 / §9 / §10 | T15 / D-34 / D-44~D-47 | `verify` PASSED + 两个 project 类型检查 0 err |
 | 2026-10-01 | **T14 落地**：`eval/condition.ts` —— 内置默认 `ConditionHandler`（`@floken-io/feel`）+ `evaluateCondition()` 唯一出口；AC-E9 双向判据（承诺下限逐条能算对 / 求不了值必须抛）；**D-37 实测推翻原方案**（`unaryTest` 顶层语义：裸 `true`→false、变量缺失→**恒真**），改走 expression 语义；null → 抛（D-38）；空 = 无条件（D-42）；`check:deps` 升级为说明符体检（D-43）；**425 单测** + 探针 **53/53** | §7 / §8.3 / §9 / §10 | T14 / D-37~D-43 | `verify` PASSED + 两个 project 类型检查 0 err |
 | 2026-10-01 | **T13 落地**：多实例展开（`approverPolicy` × `sequential`）+ 投票（`Token.vote`）+ 汇聚闭环（`settleGroups`）+ `step()` 公开（门 2 可独立完成会签）；**修掉 D-31**（会签 + `onReject:'wait'` 也是 D-21 的漏网：多数决让 2 通过 1 驳回判成 approved）；新增 `groupTallies` / `convergeCtxOf`（计票口径 `total = 已表态 + 仍在途`）；**403 单测** + 探针 **48/48** | §6.1 / §6.4 / §7.1 / §9 / §10 | T13 / D-31~D-36 | `verify` PASSED + 两个 project 类型检查 0 err |
@@ -1180,7 +1216,7 @@ class EngineError extends Error {
 | **D-13** | ~~测试代码从未被类型检查~~ → **✅ 已落地（2026-09-30）**：新增根 `tsconfig.test.json`（`moduleResolution: Bundler`，`include: [src, test]`）；`verify` 的 `check:types` 改为跑**两个 project**；`06` §6 与 §3 已写死形制 | `tsconfig.json` 的 `include` 只有 `["src"]`，而 `check:types` 就只跑它 → `test/**` 全在类型检查之外；vitest 也不做类型检查。**代价实测**：T6 抓出 1 条真实类型错误；T9 抓出 **5 处写错的错误码名**（`ENGINE_ERROR_CODES.COMMENT_REQUIRED` 等，`TS2339`）—— 若不查，表现为运行时「expected X to be undefined」这种极难定位的假象 | ✅ **已落地并反向验收**：故意在 `test/` 塞一个类型错误，新口径红（`TS2322`）、旧口径**不红**；再注入一次写错的码名，新口径红（`TS2339`）。⚠️ 属五包脚手架议题，`moddle` / `feel` / `dmn` 择机对齐 |
 | **D-19** | **engine 的 `dist` 开始有运行时依赖 `@floken-io/moddle`**（此前只有 `import type`，被 tsup 擦除） | T10 起真正消费模型层的汇聚算法（`shouldTerminate` / `requiredVotes`）。**合规**：`AGENTS.md` §2 红线表为 engine 授权的依赖就是 `@floken-io/moddle` + `@floken-io/feel`；Q36 限的是 **moddle / feel 自身**的第三方依赖 ≤1，不含跨包 | ✅ **已在冷启动探针里钉成白名单断言**：`dist/index.js` 的外部 `import` **只允许** `@floken-io/moddle`，多一个就红 |
 | **D-20** | **非票签模式带 `vote` 字段：忽略，不报错** | 实测 `normalizeApproval({ mode:'all', vote:{count:2} })` **合法且保留该字段**。若 engine 在此抛 `ACTION_VOTE_CONFIG`，会把「合法的设计期配置」判成非法 | ✅ 已落地（`test/convergence.test.ts` 有专门用例） |
-| **D-21** ⚠️ | **模型层 `shouldTerminate()` 的真实缺陷**：把「规则三 · 全员表态后按多数定（`pending === 0`）」放在了「规则一 · 会签驳回即终止」**之前** → 会签 3 人 **2 通过 1 驳回**（驳回者最后表态）被判 **approved** | 与「会签 = **全部通过**才推进」直接冲突，违反 **INV-11** 与 `03` §5.2 判定式（`approved + rejected >= total && rejected === 0`）。规则三的本意是**票签**的兜底（防除不尽 / 卡住），不该把"多数决"叠加到会签的"全票决"上。**真实后果**：会签里最后一人驳回，流程却通过了 | ✅ **引擎侧已修正**（`convergence.ts` 在委托模型层前先判规则一，只影响 `all + abort + rejected>0` 这一格）。⏳ **待拍板是否修 moddle**：修了之后删掉引擎侧那段短路即可（对账测试会提示） |
+| **D-21** ⚠️ | **模型层 `shouldTerminate()` 的真实缺陷**：把「规则三 · 全员表态后按多数定（`pending === 0`）」放在了「规则一 · 会签驳回即终止」**之前** → 会签 3 人 **2 通过 1 驳回**（驳回者最后表态）被判 **approved** | 与「会签 = **全部通过**才推进」直接冲突，违反 **INV-11** 与 `03` §5.2 判定式（`approved + rejected >= total && rejected === 0`）。规则三的本意是**票签**的兜底（防除不尽 / 卡住），不该把"多数决"叠加到会签的"全票决"上。**真实后果**：会签里最后一人驳回，流程却通过了 | ✅ **已在模型层修根因（2026-10-01）**：`floken-moddle` 的 `shouldTerminate()` 重排规则序 —— 先按 `mode` 判各自语义，`pending === 0` 的多数决兜底**只对票签生效**；引擎侧当初那段 `mode:'all' && rejected>0` 的**短路已删除**（保留即两份事实源，见 D-19）。对账测试取消例外格、改为逐格全一致，另补一条「2 通过 1 驳回两侧同判 rejected」的回归钉子 |
 | **D-18** | **T9 的编译结果还没有进 `plan()` 的接缝** —— `compileAction()` 产出 `PrimitiveCall[]`，但 `plan()` 的 `PlanOptions` 只有 `clock` / `maxAuditEntries`，无法把「要施加哪些原语」传进去 → 会出现两套演化路径 | ✅ **已裁决并落地（2026-10-01）**：`PlanOptions` 增 **`apply?: (draft) => InstanceState`**（要求纯函数，在 ④ 拷贝之后、`rev` +1 之前施加；偷改 `rev` 直接抛）+ **`tasks?: (state) => TaskView[]`**（待办差分同样必须走 `plan()`，否则门 2 拿不到 delta）。既保住纯函数性，又让 `submit()` 与门 2 自编排走同一条演化路径 |
 | **D-14** | **`plan()` 的签名从 `{ next, delta }` 变成 `PlanResult { next, delta, diagnostics }`，并新增第三参 `PlanOptions`** | ① `diagnostics` 是 **INV-17「审计裁剪不得静默丢弃」**的唯一落点 —— 纯函数不能发事件，只能把观测随结果返回；② 时间必须**从参数进来**（ADR-007），否则 `plan()` 无法纯 | ✅ **已回写 `03` §1**（2026-09-30）：`PlanOptions` / `PlanResult` 与 `ActionInput.at` 同步补上 |
 | **D-15** | **T7 验证项里的「100 次并发 `submit`」前向引用了 T11** | 与 D-8 / D-10 同病（任务拆分把验证项写到了未来阶段） | ✅ **已收口（2026-10-01）**：改为「20 次并发 **`submit`**」，并加一条**比顺序更有价值**的断言 —— **CAS 冲突必须为 0**（串行队列是主防线，CAS 只是兜底；靠兜底才不冲突 = 主防线已失效） |
@@ -1195,7 +1231,7 @@ class EngineError extends Error {
 | **D-28** ⚠️ | **`runToWait` 的自动直通未记 `completedNodes`**（真实缺陷，T12 写 reject 用例时撞到）：直通不走 `advance` 原语而是直接改 `token.nodeId`，于是 `completedNodes` **永远是空的** | `INV-6` 要求驳回 / 退回的目标必须 ∈ `completedNodes` ⇒ 「驳回给发起人」这种**最常见**的场景永远做不到，且报错是「目标非法」而不是「记账漏了」，极难往回查。修法：`core/primitives.ts` 导出 `markCompleted()`，`runtime/loop.ts` 在直通处复用（**同一口径**，不许复制一份） | ✅ **已修**（2026-10-01），`test/loop.test.ts` + `test/emit.test.ts` 双钉 |
 | **D-29** | **第 19 个抛出码 `ENGINE_ACTION_VETOED`**（ACTION 族 7 → 8） | 门 1 `beforeAction` 返回 `false` 时**必须抛错**（静默返回空差分 = 用户以为办完了）。不复用 `ACTION_NOT_ALLOWED`：后者是**设计期**开关（读定义就知道），本码是**运行期**宿主否决 —— 合成一个码，宿主分不清「按钮本来就不该显示」（前端 bug）与「业务条件不满足」（要提示用户）。**码数的事实源是 `src/core/errors.ts` 的码表**（`03` §7.4 只照抄 `AGENTS.md` §5，**没有自己的码表**，故无需回写 18 → 19） | ✅ 已落地（探针已把码数钉成 19 / ACTION 8） |
 | **D-30** | **审计溢出（INV-17）**不**投 `EventSink`** | 旧注释（`errors.ts` 的 `AUDIT_TRUNCATED` + `plan.ts` ⑧）写的是「溢出部分已投 `EventSink`」，但 ADR-006 把事件集**定死为 10 个**，其中没有审计类事件；且审计主源就是 `auditTrail` 本身。「不得静默丢弃」的正确落点是 **`diagnostics`**（溢出区间记在 `details.dropped*`），由宿主从 `diagnostics` 转存到自己的归档 | ✅ **已修正注释**（2026-10-01）。**✅ 已回写 `03` §9.1 的 `maxAuditEntries` 注释**（原文写"溢出部分走 `EventSink`"，已改为走 `diagnostics`） |
-| **D-31** ⚠️ | **D-21 的修正范围太窄**：原短路只覆盖 `mode:'all' && onReject:'abort' && rejected>0`，**漏掉了 `onReject:'wait'`** —— 会签 3 人「2 通过 1 驳回」在 `wait` 下仍被模型层的多数决判成 approved | `onReject` 只决定**要不要提前终止**（abort = 立刻，wait = 等全员表态完），**不决定最后按什么定**。会签 = 全票决，只要 `rejected > 0` 结果就必须是 `rejected`。T13 把汇聚接进真实执行路径后这条必然暴露（会签是头号场景） | ✅ **已收口**（2026-10-01）：短路条件放宽为 `mode === 'all' && rejected > 0`；`wait` 且 `pending > 0` 时仍返回 `pending`（"记录驳回但其余继续"）。对账测试的 `isD21Cell` 同步放宽（不再看 `onReject`），另加一条「票签才是多数制」的对照断言 |
+| **D-31** ⚠️ | **D-21 的修正范围太窄**：原短路只覆盖 `mode:'all' && onReject:'abort' && rejected>0`，**漏掉了 `onReject:'wait'`** —— 会签 3 人「2 通过 1 驳回」在 `wait` 下仍被模型层的多数决判成 approved | `onReject` 只决定**要不要提前终止**（abort = 立刻，wait = 等全员表态完），**不决定最后按什么定**。会签 = 全票决，只要 `rejected > 0` 结果就必须是 `rejected`。T13 把汇聚接进真实执行路径后这条必然暴露（会签是头号场景） | ✅ **已随 D-21 在模型层修根因**（2026-10-01）：`all` 分支先判 `rejected >= 1`，`abort` 立即驳回，`wait` 且 `pending > 0` → `pending`（记录驳回但其余继续），全员表态 → `rejected`。引擎侧无特判；对账测试不再看 `onReject`，另加「票签才是多数制」的对照断言 |
 | **D-32** | **待办视图只认 `state === 'active'`**（不再认 `waiting`） | T13 之前没有任何令牌会是 `waiting`，两种写法等价；串行会签引入 `waiting` 后若继续按"在途"算，宿主待办表会出现 N 条待办却只有 1 个人能点 —— 其余点了也没用。`waiting` 的含义是"**还没轮到**"，它不是待办 | ✅ 已落地（`tasksOf`）。注意 `restTokenIds` / `runToWait` **仍按"在途"**判 —— 那里要的是"未激活的也必须能被取消 / 不被推进"，语义不同 |
 | **D-33** | **加签不建组、不参与汇聚**（`SpawnInstancesInput.grouped`） | 加签是"**新增**一个人"，原令牌还在原地且**不在组内**；若也给新令牌打 `instanceGroup`，就会得到一个「只含加签来的人」的组 —— 那个人一通过，组判据（total 1 → 达线）满足，流程被他一个人推走，原办理人的待办变成**幽灵待办**（待办表里看得见、点进去永远办不动，且无任何报错）。宁可不汇聚，也不能**静默错汇聚** | ✅ 已落地：会签三项（展开）`grouped:true`，加签 `grouped:false`。副作用：INV-12 的 `addSign.maxCount` 计数从「按 `instanceGroup`」改为「按该节点在途令牌数」（按组数会永远数到 0，上限形同虚设）。⏳ 加签的汇聚语义待 T15 定型 |
 | **D-34** | **组内 `jumpTo` / `returnTo` / `takeBack` / `revoke`** —— T13 时**尚未闭环**（动的是单个令牌，其余留在原节点） | 这四项动的是**单个**令牌，组内其余令牌会留在原节点；当时**没有规格依据**去发明"顺手全取消"的语义，故选择表现为可观察的现状 | ✅ **T15 收口**（2026-10-01）：组内回退 = **整组重来** = 取消同组其余 + 一个令牌跳回 + **解散组**（见 **D-44**）。`rollbackTo`（拿回 / 撤销）的原语本身就会取消其它在途令牌，此处统一补上解散组 |
@@ -1216,7 +1252,13 @@ class EngineError extends Error {
 | **D-49** | **汇聚判据 = 「不存在别的在途令牌可达本网关」，不是「到达数 == 入向数」** | 后者在**包容网关**上必然死锁（只激活 A 分支时 B 分支永远不会有令牌），在并行分支被取消（终止 / 减签）时同样死锁。改用图可达性后：未激活分支无令牌 → 不可达 → 不等；被取消令牌不在途 → 自动退出等待。ⓐ 可达性**不按条件剪枝** —— 条件此刻为假不代表稍后不为真（变量会被表单改写），剪枝会让引擎提前合流（静默走错分支）；ⓑ `exclusiveGateway` **不等待**（BPMN 的"先到先过"），等它会让常见的「两分支汇一处」永久卡住 | ✅ 已落地（`nodes/gateways.ts` 的 `canJoin()`）。三条反向用例：另一分支在途 / 另一分支已取消 / 两条都到齐 |
 | **D-50** | **合流必须在推进之前**（第一版写反了，实测撞到） | 先推进的话，N 个令牌会**各自**走出汇聚网关 → 下一个节点出现 N 条一模一样的待办。比"停在网关不动"难查得多：待办表看着正常，只是"同一个人多了一条" | ✅ 已落地（`runtime/loop.ts` 的 `runToWait()` 外层循环：先 `joinPass` 再 `advanceTokens`）。`test/gateways.test.ts` 用「合流后只有 1 条活跃令牌」钉死 |
 | **D-51** | **条件求值走「惰性解析 + 重跑」，不预求值全图** | `ConditionHandler` 是异步 SPI 而 `runToWait` 必须同步纯。预求值全图的代价：**走不到的分支**也被求值，那里引用的变量此刻可能还不存在（`amount` 要第二步表单才填），按 D-38（`null` 必抛）流程会在**第一步**就炸；而缺值默认 `false` 又是静默走错分支。故：闭包缺值时抛 `ConditionUnresolved` 哨兵 → 引擎求值 → 重跑（每轮至少多解析一条 ⇒ 轮数 ≤ 条件数 + 1，必然收敛） | ✅ 已落地（`eval/condition.ts` 的哨兵 + `runtime/engine.ts` 的重试循环）。ⓐ 哨兵**不是** 19 个抛出码之一（宿主不会收到，引擎吞掉并重试）；ⓑ 门 2 自编排下宿主自备闭包，是否采用由他决定 |
-| **D-52** | **无条件流恒真，且不进求值器**（D-42 落到路由层） | 把它交给 `isTrue` 有两个坏处：① 宿主注入的 handler 一句 `return false` 就能把 BPMN「没写条件 = 默认流」的既有语义改掉；② 白白多一次求值（真实图里并行分支多是无条件的） | ✅ 已落地（`nodes/gateways.ts` 的 `taken()`）。`test/gateways.test.ts` 断言「`isTrue` 一次都没被调用」 |
+| **D-52** | **无条件流恒真，且不进求值器**（D-42 落到路由层） | 把它交给 `isTrue` 有两个坏处：① 宿主注入的 handler 一句 `return false` 就能把 BPMN「没写条件 = 默认流」的既有语义改掉；② 白白多一次求值（真实图里并行分支多是无条件的） | ✅ 已落地。**T17 起判据收口到 `nodes/flows.ts` 的 `flowPasses()`（`nodes/gateways.ts` 改为复用）** —— 同一判定此前有两份写法（`taken()` 与路由内联），必然漂移。`test/gateways.test.ts` 断言「`isTrue` 一次都没被调用」 |
 | **D-53** | **`Token` 新增 `branch?: string`（并行分支标记）** | `instanceGroup` 是"**同一节点上的多个人**"（会签 / 或签），`branch` 是"**同一条并行分支**"，两者正交（一个会签节点整体处在某条分支上）。它是 **D-47** 唯一的解药 | ✅ 已落地（`core/state.ts` + `assertInstanceState` 校验）。分叉写入（`${分支根}#${flowId}`）、合流清除；会签展开**继承**父令牌的 `branch` |
 | **D-54** | **未实现的 3 类事件 + 2 类网关一律显式抛，并指名归属 FR** | 这五类都是"等待 / 中断"语义，静默直通的表现是「流程办完了、但那个事件从来没发生过」—— 业务上无法接受且**没有任何报错**可循。`intermediateCatchEvent` 尤其危险：让它"等待"会造成**没有任何手段唤醒**的永久卡死 | ✅ 已落地（`nodes/events.ts` 的 `assertEventSupported` + `nodes/gateways.ts` 的路由前置）。`details.owner` 指名 FR（T20 / T21 / FR-E24 / FR-E17 / FR-E14） |
 | **D-55** | **`payload` 必须在探测之前并入（`withPayload`）** | `plan()` 的 ④.5 才并变量，而 `engine.ts` 的探测跑在 `plan()` **之前** —— 不补这一步就是「表单里把 amount 改成 9000、网关却按旧值走分支」，正是 §7.2 要防的头号事故 | ✅ 已落地（`runtime/engine.ts` 的 `withPayload()`，与 `plan()` ④.5 **同一口径**；不改入参，只产出新对象） |
+| **D-56** ⚠️ | **`sendTask` 与 `intermediateThrowEvent` 同处置：显式抛错，归 FR-E14 / T20** | `03` §6 自己写明 `sendTask`「与 `IntermediateThrowEvent` 同构」，而后者在 T16 就是因为 **ADR-006 把事件集定死 10 个、其中没有"抛出事件"** 才推迟的（`nodes/events.ts` 档首写明了「届时须先给 ADR-006 补事件，不能偷偷加」）。T17 只剩两条路：① 偷偷加第 11 个事件 —— 违反 ADR-006，且事件集变更**必须走 ADR 修订**而不是代码；② 复用 `taskCreated` + `taskCompleted` —— 结果是与 `manualTask` **完全同形**，等于把两条规格写明的语义**静默合并成一条**。两条都不接受 ⇒ 抛错并指名归属 | ✅ 已落地（`nodes/tasks.ts` 的 `assertTaskSupported`，`owner` = FR-E14 / T20）。探针与单测各有一条端到端断言 |
+| **D-57** | **`scriptTask` 非 FEEL 格式：先查 `handlers` 表，查不到才报错** | `03` §6 原文「其它格式 → 报错，要求宿主在 `handlers` 表注册处理器」有两种读法。取「先查表」是因为：① 引擎不执行任意 JS 这条红线的**实质**是"引擎自己不跑"，宿主注册实现由宿主跑，与 `serviceTask` 完全同款；② 若一律报错，后半句「要求在 `handlers` 表注册处理器」就永远兑现不了 —— 那句话会变成一句空话 | ✅ 已落地（`resolveEffect` 的 `'script'` 分支）。查找键与 `serviceTask` 同为 `graph.handlerRefOf()`；错误文案指名 `handlers` 与 ref |
+| **D-58** | **`serviceTask` 的失败重试归内核外**（不进内核） | `03` §6 写「支持失败重试」。但重试 = 延时 + 重放，与超时 / 暂存同属**内核外**（ADR-004：内核内不做定时、不做事务）。放进内核有两个后果：① `plan()` 要 await 外部调用 ⇒ 纯函数性（NFR-E6）当场失守；② 一次 `submit()` 内嵌套重试会**放大副作用**（同一封邮件发 N 次），而"至少一次 + 宿主幂等"这套契约就没了 | ✅ **已回写 `03` §6**（2026-10-01）：任务表 `ServiceTask` 一行改注「重试由宿主在 handler 内或经 `Scheduler` 实现」。内核侧只保证「一次推进 = 一次调用」（D-60） |
+| **D-59** | **FEEL 脚本的结果落在 `variables[nodeId]`** | BPMN 的结果变量走 `ioSpecification` / `dataOutput`，而模型层（L3）未兑现该字段 —— 此处不发明扩展键（那要动模型层并跨包发版），也**不静默丢弃结果**（脚本白跑）。按「节点 id」落，可推导、可追溯；将来 `ioSpecification` 兑现时改为「优先取它、缺省回退 nodeId」，不破坏已有流程 | ✅ 已落地（`eval/script.ts` + `resolveEffect`）。注意与**条件**的处置相反：脚本结果是**数据**，`null` 照写（三值语义的合法值）；条件必须收敛成二值，`null` 必抛（D-38） |
+| **D-60** ⚠️ | **副作用外源解析 + 按 `${nodeId}::${tokenId}` 缓存；条件上下文取「此刻」变量快照** | 两条缺一都会出事：① **不缓存** ⇒ 惰性解析每重跑一轮就调一次宿主（同一封邮件发 N 次）；② **缓存键不含 `tokenId`** ⇒ 并行分支上两个令牌同时到达同一个 `serviceTask`，第二个拿到第一个的结果；③ **条件哨兵不带变量快照** ⇒ 解析用的是提交前的旧变量，于是「`scriptTask` 把 amount 改成 9000、网关却按旧值走分支」—— §7.2 头号事故换一副面孔出现 | ✅ 已落地（`nodes/tasks.ts` 的 `NodeEffectUnresolved` + `eval/condition.ts` 的 `ConditionUnresolved.variables` + `engine.ts` 的 `effects` / `conditions` 两个 Map）。探针与单测各有「handler 只被调 1 次」与「落在高分分支」两条断言 |
+| **D-61** | **「禁止动态执行」的源码扫描必须去掉注释再扫** | 本包的注释里**正大光明地写着**「禁止 `eval` / `new Function` / `node:vm`」（那是规格引用）。不去注释的话，门禁会因为"文档里提到了它"而红 —— 那等于逼着实现把红线说明从注释里删掉，本末倒置。另：`engine.ts` 里那条错误提示的**字符串字面量**也不逐字写这三个名字（同样原因） | ✅ 已落地（`test/tasks.test.ts` 的 `stripComments` + 探针扫 `dist/*.js`，产物层已无注释故直接扫） |

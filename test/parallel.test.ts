@@ -18,6 +18,7 @@ import type { ActionInput } from '../src/core/action';
 import { ENGINE_ERROR_CODES } from '../src/core/errors';
 import type { InstanceState } from '../src/core/state';
 import { createProcessGraph } from '../src/nodes/graph';
+import { NO_EFFECT } from '../src/nodes/tasks';
 import { createEngine } from '../src/runtime/engine';
 import { step } from '../src/runtime/loop';
 import { createMemoryStore } from '../src/store/memory';
@@ -188,7 +189,7 @@ describe('并行分支端到端（引擎层）', () => {
     // 施加后：B 分支的令牌必须还活着
     const after = step(
       state,
-      { graph, at: T0, assigneesOf: () => ['u_b'] as readonly string[], conditionsOf: () => true },
+      { graph, at: T0, assigneesOf: () => ['u_b'] as readonly string[], conditionsOf: () => true, effectsOf: () => NO_EFFECT },
       { calls: compiled.calls, ...(compiled.post ? { post: compiled.post } : {}) },
     ).next;
     expect(after.tokens.find((t) => t.id === 'tk_b')?.state).toBe('active');

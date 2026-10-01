@@ -16,6 +16,7 @@ import type { StateStore } from '../src/core/spi';
 import type { InstanceState } from '../src/core/state';
 import type { ActionInput } from '../src/core/action';
 import { createProcessGraph } from '../src/nodes/graph';
+import { NO_EFFECT } from '../src/nodes/tasks';
 import { createEngine } from '../src/runtime/engine';
 import { applyPrimitiveCalls, runToWait, tasksOf } from '../src/runtime/loop';
 import { createMemoryStore } from '../src/store/memory';
@@ -158,7 +159,7 @@ describe('AC-E13 · 零配置跑通「报销」（start → approve → approve�
           graph,
           at: T1,
           assigneesOf: (n) => (n === 'Task_finance' ? ['u_finance'] : []),
-          conditionsOf: () => true,
+          conditionsOf: () => true, effectsOf: () => NO_EFFECT,
         }).next,
       tasks: (s) => tasksOf(s, graph),
     });

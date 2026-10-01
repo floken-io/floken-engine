@@ -64,8 +64,18 @@ import type {
 import type { ActionRecord, InstanceState, Token } from '../core/state.js';
 import { STATE_SCHEMA_VERSION, cloneState, headerOf, isTerminalStatus } from '../core/state.js';
 import type { TaskDelta } from '../core/task.js';
+import type { EngineEvent, TaskEvent } from '../core/events.js';
 import { assertTokensInGraph, createProcessGraph } from '../nodes/graph.js';
 import type { OutFlow, ProcessGraph } from '../nodes/graph.js';
+import type { NodeEffect, TaskEffectKind } from '../nodes/tasks.js';
+import {
+  asUnresolvedEffect,
+  assertVariablePatch,
+  effectKeyOf,
+  effectKindOf,
+  isFeelScriptFormat,
+  unresolvedEffect,
+} from '../nodes/tasks.js';
 import { plan } from './plan.js';
 import type { PlanOptions, PlanResult } from './plan.js';
 import { createInstanceQueue } from './queue.js';
@@ -74,15 +84,21 @@ import type { StepInput, VoteCast } from './loop.js';
 import type { PostStep } from '../actions/compile.js';
 import { emitAll, eventsOf } from './emit.js';
 import { createMemoryStore } from '../store/memory.js';
-import { asUnresolved, createFeelConditionHandler, evaluateCondition, unresolvedCondition } from '../eval/condition.js';
+import {
+  asUnresolved,
+  createFeelConditionHandler,
+  evaluateCondition,
+  unresolvedCondition,
+} from '../eval/condition.js';
+import { evaluateScript } from '../eval/script.js';
 
 /**
- * 条件惰性解析的重试上限。
+ * 条件 / 副作用惰性解析的重试上限。
  *
- * 真实上界是「条件数 + 1」（每轮至少解析一条新的），故正常流程 **1 轮就够**
- * （没有网关时 0 次重试）。这只是防"解析了却没被记住"这类 bug 导致无限重试的兜底闸。
+ * 真实上界是「条件数 + 副作用数 + 1」（每轮至少解析一个新的），故正常流程 **1 轮就够**
+ * （没有网关 / 服务节点时 0 次重试）。这只是防"解析了却没被记住"这类 bug 导致无限重试的兜底闸。
  */
-const MAX_CONDITION_ROUNDS = 256;
+const MAX_RESOLVE_ROUNDS = 256;
 
 // ---------------- 配置 ----------------
 
@@ -290,6 +306,16 @@ export function createEngine(config: EngineConfig): Engine {
    *   （每轮至少多解析一条 ⇒ 轮数 ≤ 条件数 + 1，必然收敛）。
    */
   const condition: ConditionHandler = config.conditionHandler ?? createFeelConditionHandler();
+  /** `serviceTask` / 非 FEEL `scriptTask` 的实现表（**不注入 = 该类节点报「未配置」**） */
+  const handlers: ServiceHandler | undefined = config.handlers;
+  /**
+   * `businessRuleTask` 的决策求值（**不注入 = 该节点报「未配置」**，无内置默认）。
+   *
+   * ⚠️ 为什么刻意不给默认：`03` §8.3 写的是「可接 `@floken-io/dmn`」——
+   *   但接 DMN 是**宿主的选择**。给一个内置默认（比如"原样返回 input"）会让
+   *   「决策没生效」表现为「流程正常走完了」，那是静默失败。
+   */
+  const decisionHandler: DecisionHandler | undefined = config.decisionHandler;
   const maxAuditEntries: number | undefined = config.maxAuditEntries;
   const hooks: EngineHooks | undefined = config.hooks;
   /** 事件出口（槽位 9）；不注入 = 不发事件（AuditTrail 仍是完整的，见 ADR-006） */
@@ -324,22 +350,37 @@ export function createEngine(config: EngineConfig): Engine {
    *   重试循环**包住整个探测 + 闭包构造**：探测跑本身也会撞上未解析的条件，
    *   解析完重跑一次，探测路径与真值路径就必然一致（不会问错落点）。
    *
+   * ★ **T17 追加：节点副作用走同一套路**（`serviceTask` / `scriptTask` /
+   *   `businessRuleTask` / `manualTask`）。三条与条件**不同**的地方：
+   *     ① 副作用是**真实外部行为**（发邮件、建单），故解析结果按 `${nodeId}::${tokenId}`
+   *        **缓存** —— 否则每重跑一轮就调一次，同一个服务被调 N 次；
+   *     ② 解析时用的变量是**令牌到达该节点那一刻**的快照（哨兵带过来的），
+   *        不是提交前的旧值 —— 否则「脚本把 amount 改成 9000、后面的服务还按旧值干活」；
+   *     ③ 副作用产出的事件**不在这里投递**，而是攒进 `pendingEvents`，
+   *        由 `start()` / `submit()` 在**槽位 9**（状态已落库之后）统一发。
+   *
    * @param state 已并入 `payload` 增量的状态（与 `plan()` 交给 `apply` 的那份**同源** ——
    *              否则「表单里把 amount 改成 9000、网关却按旧值走分支」，正是 §7.2 要防的事故）
+   * @param record 本次动作事实（副作用产出的事件要与它**同源**，否则重放时对不上）
    */
   async function buildApply(params: {
     readonly state: InstanceState;
     readonly calls: readonly PrimitiveCall[];
     readonly graph: ProcessGraph;
     readonly at: string;
+    readonly record: ActionRecord;
     /** 组内投票（`CompiledAction.vote`）；非组内动作为 `undefined` */
     readonly vote?: VoteCast | undefined;
     /** ★ T15 令牌级微调（`CompiledAction.post`：委派回归 / 解散组） */
     readonly post?: PostStep | undefined;
     /** 汇聚驳回时的显式退回目标 */
     readonly rejectTarget?: string | undefined;
-  }): Promise<(draft: InstanceState) => InstanceState> {
-    const { state, calls, graph, at } = params;
+  }): Promise<{
+    readonly apply: (draft: InstanceState) => InstanceState;
+    /** ★ 本次推进里由节点副作用产出的事件（**槽位 9** 投递，见 `pendingEvents` 注释） */
+    readonly pendingEvents: readonly EngineEvent[];
+  }> {
+    const { state, calls, graph, at, record } = params;
     const stepInput: StepInput = {
       calls,
       ...(params.vote !== undefined ? { vote: params.vote } : {}),
@@ -349,13 +390,43 @@ export function createEngine(config: EngineConfig): Engine {
 
     /** 已解析的条件（按 flow id）。惰性填充 —— 只算本次**真正走到**的那几条 */
     const conditions = new Map<string, boolean>();
-    const conditionsOf = (flow: OutFlow, nodeId: string): boolean => {
+    const conditionsOf = (
+      flow: OutFlow,
+      nodeId: string,
+      variables: Readonly<Record<string, unknown>>,
+    ): boolean => {
       // D-42：无条件（BPMN 的默认流）→ 恒真，不进求值器
       if (flow.expression === undefined) return true;
       const value = conditions.get(flow.id);
-      if (value === undefined) throw unresolvedCondition(flow.id, flow.expression, nodeId);
+      if (value === undefined) {
+        throw unresolvedCondition(flow.id, flow.expression, nodeId, variables);
+      }
       return value;
     };
+
+    /** ★ 已解析的节点副作用（按 `${nodeId}::${tokenId}`）—— 缓存 = 「只调一次」的唯一保证 */
+    const effects = new Map<string, NodeEffect>();
+    const effectsOf = (
+      nodeId: string,
+      tokenId: string,
+      variables: Readonly<Record<string, unknown>>,
+    ): NodeEffect => {
+      const effect = effects.get(effectKeyOf(nodeId, tokenId));
+      if (effect === undefined) {
+        const kind = effectKindOf(graph.typeOf(nodeId));
+        if (kind === undefined) {
+          throw stateShapeInvalid(`node '${nodeId}' is not an effect task`, {
+            nodeId,
+            type: graph.typeOf(nodeId) ?? null,
+          });
+        }
+        throw unresolvedEffect({ nodeId, tokenId, kind, variables });
+      }
+      return effect;
+    };
+
+    /** ★ 副作用产出的事件；由 `start()` / `submit()` 在槽位 9 统一投递 */
+    const pendingEvents: EngineEvent[] = [];
 
     for (let round = 0; ; round += 1) {
       try {
@@ -372,6 +443,7 @@ export function createEngine(config: EngineConfig): Engine {
             return [PROBE_ASSIGNEE];
           },
           conditionsOf,
+          effectsOf,
         }, stepInput);
 
         const resolved = new Map<string, readonly string[]>();
@@ -379,15 +451,51 @@ export function createEngine(config: EngineConfig): Engine {
           resolved.set(nodeId, await resolveAssigneesFor(nodeId, state, graph, approverSource));
         }
 
-        return (draft: InstanceState): InstanceState =>
-          step(draft, { graph, at, assigneesOf: (nodeId) => resolved.get(nodeId) ?? [], conditionsOf }, stepInput)
-            .next;
+        return {
+          pendingEvents,
+          apply: (draft: InstanceState): InstanceState => {
+            const r = step(
+              draft,
+              { graph, at, assigneesOf: (nodeId) => resolved.get(nodeId) ?? [], conditionsOf, effectsOf },
+              stepInput,
+            );
+            // 只有**真值跑**产出的事件算数：探测跑的结果一律丢弃（它可能被重试掉）
+            pendingEvents.length = 0;
+            for (const e of r.events) pendingEvents.push(e);
+            return r.next;
+          },
+        };
       } catch (e) {
+        const pendingEffect = asUnresolvedEffect(e);
+        if (pendingEffect !== undefined) {
+          if (round >= MAX_RESOLVE_ROUNDS) {
+            throw stateShapeInvalid('effect resolution did not converge (retry budget exceeded)', {
+              budget: MAX_RESOLVE_ROUNDS,
+              instanceId: state.instanceId,
+            });
+          }
+          effects.set(
+            pendingEffect.key,
+            await resolveEffect({
+              nodeId: pendingEffect.nodeId,
+              tokenId: pendingEffect.tokenId,
+              kind: pendingEffect.kind,
+              variables: pendingEffect.variables,
+              graph,
+              state,
+              record,
+              handlers,
+              decisionHandler,
+            }),
+          );
+          continue;
+        }
+
         const pending = asUnresolved(e);
-        if (pending === undefined) throw e; // 不是"条件未解析"→ 原样抛出，绝不吞
-        if (round >= MAX_CONDITION_ROUNDS) {
+        if (pending === undefined) throw e; // 不是"未解析"→ 原样抛出，绝不吞
+        if (round >= MAX_RESOLVE_ROUNDS) {
           throw stateShapeInvalid('condition resolution did not converge (retry budget exceeded)', {
-            budget: MAX_CONDITION_ROUNDS,
+            budget: MAX_RESOLVE_ROUNDS,
             instanceId: state.instanceId,
           });
         }
@@ -396,7 +504,8 @@ export function createEngine(config: EngineConfig): Engine {
           await evaluateCondition(condition, pending.expression, {
             instanceId: state.instanceId,
             nodeId: pending.nodeId,
-            variables: state.variables,
+            // ★ 用**到达该网关那一刻**的变量快照（哨兵带来），不是提交前的旧值
+            variables: pending.variables,
           }),
         );
       }
@@ -427,11 +536,12 @@ export function createEngine(config: EngineConfig): Engine {
     if (opts.businessKey !== undefined) base.businessKey = opts.businessKey;
     if (opts.tenantId !== undefined) base.tenantId = opts.tenantId;
 
-    // 发起也要跑 run-to-wait：发起节点是自动节点，令牌要一直走到第一个等待节点
-    const apply = await buildApply({ state: base, calls: [], graph, at });
-    const looped = apply(cloneState(base));
-
     const record: ActionRecord = { name: 'start', actor: opts.starter, at };
+
+    // 发起也要跑 run-to-wait：发起节点是自动节点，令牌要一直走到第一个等待节点
+    const built = await buildApply({ state: base, calls: [], graph, at, record });
+    const looped = built.apply(cloneState(base));
+
     const next: InstanceState = {
       ...looped,
       rev: 1,
@@ -461,7 +571,7 @@ export function createEngine(config: EngineConfig): Engine {
      *    宿主要拦发起（如业务键去重）请**在调 `start()` 之前自己判** ——
      *    那时也拿得到更完整的上下文。
      */
-    emitAll(sink, eventsOf({ before: [], delta, next }));
+    emitAll(sink, [...eventsOf({ before: [], delta, next }), ...built.pendingEvents]);
     return instanceId;
   }
 
@@ -516,7 +626,12 @@ export function createEngine(config: EngineConfig): Engine {
       const before = tasksOf(state, graph);
 
       // 槽位 4（纯函数）：动作语义经 D-18 的接缝进来
-      const apply = await buildApply({
+      /*
+       * ★ `record` 与 `plan()` 里的 `lastAction` **同一口径**（`{name, actor, at}`），
+       *   故节点副作用产出的事件与 `delta.action` 必然同源 —— 否则重放时对不上。
+       */
+      const record: ActionRecord = { name: input.action, actor: input.actor, at };
+      const built = await buildApply({
         /*
          * ★ 传给探测/闭包的是**已并入 payload 增量**的状态。
          *   `plan()` 在 ④.5 先并变量、④.6 才调 `apply` —— 探测必须用同一份，
@@ -526,6 +641,7 @@ export function createEngine(config: EngineConfig): Engine {
         calls: compiled.calls,
         graph,
         at,
+        record,
         ...(compiled.vote !== undefined ? { vote: compiled.vote } : {}),
         ...(compiled.post !== undefined ? { post: compiled.post } : {}),
         ...(input.target !== undefined ? { rejectTarget: input.target } : {}),
@@ -533,7 +649,7 @@ export function createEngine(config: EngineConfig): Engine {
       const result = plan(state, input, {
         clock,
         ...(maxAuditEntries !== undefined ? { maxAuditEntries } : {}),
-        apply,
+        apply: built.apply,
         tasks: (s) => tasksOf(s, graph),
       });
 
@@ -565,7 +681,11 @@ export function createEngine(config: EngineConfig): Engine {
       // 槽位 9：事件（不 await、失败不影响流程）
       emitAll(
         sink,
-        eventsOf({ before, delta: result.delta, next: result.next, previousStatus: state.status }),
+        [
+          ...eventsOf({ before, delta: result.delta, next: result.next, previousStatus: state.status }),
+          // ★ 节点副作用产出的事件（`manualTask` 的留痕）—— 状态已落库，此刻投递才安全
+          ...built.pendingEvents,
+        ],
       );
 
       return result.delta;
@@ -582,6 +702,143 @@ export function createEngine(config: EngineConfig): Engine {
         ...options,
       }),
   };
+}
+
+// ---------------- ★ 节点副作用的解析（T17 · 唯一允许"调宿主代码"的地方） ----------------
+
+/**
+ * ★ 解析一个 `effect` 节点的副作用。
+ *
+ * ⚠️ **本函数是 `runtime/engine.ts` 里唯一会调宿主业务代码的地方** ——
+ *   `ServiceHandler` / `DecisionHandler` 都在这里被 await。它**不在**纯循环里，
+ *   正是为了让 `runToWait()` 保持纯（NFR-E6），也让「一次推进 = 一次副作用」成立。
+ *
+ * ## 四种 kind
+ *   - `'service'`（`serviceTask`）—— 查 `handlers` 表；查不到 → **抛**（不静默跳过）
+ *   - `'script'`（`scriptTask`）—— FEEL 格式 → 内置求值；非 FEEL → 查 `handlers` 表
+ *   - `'decision'`（`businessRuleTask`）—— `decisionHandler`；未注入 → **抛「未配置」**
+ *   - `'manual'`（`manualTask`）—— 只留痕：连发 `taskCreated` + `taskCompleted`
+ *
+ * @throws `ENGINE_OPTION_INVALID` —— 宿主没注入对应的实现（与 **D-24** 同口径：
+ *         「没注入」这个**真因**必须原样报出来，不得包装成"解析不出结果"）
+ */
+async function resolveEffect(params: {
+  readonly nodeId: string;
+  readonly tokenId: string;
+  readonly kind: TaskEffectKind;
+  readonly variables: Readonly<Record<string, unknown>>;
+  readonly graph: ProcessGraph;
+  readonly state: InstanceState;
+  readonly record: ActionRecord;
+  readonly handlers: ServiceHandler | undefined;
+  readonly decisionHandler: DecisionHandler | undefined;
+}): Promise<NodeEffect> {
+  const { nodeId, tokenId, kind, variables, graph, state, record } = params;
+  const { handlers, decisionHandler } = params;
+
+  // —— manualTask：不产生待办、不等待，只留两条痕 ——
+  if (kind === 'manual') return { nodeId, events: manualTaskEvents({ nodeId, tokenId, graph, state, record }) };
+
+  // —— serviceTask / 非 FEEL 的 scriptTask：查 handlers 表 ——
+  if (kind === 'service' || (kind === 'script' && !isFeelScriptFormat(graph.scriptFormatOf(nodeId)))) {
+    const ref = graph.handlerRefOf(nodeId);
+    const fn = handlers?.get(ref);
+    if (fn === undefined) {
+      const why =
+        kind === 'script'
+          ? `scriptTask '${nodeId}' 的 scriptFormat '${String(graph.scriptFormatOf(nodeId))}' 不是 FEEL`
+          : `serviceTask '${nodeId}' 没有注册处理器`;
+      throw optionInvalid('handlers', `${why} —— 请在 handlers 表注册 ref '${ref}'`, {
+        nodeId,
+        ref,
+        kind,
+        /*
+         * ⚠️ 提示文案**刻意不逐字写**那三个禁用 API 名（`test/tasks.test.ts` 有一道
+         *   「源码扫描」门禁，`src/**` 里出现它们就红，而字符串字面量不在注释剥离范围内）。
+         *   语义照样讲清楚：本引擎没有任何"动态执行宿主代码"的能力，一律由宿主提供实现。
+         */
+        hint: '引擎不执行任意 JS（无动态求值能力，也不加载 vm 类模块）；非 FEEL 的脚本与其它实现一律由宿主提供',
+      });
+    }
+    const out = await fn(variables, {
+      instanceId: state.instanceId,
+      processId: state.processId,
+      definitionVersion: state.definitionVersion,
+      nodeId,
+    });
+    return { nodeId, variables: assertVariablePatch(nodeId, kind, out) };
+  }
+
+  // —— scriptTask（FEEL）：内置求值，结果写进变量 ——
+  if (kind === 'script') {
+    const source = graph.scriptOf(nodeId);
+    if (source === undefined) {
+      throw stateShapeInvalid(`scriptTask '${nodeId}' has no <script> content`, {
+        nodeId,
+        hint: '给该节点写 <bpmn:script>，或改为非 FEEL 的 scriptFormat 并在 handlers 表注册处理器',
+      });
+    }
+    const r = evaluateScript(source, variables);
+    /*
+     * ★ 结果落在**节点 id** 这个变量名下（**D-59**）。
+     *   BPMN 的结果变量走 `ioSpecification` / `dataOutput`，而模型层未兑现该字段 ——
+     *   此处不发明扩展键，也不静默丢弃结果；按「节点 id」落，可推导、可追溯。
+     */
+    return { nodeId, variables: { [nodeId]: r.value } };
+  }
+
+  // —— businessRuleTask：decisionHandler ——
+  if (decisionHandler === undefined) {
+    throw optionInvalid(
+      'decisionHandler',
+      `businessRuleTask '${nodeId}' 需要 decisionHandler —— 未注入即报「未配置」`,
+      { nodeId, hint: '可接 @floken-io/dmn，也可以直接传一个 (input, ctx) => output 的函数' },
+    );
+  }
+  const out = await decisionHandler.evaluate({ ...variables }, {
+    instanceId: state.instanceId,
+    nodeId,
+    input: { ...variables },
+  });
+  return { nodeId, variables: assertVariablePatch(nodeId, kind, out) };
+}
+
+/**
+ * `manualTask` 的留痕：**连发** `taskCreated` + `taskCompleted`。
+ *
+ * ★ 这就是它与裸 `task` 的**唯一**差别（`03` §6 原话：「与裸 `Task` 的差别 = 是否留痕」）：
+ *   二者都不产生待办、都不等待，但 `manualTask` 在流程轨迹里**看得见**。
+ *
+ * ⚠️ 为什么 `taskStatus` 一条 `active` 一条 `done`：`taskCreated` 描述"产生了这个任务"，
+ *   `taskCompleted` 描述"它办完了" —— 中间没有停顿，但两条事实**都发生了**，
+ *   合成一条就等于承认"任务既没被创建过也没被完成过"，宿主的时间线会缺一段。
+ */
+function manualTaskEvents(params: {
+  readonly nodeId: string;
+  readonly tokenId: string;
+  readonly graph: ProcessGraph;
+  readonly state: InstanceState;
+  readonly record: ActionRecord;
+}): readonly EngineEvent[] {
+  const { nodeId, tokenId, graph, state, record } = params;
+  const base = {
+    at: record.at,
+    instanceId: state.instanceId,
+    processId: state.processId,
+    definitionVersion: state.definitionVersion,
+    action: record,
+  };
+  const name = graph.nameOf(nodeId);
+  const formKey = graph.formKeyOf(nodeId);
+
+  const make = (eventName: 'taskCreated' | 'taskCompleted', taskStatus: 'active' | 'done'): TaskEvent => {
+    const e: TaskEvent = { ...base, name: eventName, taskId: `${nodeId}:${tokenId}`, nodeId, taskStatus };
+    if (name !== undefined) e.nodeName = name;
+    if (formKey !== undefined) e.formKey = formKey;
+    return e;
+  };
+
+  return [make('taskCreated', 'active'), make('taskCompleted', 'done')];
 }
 
 // ---------------- 内部 helpers ----------------

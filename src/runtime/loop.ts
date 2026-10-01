@@ -56,16 +56,20 @@ import {
   stateShapeInvalid,
   tokenOrphan,
 } from '../core/errors.js';
+import type { EngineEvent } from '../core/events.js';
 import { LIVE_TOKEN_STATES, clearAssignment, markCompleted, primitives } from '../core/primitives.js';
 import type { InstanceState, Token } from '../core/state.js';
 import { cloneState, isTerminalStatus } from '../core/state.js';
 import type { TaskStatus, TaskView } from '../core/task.js';
 import { assertEventSupported, eventBehaviorOf } from '../nodes/events.js';
+import { assertNotDataNode } from '../nodes/flows.js';
 import type { OutFlow } from '../nodes/graph.js';
 import { isWaitingNode } from '../nodes/graph.js';
 import type { ProcessGraph } from '../nodes/graph.js';
 import { canJoin, isConverging, isGatewayType, routeGateway, waitingAt } from '../nodes/gateways.js';
 import type { RoutedFlow } from '../nodes/gateways.js';
+import type { NodeEffect } from '../nodes/tasks.js';
+import { assertTaskSupported, taskBehaviorOf } from '../nodes/tasks.js';
 
 /** 探测阶段用的办理人占位：**非空**（否则会触发 INV-13 的空集报错），仅用于问出落点 */
 export const PROBE_ASSIGNEE = '__probe__';
@@ -117,8 +121,31 @@ export interface LoopContext {
    *
    * @param flow 出向流（`expression` 为 `undefined` = 无条件，恒真）
    * @param nodeId 该网关的 id（条件上下文要用）
+   * @param variables ★ **到达该网关此刻**的变量快照（T17）。
+   *   为什么必须传：`scriptTask` / `serviceTask` 会在本次推进里**改写**变量，
+   *   拿提交前的旧快照去求值，就是「脚本把 amount 改成了 9000、网关却按旧值走分支」
+   *   —— §7.2 要防的头号事故的另一副面孔。
    */
-  readonly conditionsOf: (flow: OutFlow, nodeId: string) => boolean;
+  readonly conditionsOf: (
+    flow: OutFlow,
+    nodeId: string,
+    variables: Readonly<Record<string, unknown>>,
+  ) => boolean;
+  /**
+   * ★ **任务副作用**（T17 · `serviceTask` / `scriptTask` / `businessRuleTask` / `manualTask`）
+   * —— **同步**，与 `assigneesOf` / `conditionsOf` 同一套路。
+   *
+   * `ServiceHandler` / `DecisionHandler` 是**异步** SPI，且带真实副作用（发邮件、建单），
+   * 而本文件必须同步纯。故：尚未解析时闭包抛 `NodeEffectUnresolved` 哨兵 →
+   * `runtime/engine.ts` 解析 → **重跑**；结果按 `${nodeId}::${tokenId}` 缓存 ⇒ **只调一次**。
+   *
+   * ⚠️ 本档只**消费** `NodeEffect`（并变量 / 收事件），**绝不**在这里调宿主代码。
+   */
+  readonly effectsOf: (
+    nodeId: string,
+    tokenId: string,
+    variables: Readonly<Record<string, unknown>>,
+  ) => NodeEffect;
   /** 本次推进的时刻（填 `Token.createdAt`） */
   readonly at: string;
 }
@@ -140,6 +167,14 @@ export interface LoopResult {
   readonly next: InstanceState;
   /** 令牌停下来的等待节点（去重、保序）—— 调用方据此预先解析办理人 */
   readonly landings: readonly string[];
+  /**
+   * ★ 本次推进里**由节点副作用产出**的事件（T17：目前只有 `manualTask` 的留痕）。
+   *
+   * ⚠️ 为什么不在本文件里 `emit`：本文件是纯的（NFR-E6）。事件由 `runtime/engine.ts`
+   *   在**槽位 9**（状态已落库之后）统一投递 —— 在推进过程中就发，一旦后续步骤抛错，
+   *   就会出现「事件说办完了、状态却没落库」的不一致。
+   */
+  readonly events: readonly EngineEvent[];
 }
 
 /**
@@ -399,6 +434,7 @@ function restIdsOf(state: InstanceState, groupId: string): string[] {
 export function runToWait(state: InstanceState, ctx: LoopContext): LoopResult {
   let cur = cloneState(state);
   const landings: string[] = [];
+  const events: EngineEvent[] = [];
   const budget = { steps: 0 };
 
   /*
@@ -413,7 +449,7 @@ export function runToWait(state: InstanceState, ctx: LoopContext): LoopResult {
    */
   for (let round = 0; round < MAX_STEPS; round += 1) {
     const merged = joinPass(cur, ctx);
-    cur = advanceTokens(cur, ctx, landings, budget);
+    cur = advanceTokens(cur, ctx, landings, budget, events);
     if (!merged) break;
   }
 
@@ -422,7 +458,7 @@ export function runToWait(state: InstanceState, ctx: LoopContext): LoopResult {
     cur.status = 'completed';
   }
 
-  return { next: cur, landings };
+  return { next: cur, landings, events };
 }
 
 /**
@@ -435,6 +471,7 @@ function advanceTokens(
   ctx: LoopContext,
   landings: string[],
   budget: { steps: number },
+  events: EngineEvent[],
 ): InstanceState {
   const next = cloneState(state);
   /*
@@ -463,6 +500,9 @@ function advanceTokens(
         throw tokenOrphan(next.instanceId, token.id, token.nodeId);
       }
 
+      // ⓪ 数据节点：**不是**可执行节点（引擎只读不写），令牌落到它上面 = 定义画错了
+      assertNotDataNode(type, token.nodeId);
+
       // ① 事件族：未实现的 3 类在这里显式抛（绝不静默直通）
       const behavior = eventBehaviorOf(type);
       if (behavior !== undefined) {
@@ -484,7 +524,8 @@ function advanceTokens(
           nodeId: token.nodeId,
           outFlows: ctx.graph.outFlowsOf(token.nodeId),
           defaultFlowId: ctx.graph.defaultFlowIdOf(token.nodeId),
-          isTrue: (f) => ctx.conditionsOf(f, token.nodeId),
+          // ★ 条件上下文取**此刻**的变量（T17：脚本 / 服务可能在本次推进里改过它）
+          isTrue: (f) => ctx.conditionsOf(f, token.nodeId, next.variables),
         });
         // ★ 离开网关也要记账（D-28 同口径）
         markCompleted(next, token.nodeId);
@@ -497,6 +538,14 @@ function advanceTokens(
         // 多条出向 → 令牌分裂。第 0 条沿用原令牌，故此处 `continue` 接着推它
         forkToken(next, token, i, routed);
         continue;
+      }
+
+      // ③ 任务族（T17）：未实现的 2 类显式抛；有副作用的先**消费**已解析的结果
+      const taskBehavior = taskBehaviorOf(type);
+      if (taskBehavior !== undefined) {
+        assertTaskSupported(type, token.nodeId, taskBehavior);
+        if (taskBehavior === 'effect') applyEffect(next, token, ctx, events);
+        // 'wait' → 落到下面的 `settleAssignee`；'pass' 与已消费的 'effect' → 自动直通
       }
 
       if (isWaitingNode(type)) {
@@ -527,6 +576,30 @@ function advanceTokens(
   }
 
   return next;
+}
+
+/**
+ * ★ 消费一个已解析的**节点副作用**（T17）。
+ *
+ * 只做两件事：并变量、收事件。**不调宿主代码** —— 那是 `runtime/engine.ts` 在解析阶段做的。
+ *
+ * ⚠️ 并变量必须**就地**改 `next.variables` 且不改原对象：`runToWait` 全程是纯的
+ *    （入参 `state` 由 `cloneState` 保护），而后续的条件求值要读到**并完之后**的值。
+ *
+ * @throws `NodeEffectUnresolved` —— `effectsOf` 闭包尚未解析（引擎捕获后解析并重跑）
+ */
+function applyEffect(
+  next: InstanceState,
+  token: Token,
+  ctx: LoopContext,
+  events: EngineEvent[],
+): void {
+  const effect = ctx.effectsOf(token.nodeId, token.id, next.variables);
+  const patch = effect.variables;
+  if (patch !== undefined && Object.keys(patch).length > 0) {
+    next.variables = { ...next.variables, ...patch };
+  }
+  for (const e of effect.events ?? []) events.push(e);
 }
 
 /**

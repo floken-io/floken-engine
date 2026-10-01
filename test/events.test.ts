@@ -19,6 +19,7 @@ import {
   eventBehaviorOf,
   isEventType,
 } from '../src/nodes/events';
+import { NO_EFFECT } from '../src/nodes/tasks';
 import { runToWait } from '../src/runtime/loop';
 import { expectCode } from './helpers/expect';
 import { makeDefinition, userApproval } from './helpers/definition';
@@ -44,6 +45,7 @@ const ctx = (def: ReturnType<typeof makeDefinition>) => ({
   graph: createProcessGraph(def, 'Process_1', 1),
   assigneesOf: () => ['u1'] as readonly string[],
   conditionsOf: () => true,
+  effectsOf: () => NO_EFFECT,
   at: T,
 });
 

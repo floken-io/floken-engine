@@ -18,6 +18,7 @@ import { compileAction } from '../src/actions/compile';
 import { ENGINE_ERROR_CODES } from '../src/core/errors';
 import type { InstanceState } from '../src/core/state';
 import { createProcessGraph } from '../src/nodes/graph';
+import { NO_EFFECT } from '../src/nodes/tasks';
 import { createEngine } from '../src/runtime/engine';
 import { step, tasksOf } from '../src/runtime/loop';
 import { createMemoryStore } from '../src/store/memory';
@@ -416,7 +417,7 @@ describe('⑧ ★ `submit()` 与 `plan()` 同一结果（含投票 + 汇聚）',
       apply: (draft) =>
         step(
           draft,
-          { graph: c.graph, at: T0, assigneesOf: () => ['u9'], conditionsOf: () => true },
+          { graph: c.graph, at: T0, assigneesOf: () => ['u9'], conditionsOf: () => true, effectsOf: () => NO_EFFECT },
           { calls: compiled.calls, ...(compiled.vote ? { vote: compiled.vote } : {}) },
         ).next,
       tasks: (s) => tasksOf(s, c.graph),
@@ -450,7 +451,7 @@ describe('⑨ 边界', () => {
       ],
     };
     expectCode(
-      () => step(bogus, { graph: c.graph, at: T0, assigneesOf: () => [], conditionsOf: () => true }, { calls: [] }),
+      () => step(bogus, { graph: c.graph, at: T0, assigneesOf: () => [], conditionsOf: () => true, effectsOf: () => NO_EFFECT }, { calls: [] }),
       ENGINE_ERROR_CODES.STATE_SHAPE_INVALID,
     );
   });

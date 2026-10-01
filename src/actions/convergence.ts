@@ -185,48 +185,16 @@ export function evaluateConvergence(ctx: ConvergeCtx): ConvergenceResult {
   const required = requiredVotes(ctx.total, vote);
 
   /*
-   * ★ D-21（**模型层的真实缺陷，引擎侧在此修正**）
+   * ★ D-21 / D-31 —— **已在模型层修正（2026-10-01），引擎侧短路随之删除**。
    *
-   * `@floken-io/moddle` 的 `shouldTerminate()` 把「规则三 · 全员表态后按多数定」
-   * 放在了最前面（不管 `mode`），于是：
+   * 原缺陷：`shouldTerminate()` 把「全员表态后按多数定（`pending === 0`）」放在最前面且不看 `mode`，
+   * 于是会签 3 人「2 通过 1 驳回」被判成 **approved**，与会签的全票决定义冲突（违反 INV-11）。
+   * 当时引擎在此加了一段 `mode:'all' && rejected > 0` 的短路来兜住语义。
    *
-   *   会签 3 人，2 通过 1 驳回 → 实测返回 **approved**（"所有人已表态"+ 多数决）
-   *
-   * 这与会签的定义（**全部通过才推进**）直接冲突，也违反 **INV-11**
-   * （`mode:'all'` 的正向汇聚**只在 `rejected === 0` 时成立**）与 `03` §5.2 的判定式。
-   * 规则三的本意是**票签**的兜底（防除不尽 / 永远卡住），不该把"多数决"叠加到会签的"全票决"上。
-   *
-   * ★ **修正范围 = `mode:'all' && rejected > 0`（不只是 `abort` 那一格）**：
-   *   `onReject` 只决定**要不要提前终止**，不决定**最后按什么定** ——
-   *   会签下只要有人驳回，结果就必须是 `rejected`，与 `onReject` 无关
-   *   （`wait` 的含义 =「先记下这票，等其余人表态完再定」，不是「改成多数决」）。
-   *   若只修 `abort`，会签 + `wait` + 2 通过 1 驳回仍会被判成 approved ——
-   *   T13 把它接进真实执行路径时这条必然暴露，故一并收口（**D-31**）。
-   *
-   *   除这一格之外，其余全部委托模型层。待 moddle 修正后本段可整块删除
-   *   （对账测试会提示：那一格不再需要排除）。
+   * 现模型层已按 §4.4.1 的原意重排规则序（先按 `mode` 判，"全员已表态"兜底只对票签生效），
+   * 短路遂整块删除 —— 否则就是**两份事实源**，将来必然漂移（D-19 的教训）。
+   * 对账测试（③）已去掉该格的例外，一旦模型层再退化会立即红。
    */
-  if (ctx.mode === 'all' && ctx.rejected > 0) {
-    const abort = ctx.onReject === 'abort';
-    // `wait` 且还有人没表态 → 继续等（"记录驳回但其余继续"）
-    if (!abort && ctx.pending > 0) {
-      return {
-        outcome: 'pending',
-        cancelRest: false,
-        reason: '会签：已记录驳回，等待其余成员表态（onReject=wait）',
-        required,
-      };
-    }
-    return {
-      outcome: 'rejected',
-      cancelRest: abort,
-      reason: abort
-        ? '会签：任一人驳回即整体驳回（onReject=abort）'
-        : '会签：全员表态且有人驳回 → 整体驳回（onReject=wait）',
-      required,
-    };
-  }
-
   const r = modelShouldTerminate(ctx.mode, ctx.total, ctx.approved, ctx.rejected, {
     onReject: ctx.onReject,
     ...(vote === undefined ? {} : { vote }),

@@ -10,6 +10,7 @@
  * 用法：`node test/fixtures/smoke.mjs`；全绿则打印 `SMOKE OK` 且退出码 0。
  */
 import { readdirSync, readFileSync } from 'node:fs';
+import { fileURLToPath } from 'node:url';
 
 const results = [];
 const ok = (name) => results.push([true, name]);
@@ -1453,6 +1454,187 @@ check('T16 · nodes/ 新模块同样未泄漏进公开面', () => {
     'eventBehaviorOf',
     'isGatewayType',
     'waitingAt',
+  ].filter((k) => k in m);
+  eq(leaked.length, 0, `被意外导出：${leaked.join(', ') || '无'}`);
+});
+
+// ---------------- T17 · 任务 8 类 + 连线与数据 4 类 ----------------
+
+const T17 = '2026-10-01T00:00:00.000Z';
+
+/**
+ * ★ **运行期探针**：产物 `dist/*.js` 里**不得**出现动态执行 API。
+ *   单元测试那道扫的是 `src/`（去注释）；这道扫的是**真正发出去的那份代码** ——
+ *   `03` §6 的 `ScriptTask` 红线是「禁止动态执行」，两层都绿才算收口。
+ */
+check('T17 · ★ dist 产物无动态执行 API（无 new Function / node:vm / eval(）', () => {
+  const distDir = fileURLToPath(new URL('.', resolved));
+  const files = readdirSync(distDir).filter((f) => f.endsWith('.js'));
+  assert(files.length > 0, `dist 下没有 .js（${distDir}）`);
+  for (const f of files) {
+    const src = readFileSync(distDir + f, 'utf8');
+    assert(!/new\s+Function/.test(src), `${f} 出现 new Function`);
+    assert(!/['"`]node:vm['"`]/.test(src), `${f} 引用 node:vm`);
+    assert(!/(^|[^\w.])eval\s*\(/.test(src), `${f} 出现 eval(`);
+  }
+});
+
+/** 一条「自动任务 + 人工审批」的最小流程；`auto` 节点的类型由调用方给 */
+const autoDef = (auto) => ({
+  schemaVersion: '1.0.0',
+  id: 'Definitions_auto',
+  processes: [
+    {
+      id: 'Process_auto',
+      nodes: [
+        { id: 'Start_1', type: 'startEvent' },
+        { id: 'Auto_1', type: auto.type, name: '自动节点', ...auto },
+        {
+          id: 'Task_1',
+          type: 'userTask',
+          extension: { 'floken:approval': { approvers: [{ type: 'user', value: 'u_1' }] } },
+        },
+        { id: 'End_1', type: 'endEvent' },
+      ],
+      flows: [
+        { id: 'F1', from: 'Start_1', to: 'Auto_1' },
+        { id: 'F2', from: 'Auto_1', to: 'Task_1' },
+        { id: 'F3', from: 'Task_1', to: 'End_1' },
+      ],
+    },
+  ],
+});
+
+function autoEngine(auto, extra = {}) {
+  const events = [];
+  const store = m.createMemoryStore();
+  const engine = m.createEngine({
+    definitionSource: {
+      async getDefinition(pid, v) {
+        return pid === 'Process_auto' && v === 1 ? autoDef(auto) : null;
+      },
+    },
+    store,
+    events: { emit: (e) => void events.push(e) },
+    clock: () => T17,
+    ...extra,
+  });
+  return { engine, store, events };
+}
+
+await checkAsync('T17 · ★ manualTask：连发 created + completed，且不等待、无 assignee', async () => {
+  const c = autoEngine({ type: 'manualTask' });
+  const id = await c.engine.start('Process_auto', { definitionVersion: 1, starter: 'u_0' });
+  // 不等待：起点 → manualTask → userTask 一步到位
+  const st = await c.store.load(id);
+  sameArray(
+    st.tokens.filter((t) => t.state === 'active').map((t) => t.nodeId),
+    ['Task_1'],
+    '令牌没停在 manualTask 上',
+  );
+  const trace = c.events.filter((e) => e.nodeId === 'Auto_1').map((e) => e.name);
+  sameArray(trace, ['taskCreated', 'taskCompleted'], '留痕两条');
+  assert(c.events.filter((e) => e.nodeId === 'Auto_1').every((e) => e.assignee === undefined), '不该有 assignee');
+});
+
+await checkAsync('T17 · ★ 裸 task：一条事件都不发（与 manualTask 的差别 = 是否留痕）', async () => {
+  const c = autoEngine({ type: 'task' });
+  const id = await c.engine.start('Process_auto', { definitionVersion: 1, starter: 'u_0' });
+  const st = await c.store.load(id);
+  sameArray(st.tokens.filter((t) => t.state === 'active').map((t) => t.nodeId), ['Task_1'], '直通到 Task_1');
+  eq(c.events.filter((e) => e.nodeId === 'Auto_1').length, 0, '裸 task 的事件数');
+});
+
+await checkAsync('T17 · serviceTask：调 handler 一次，返回值并入变量', async () => {
+  let calls = 0;
+  const c = autoEngine(
+    { type: 'serviceTask', implementation: 'mkTicket' },
+    { handlers: { get: (ref) => (ref === 'mkTicket' ? async () => { calls += 1; return { ticket: 'T-9' }; } : undefined) } },
+  );
+  const id = await c.engine.start('Process_auto', { definitionVersion: 1, starter: 'u_0' });
+  eq(calls, 1, 'handler 调用次数');
+  eq((await c.store.load(id)).variables.ticket, 'T-9', '并入的变量');
+});
+
+await checkAsync('T17 · scriptTask（FEEL）：内置求值，结果落在 variables[nodeId]', async () => {
+  const c = autoEngine({ type: 'scriptTask', scriptFormat: 'feel', script: '1 + 2' });
+  const id = await c.engine.start('Process_auto', { definitionVersion: 1, starter: 'u_0' });
+  eq((await c.store.load(id)).variables.Auto_1, 3, 'FEEL 脚本结果');
+});
+
+await checkAsync('T17 · ★ businessRuleTask 未注入 decisionHandler → 报「未配置」', async () => {
+  const c = autoEngine({ type: 'businessRuleTask' });
+  let code = null;
+  try {
+    await c.engine.start('Process_auto', { definitionVersion: 1, starter: 'u_0' });
+  } catch (e) {
+    code = e.code;
+  }
+  eq(code, 'ENGINE_OPTION_INVALID', '未注入 decisionHandler 的错误码');
+});
+
+await checkAsync('T17 · ★ sendTask / receiveTask → 显式抛（不得静默直通）', async () => {
+  for (const type of ['sendTask', 'receiveTask']) {
+    const c = autoEngine({ type });
+    let code = null;
+    try {
+      await c.engine.start('Process_auto', { definitionVersion: 1, starter: 'u_0' });
+    } catch (e) {
+      code = e.code;
+    }
+    eq(code, 'ENGINE_STATE_SHAPE_INVALID', `${type} 的错误码`);
+  }
+});
+
+await checkAsync('T17 · ★ 数据节点：令牌落到 dataObject → 抛（引擎只读不写）', async () => {
+  const def = {
+    schemaVersion: '1.0.0',
+    id: 'Definitions_data',
+    processes: [
+      {
+        id: 'Process_data',
+        nodes: [
+          { id: 'Start_1', type: 'startEvent' },
+          { id: 'Data_1', type: 'dataObject' },
+          {
+            id: 'Task_1',
+            type: 'userTask',
+            extension: { 'floken:approval': { approvers: [{ type: 'user', value: 'u_1' }] } },
+          },
+        ],
+        flows: [
+          { id: 'F1', from: 'Start_1', to: 'Data_1' },
+          { id: 'F2', from: 'Data_1', to: 'Task_1' },
+        ],
+      },
+    ],
+  };
+  const engine = m.createEngine({
+    definitionSource: { async getDefinition(pid, v) { return pid === 'Process_data' && v === 1 ? def : null; } },
+    store: m.createMemoryStore(),
+    clock: () => T17,
+  });
+  let code = null;
+  try {
+    await engine.start('Process_data', { definitionVersion: 1, starter: 'u_0' });
+  } catch (e) {
+    code = e.code;
+  }
+  eq(code, 'ENGINE_STATE_SHAPE_INVALID', '令牌落到数据节点的错误码');
+});
+
+check('T17 · nodes/ 新模块同样未泄漏进公开面', () => {
+  const leaked = [
+    'taskBehaviorOf',
+    'assertTaskSupported',
+    'effectKindOf',
+    'isFeelScriptFormat',
+    'unresolvedEffect',
+    'isDataNode',
+    'assertNotDataNode',
+    'flowPasses',
+    'dataRefOf',
+    'evaluateScript',
   ].filter((k) => k in m);
   eq(leaked.length, 0, `被意外导出：${leaked.join(', ') || '无'}`);
 });

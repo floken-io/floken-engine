@@ -39,6 +39,7 @@
 import { definitionMissing, stateShapeInvalid } from '../core/errors.js';
 import type { InstanceState } from '../core/state.js';
 import { LIVE_TOKEN_STATES } from '../core/primitives.js';
+import { flowPasses } from './flows.js';
 import type { OutFlow } from './graph.js';
 import type { ProcessGraph } from './graph.js';
 
@@ -150,8 +151,10 @@ export function routeGateway(input: RouteInput): readonly RoutedFlow[] {
    *   把它交给 `isTrue` 有两个坏处：① 宿主注入的 handler 可以把它判成 false，
    *   于是"没写条件"这条 BPMN 的既有语义被悄悄改写；② 白白多一次求值
    *   （并行分支上每条无条件流都要问一遍，而这些分支在真实图里占多数）。
+   *
+   *   判据本身在 `nodes/flows.ts` 的 `flowPasses()` —— 连线的语义只有一个口径。
    */
-  const taken = (f: OutFlow): boolean => (f.expression === undefined ? true : isTrue(f));
+  const taken = (f: OutFlow): boolean => flowPasses(f, () => isTrue(f));
 
   // —— exclusiveGateway：第一条为真的（不判 default；它只在"一条都没中"时才走）——
   if (type === 'exclusiveGateway') {

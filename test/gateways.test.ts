@@ -17,6 +17,8 @@ import { STATE_SCHEMA_VERSION } from '../src/core/state';
 import type { InstanceState } from '../src/core/state';
 import { createProcessGraph } from '../src/nodes/graph';
 import type { OutFlow } from '../src/nodes/graph';
+import type { NodeEffect } from '../src/nodes/tasks';
+import { NO_EFFECT } from '../src/nodes/tasks';
 import {
   EXECUTABLE_GATEWAY_TYPES,
   GATEWAY_TYPES,
@@ -52,11 +54,13 @@ const ctxOf = (
   opts: {
     assigneesOf?: (n: string) => readonly string[];
     conditionsOf?: (f: OutFlow) => boolean;
+    effectsOf?: () => NodeEffect;
   } = {},
 ): LoopContext => ({
   graph: createProcessGraph(def, 'Process_1', 1),
   assigneesOf: opts.assigneesOf ?? (() => ['u1'] as readonly string[]),
   conditionsOf: opts.conditionsOf ?? (() => true),
+  effectsOf: opts.effectsOf ?? (() => NO_EFFECT),
   at: T,
 });
 

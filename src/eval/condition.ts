@@ -25,8 +25,26 @@ import type { ConditionCtx, ConditionHandler } from '../core/spi.js';
  * JUEL 插值（`${variables.foo}`）—— **不是 FEEL**。
  * Camunda 7 的写法；本引擎执行 FEEL，变量**直接写名字**（`amount` / `order.amount`）。
  * `03-engine` §7.2：出现即**越界抛错**，不静默求值、也不做隐式转换。
+ *
+ * ★ 导出给 `eval/script.ts` 复用：脚本任务与条件走**同一条**越界判定
+ *   （两处各写一份正则，必然有一处漏 —— 而漏的表现是"JUEL 被当成 FEEL 静默求值"）。
  */
-const JUEL_INTERPOLATION = /\$\{/;
+export const JUEL_INTERPOLATION = /\$\{/;
+
+/**
+ * ★ 越界拦截：**先于**解析器。
+ *
+ * 不拦的话 `@floken-io/feel` 只会报 `Unexpected character '$'`（指向**错因**而不是**错类**），
+ * 拦了才有「这是 JUEL 不是 FEEL」的可执行修复建议。
+ */
+export function assertNotJuel(source: string, where: 'condition' | 'script'): void {
+  if (!JUEL_INTERPOLATION.test(source)) return;
+  throw conditionInvalid(
+    source,
+    'JUEL 插值 ${...} 不是 FEEL 语法',
+    { hintKind: 'juel', where },
+  );
+}
 
 /**
  * 内置 `ConditionHandler` 的可调项（透传给 `@floken-io/feel` 的 `EvaluateOptions`）。
@@ -74,11 +92,7 @@ export function createFeelConditionHandler(options: FeelConditionOptions = {}): 
     evaluate(expression: string, ctx: ConditionCtx): boolean {
       // ① `${...}`：先于解析器拦截，好给出「这是 JUEL 不是 FEEL」的可执行修复建议。
       //    （不拦的话 feel 只会报 `Unexpected character '$'`，指向错因而不是错类。）
-      if (JUEL_INTERPOLATION.test(expression)) {
-        throw conditionInvalid(expression, 'JUEL 插值 ${...} 不是 FEEL 语法', {
-          hintKind: 'juel',
-        });
-      }
+      assertNotJuel(expression, 'condition');
 
       // ② 空 / 空白 = **无条件**（BPMN 的既有语义：无 `conditionExpression` 的顺序流即默认流）。
       //    只有 trim 后为空才走这条；写坏了（`amount >`）照旧抛语法错 —— 见 **D-42**。
@@ -167,12 +181,26 @@ export class ConditionUnresolved extends Error {
   readonly flowId: string;
   readonly expression: string;
   readonly nodeId: string;
+  /**
+   * ★ **到达该网关那一刻**的变量快照（T17）。
+   *
+   * 为什么必须由哨兵带出来：解析发生在**重跑**里，那时拿不到"当时"的状态。
+   * 若用提交前的旧变量去求值，`scriptTask` / `serviceTask` 在本次推进里改过的变量
+   * 就被忽略了 —— 表现为「脚本把 amount 改成了 9000，网关却按旧值走了分支」。
+   */
+  readonly variables: Readonly<Record<string, unknown>>;
 
-  constructor(flowId: string, expression: string, nodeId: string) {
+  constructor(
+    flowId: string,
+    expression: string,
+    nodeId: string,
+    variables: Readonly<Record<string, unknown>> = {},
+  ) {
     super(`condition of flow '${flowId}' is not resolved yet`);
     this.flowId = flowId;
     this.expression = expression;
     this.nodeId = nodeId;
+    this.variables = variables;
   }
 }
 
@@ -181,8 +209,9 @@ export function unresolvedCondition(
   flowId: string,
   expression: string,
   nodeId: string,
+  variables: Readonly<Record<string, unknown>> = {},
 ): ConditionUnresolved {
-  return new ConditionUnresolved(flowId, expression, nodeId);
+  return new ConditionUnresolved(flowId, expression, nodeId, variables);
 }
 
 /** 判定并取出哨兵内容；不是哨兵 → `undefined`（**原样交给上层，绝不吞**） */

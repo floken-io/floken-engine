@@ -22,6 +22,18 @@ export interface TestNode {
   defaultFlow?: string;
   /** `floken:approval` 的原始配置（未归一化 —— 归一化由 `createProcessGraph` 做） */
   approval?: Record<string, unknown>;
+  /**
+   * T17：任务类节点的取参。**只造引擎真的会读的那几个字段**，
+   * 不做全字段映射（那是 `01-moddle` 的活）。
+   */
+  /** `<bpmn:script>` 子元素（`scriptTask`） */
+  script?: string;
+  /** `scriptFormat`（`scriptTask`） */
+  scriptFormat?: string;
+  /** `implementation`（`serviceTask` 的 handler 查找键；`##` 前缀的会被忽略） */
+  implementation?: string;
+  /** `operationRef`（`serviceTask` 的 handler 查找键） */
+  operationRef?: string;
 }
 
 export interface TestFlow {
@@ -45,6 +57,10 @@ export function makeDefinition(opts: {
     if (n.formKey !== undefined) node.formKey = n.formKey;
     if (n.defaultFlow !== undefined) node.defaultFlow = n.defaultFlow;
     if (n.approval !== undefined) node.extension = { 'floken:approval': n.approval };
+    if (n.script !== undefined) node.script = n.script;
+    if (n.scriptFormat !== undefined) node.scriptFormat = n.scriptFormat;
+    if (n.implementation !== undefined) node.implementation = n.implementation;
+    if (n.operationRef !== undefined) node.operationRef = n.operationRef;
     return node as unknown as FlowNode;
   });
 
