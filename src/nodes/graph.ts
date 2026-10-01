@@ -11,13 +11,15 @@
  *
  * ★ 分层：`nodes/` 可 import `core/` 与模型层；`core/` 不得反向 import 本目录。
  *
- * ⚠️ **T16 落地后的能力边界（诚实标注，勿含糊成"支持"）**：
- *   - 认得全部 **6 类事件 + 5 类网关**（分类与可达性见图适配层），但其中
+ * ⚠️ **T16 / T17 / T18 落地后的能力边界（诚实标注，勿含糊成"支持"）**：
+ *   - 认得全部 **6 类事件 + 5 类网关 + 8 类任务**（分类与可达性见图适配层），但其中
  *     `intermediateCatchEvent` / `boundaryEvent` / `implicitThrowEvent` /
- *     `complexGateway` / `eventBasedGateway` 一律**显式抛错**（分属 T20 / T21 / FR-E24 / FR-E17 / FR-E14）；
+ *     `complexGateway` / `eventBasedGateway` / `sendTask` / `receiveTask` 一律**显式抛错**
+ *     （分属 T20 / T21 / FR-E24 / FR-E17 / FR-E14）；
  *   - **单出向的普通节点**（`userTask` 等）有多条 `sequenceFlow` → 仍抛 `D-22`
  *     （"隐式排他 / 隐式包容"没有规格依据，不发明）；多出向**只**在网关上被路由；
- *   - 子流程内嵌（`FlowNode.nodes` / `flows`）**不展开**，归 **T18**。
+ *   - **T18 起内嵌子流程在建图时展开**（`nodes/activities.ts` 的 `expandSubProcesses`），
+ *     故本档拿到的 `nodes` / `flows` 已是**拍平后**的全表 —— 展开规则见该文件档首。
  *   把这三点写成显式抛错而不是"取第一条流走下去"，是为了让"这条流程现在跑不了"
  *   表现为**一条能照着修的错误**，而不是"流程静默走错分支"。
  */
@@ -26,6 +28,8 @@ import { normalizeApproval } from '@floken-io/moddle';
 import type { Flow, FlowNode, NormalizedApproval, ProcessDefinition } from '@floken-io/moddle';
 
 import { definitionMissing, stateShapeInvalid, tokenOrphan } from '../core/errors.js';
+import { callTargetOf, expandSubProcesses } from './activities.js';
+import type { CallTarget } from './activities.js';
 
 // ---------------- 引擎关心的节点分类 ----------------
 
@@ -147,6 +151,14 @@ export interface ProcessGraph {
    *    （`AC-E13` 的精神），而不是逼宿主为每个节点写一遍 `implementation`。
    */
   handlerRefOf(nodeId: string): string;
+  /**
+   * ★ `callActivity` 的被调用目标（T18 · **INV-16** 的落点）。
+   *
+   * - 不是 `callActivity` → `undefined`；
+   * - 是 `callActivity` 但**没绑定版本** → **抛**（绝不回退到"最新版"，理由见
+   *   `nodes/activities.ts` 的 `callTargetOf`）。
+   */
+  callTargetOf(nodeId: string): CallTarget | undefined;
 }
 
 /**
@@ -168,8 +180,20 @@ export function createProcessGraph(
     throw definitionMissing(processId, definitionVersion);
   }
 
+  /*
+   * ★ T18：**先拍平再建图**。
+   *
+   * 内嵌子流程在此展开成"父图的一部分"（节点 id 带层级前缀），于是下游全部逻辑
+   * —— `nextOf` / `reachable` / 网关汇聚 / `completedNodes` / `tasksOf` ——
+   * **一行都不用改**就知道"子流程里还有哪些节点"。这是选择"展开"而不是
+   * "运行期另起一套子令牌树"的全部理由：后者要给上面每一处都加一遍"如果在子流程里"。
+   */
+  const flat = expandSubProcesses(process.nodes ?? [], process.flows ?? []);
+  const flatNodes = flat.nodes;
+  const flatFlows = flat.flows;
+
   const nodes = new Map<string, FlowNode>();
-  for (const n of process.nodes ?? []) {
+  for (const n of flatNodes) {
     if (n === null || typeof n !== 'object' || typeof n.id !== 'string') continue;
     // 重复 id 是定义自身的问题；取最后一个会掩盖它，取第一个同样会 —— 这里直接抛，
     // 与「推定不了 = 不允许」同一条纪律（白名单式，见 `actions/gates.ts`）。
@@ -186,7 +210,7 @@ export function createProcessGraph(
   const out = new Map<string, OutFlow[]>();
   /** to → 入向流列表（T16：汇聚判据要用） */
   const inn = new Map<string, InFlow[]>();
-  for (const f of process.flows ?? []) {
+  for (const f of flatFlows) {
     if (f === null || typeof f !== 'object') continue;
     if (typeof f.from !== 'string' || typeof f.to !== 'string') continue;
     const flowId = typeof f.id === 'string' ? f.id : `flow:${f.from}->${f.to}`;
@@ -199,7 +223,7 @@ export function createProcessGraph(
     else inList.push({ id: flowId, from: f.from });
   }
 
-  const startNode = (process.nodes ?? []).find(
+  const startNode = flatNodes.find(
     (n) => n !== null && typeof n === 'object' && n.type === 'startEvent',
   );
   if (startNode === undefined) {
@@ -316,6 +340,8 @@ export function createProcessGraph(
       if (typeof op === 'string' && op.length > 0) return op;
       return nodeId;
     },
+
+    callTargetOf: (nodeId) => callTargetOf(nodes.get(nodeId)),
   };
 }
 

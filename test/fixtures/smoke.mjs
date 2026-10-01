@@ -1639,6 +1639,187 @@ check('T17 · nodes/ 新模块同样未泄漏进公开面', () => {
   eq(leaked.length, 0, `被意外导出：${leaked.join(', ') || '无'}`);
 });
 
+// ---------------- T18 · 活动 / 子流程 4 类 ----------------
+
+const T18 = '2026-10-01T00:00:00.000Z';
+
+/** 最小 `ProcessDefinition`（探针不 import 测试夹具 —— 它只该跑**产物**） */
+function defOf(processId, nodes, flows) {
+  return {
+    schemaVersion: '1.0.0',
+    id: `Definitions_${processId}`,
+    processes: [{ id: processId, nodes, flows }],
+  };
+}
+const userApprovalOf = (value) => ({ 'floken:approval': { approvers: [{ type: 'user', value }] } });
+
+await checkAsync('T18 · 内嵌子流程：令牌走进去、再从出口出来（子流程自身不在图里）', async () => {
+  const def = defOf(
+    'Process_1',
+    [
+      { id: 'Start_1', type: 'startEvent' },
+      {
+        id: 'Sub_1',
+        type: 'subProcess',
+        nodes: [
+          { id: 'S_Start', type: 'startEvent' },
+          { id: 'S_Task', type: 'userTask', extension: userApprovalOf('u_child') },
+          { id: 'S_End', type: 'endEvent' },
+        ],
+        flows: [
+          { id: 'fs1', from: 'S_Start', to: 'S_Task' },
+          { id: 'fs2', from: 'S_Task', to: 'S_End' },
+        ],
+      },
+      { id: 'Task_2', type: 'userTask', extension: userApprovalOf('u_boss') },
+      { id: 'End_1', type: 'endEvent' },
+    ],
+    [
+      { id: 'f1', from: 'Start_1', to: 'Sub_1' },
+      { id: 'f2', from: 'Sub_1', to: 'Task_2' },
+      { id: 'f3', from: 'Task_2', to: 'End_1' },
+    ],
+  );
+  const store = m.createMemoryStore();
+  const engine = m.createEngine({
+    definitionSource: { async getDefinition(pid, v) { return pid === 'Process_1' && v === 1 ? def : null; } },
+    store,
+    clock: () => T18,
+  });
+  const id = await engine.start('Process_1', { definitionVersion: 1, starter: 'u_0' });
+
+  const live = (s) => s.tokens.filter((t) => t.state === 'active');
+  let st = await store.load(id);
+  eq(live(st)[0].nodeId, 'Sub_1/S_Task', '展开后落点 = 内嵌的 userTask');
+  eq(live(st)[0].assignee, 'u_child', '内嵌节点的办理人');
+
+  await engine.submit(id, { action: 'approve', actor: 'u_child', at: T18 });
+  st = await store.load(id);
+  eq(live(st)[0].nodeId, 'Task_2', '子流程出口 → 主流程下一节点');
+  assert(st.completedNodes.includes('Sub_1/S_Task'), 'completedNodes 应记内嵌节点');
+
+  await engine.submit(id, { action: 'approve', actor: 'u_boss', at: T18 });
+  st = await store.load(id);
+  eq(st.status, 'completed', '走完全程');
+});
+
+await checkAsync('T18 · CallActivity：版本绑定（INV-16）+ 子实例回归', async () => {
+  const main = defOf(
+    'Process_1',
+    [
+      { id: 'Start_1', type: 'startEvent' },
+      {
+        id: 'Call_1',
+        type: 'callActivity',
+        calledElement: 'Sub_Proc',
+        // ★ 版本必须在设计期**显式绑定**；引擎不取最新版
+        extension: { 'floken:call': { version: 1 } },
+      },
+      { id: 'Task_2', type: 'userTask', extension: userApprovalOf('u_boss') },
+      { id: 'End_1', type: 'endEvent' },
+    ],
+    [
+      { id: 'f1', from: 'Start_1', to: 'Call_1' },
+      { id: 'f2', from: 'Call_1', to: 'Task_2' },
+      { id: 'f3', from: 'Task_2', to: 'End_1' },
+    ],
+  );
+  const subOf = (v) =>
+    defOf(
+      'Sub_Proc',
+      [
+        { id: 'S_Start', type: 'startEvent' },
+        { id: `S_Task_v${v}`, type: 'userTask', extension: userApprovalOf(`u_v${v}`) },
+        { id: 'S_End', type: 'endEvent' },
+      ],
+      [
+        { id: 'g1', from: 'S_Start', to: `S_Task_v${v}` },
+        { id: 'g2', from: `S_Task_v${v}`, to: 'S_End' },
+      ],
+    );
+
+  const store = m.createMemoryStore();
+  const engine = m.createEngine({
+    definitionSource: {
+      async getDefinition(pid, v) {
+        if (pid === 'Process_1' && v === 1) return main;
+        if (pid === 'Sub_Proc' && v === 1) return subOf(1);
+        if (pid === 'Sub_Proc' && v === 2) return subOf(2); // ★ 存在更新的版本，但绑定的是 1
+        return null;
+      },
+    },
+    store,
+    clock: () => T18,
+  });
+  const id = await engine.start('Process_1', { definitionVersion: 1, starter: 'u_0' });
+
+  const parent = await store.load(id);
+  eq(parent.childInstanceIds.length, 1, '父实例记下了子实例');
+  eq(parent.tokens.filter((t) => t.state === 'waiting').length, 1, '父令牌在 callActivity 上等待');
+
+  const childId = parent.childInstanceIds[0];
+  const child = await store.load(childId);
+  eq(child.processId, 'Sub_Proc', '子实例的 processId');
+  eq(child.definitionVersion, 1, '★ 子实例用的是**绑定**的 v1（v2 存在也不理）');
+  eq(child.parent.instanceId, id, '子实例指回父实例');
+  eq(child.tokens[0].nodeId, 'S_Task_v1', '子实例停在 v1 的那个节点');
+
+  await engine.submit(childId, { action: 'approve', actor: 'u_v1', at: T18 });
+  eq((await store.load(childId)).status, 'completed', '子实例终态');
+
+  const woken = await store.load(id);
+  eq(woken.tokens.filter((t) => t.state === 'active')[0].nodeId, 'Task_2', '父实例被唤醒并继续');
+  eq(woken.lastAction.name, 'callActivityReturn', '★ 审计记的是"子流程回归"，不是"某人审批"');
+
+  await engine.submit(id, { action: 'approve', actor: 'u_boss', at: T18 });
+  eq((await store.load(id)).status, 'completed', '主流程走完');
+});
+
+await checkAsync('T18 · 未实现的活动（transaction）→ 显式抛并指名 FR-E13', async () => {
+  const def = defOf(
+    'Process_1',
+    [
+      { id: 'Start_1', type: 'startEvent' },
+      { id: 'T_1', type: 'transaction' },
+      { id: 'End_1', type: 'endEvent' },
+    ],
+    [
+      { id: 'f1', from: 'Start_1', to: 'T_1' },
+      { id: 'f2', from: 'T_1', to: 'End_1' },
+    ],
+  );
+  const engine = m.createEngine({
+    definitionSource: { async getDefinition(pid, v) { return pid === 'Process_1' && v === 1 ? def : null; } },
+    store: m.createMemoryStore(),
+    clock: () => T18,
+  });
+  let err = null;
+  try {
+    await engine.start('Process_1', { definitionVersion: 1, starter: 'u_0' });
+  } catch (e) {
+    err = e;
+  }
+  eq(err?.code, 'ENGINE_STATE_SHAPE_INVALID', 'transaction 的错误码');
+  assert(String(err?.details?.owner).includes('FR-E13'), `owner 应指名 FR-E13，实得 ${err?.details?.owner}`);
+});
+
+check('T18 · 门 2 需要的两个出口已公开；`nodes/activities` 其余内部未泄漏', () => {
+  eq(typeof m.callReturnOf, 'function', 'callReturnOf（门 2 完成子流程回归）');
+  eq(m.CALL_RETURN_ACTION, 'callActivityReturn', 'CALL_RETURN_ACTION');
+  const leaked = [
+    'activityBehaviorOf',
+    'assertActivitySupported',
+    'expandSubProcesses',
+    'parkForCall',
+    'callInstanceIdOf',
+    'callTargetOf',
+    'SUBPROCESS_EXIT_TYPE',
+    'SUBPROCESS_PATH_SEP',
+    'CALL_EXT_KEY',
+  ].filter((k) => k in m);
+  eq(leaked.length, 0, `被意外导出：${leaked.join(', ') || '无'}`);
+});
+
 // ---------------- 汇总 ----------------
 
 let failed = 0;

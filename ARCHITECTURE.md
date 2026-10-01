@@ -285,6 +285,12 @@ interface InstanceStateBody {
   variables: Record<string, unknown>;
   auditTrail: AuditEntry[];              // ★ 合规主源：任何状态变更都追加一条
   childInstanceIds?: string[];           // CallActivity 子实例（不新增接口）
+  parent?: InstanceParent;               // ★ T18：本实例是某个 CallActivity 的子实例时的回归指针
+}
+
+/** ★ T18：只带定位三元组，不带状态副本（父实例此刻什么样必须现读） */
+interface InstanceParent {
+  instanceId: string; nodeId: string; tokenId: string;
 }
 
 type InstanceState = InstanceStateHeader & InstanceStateBody;
@@ -379,7 +385,7 @@ interface ConvergeCtx {
 | INV-13 | 多实例展开前 `ApproverSource.resolve()` 必须已成功；`onEmpty:'error'` 时解析为空集 → **必须抛错**，不得产生 0 办待人却 `active` 的节点 | 令牌创建前 | `runtime/loop.ts` | `AC-` 空集负向测试 |
 | INV-14 | `JSON.parse(JSON.stringify(state))` 与 `state` 深等（无函数 / Map / Set / 类实例 / `undefined` 键） | 任何状态产出后 | `core/state.ts` | `AC-E8` |
 | INV-15 | `delta.removed` 中每个 `taskId` 在投影 `apply()` 之后**必须查不到**；同 `delta` 重复 `apply` 结果不变 | 投影写入后 | `conformance/projection.ts` | `AC-E12` + 「removed 必须真删」断言 |
-| INV-16 | `CallActivity` 子实例的 `definitionVersion` = 设计期**显式绑定**的版本，不等于宿主最新版本 | 子实例创建时 | `nodes/activities.ts` | 版本绑定断言 |
+| INV-16 | `CallActivity` 子实例的 `definitionVersion` = 设计期**显式绑定**的版本，不等于宿主最新版本 | 子实例创建时 | `nodes/activities.ts`（`callTargetOf`）/ `runtime/engine.ts`（`doStartChild`） | 版本绑定断言 ✅ **T18 已验**（绑定 v1 而 v2 存在 → 子实例仍是 v1；未绑定 → 抛） |
 | INV-17 | `auditTrail.length ≤ maxAuditEntries`（配置后）；溢出部分走 `EventSink`，**不得静默丢弃** | 每次追加后 | `runtime/plan.ts` | 上限测试 + 溢出可见性断言 |
 | INV-18 | `pendingProjectionRev` 存在 ⟺ 该 `rev` 的投影尚未追平；`load()` 发现该键 → **必须先 `sync()` 补做**，完成后删除键 | `load()` 时 | `runtime/engine.ts` | 补偿路径测试（模拟 apply 失败） |
 
@@ -460,7 +466,7 @@ interface ActionInput {
 `plan()` 是其中**唯一含状态演化逻辑**的那一步，且必须是纯的。**两条路径的状态演化必须完全一致**（不许出现"走 submit 和走 plan 得到不同 next"）。
 
 > **T11 已落地 `start` / `submit` / `plan`；T12 已补齐九个槽位中的 ⑤⑧⑨**（2026-10-01）。
-> `deliverMessage` / `deliverSignal`（T20）与 `exportTrace`（T18）尚未实现 ——
+> `deliverMessage` / `deliverSignal`（T20）与 `exportTrace`（T22）尚未实现 ——
 > 公开的 `Engine` 接口**刻意不提前声明**它们（声明了就得给实现）。
 
 ### 7.2 11 项 SPI（与业务的全部接触面）
@@ -987,7 +993,7 @@ class EngineError extends Error {
   把 `rev` CAS 当主防线用是设计错误，见 ADR-004）。
 
   ⚠️ **能力边界（诚实标注）**：多出向路由（D-22）/ 原语级审计（D-23）
-  / `deliver*` 与 `exportTrace`（T18、T20）均未实现 —— 全部表现为**显式抛错**而非静默降级。
+  / `deliver*`（T20）与 `exportTrace`（T22）均未实现 —— 全部表现为**显式抛错**而非静默降级。
 
 - [x] **T12 事件发射（节点级 5 + 实例级 5）与门 1 钩子**
   组件：`runtime/emit.ts` / `core/hooks.ts`
@@ -1133,10 +1139,25 @@ class EngineError extends Error {
   `serviceTask` 的**失败重试属内核外**（D-58，与超时 / 暂存同族 —— 内核内重试会让 `plan()` 不纯
   且放大副作用），由宿主在 handler 内或经 `Scheduler` 自行实现。
 
-- [ ] **T18 活动 / 子流程 4 类**
-  组件：`nodes/activities.ts`
+- [x] **T18 活动 / 子流程 4 类**
+  组件：`nodes/activities.ts` + `nodes/graph.ts`（接入展开）+ `runtime/engine.ts`（子实例链路）
   依赖：T16, T17
   验证：`SubProcess` 子令牌树正确归并；`CallActivity` **版本绑定**（**INV-16**）+ `childInstanceIds` 记录；`AC-E1~E16` 全量回归**全绿**（阶段出口）
+  **实现要点**（详见 §10 的 T18 行）：
+  ① **内嵌子流程在建图时拍平**（`expandSubProcesses`）—— 不是运行期另起一套"子令牌树"。
+     所谓"子令牌树"在本引擎里就是**令牌走进展开后的那几个节点**，于是 `nextOf` / `reachable` /
+     网关汇聚 / `completedNodes` / `tasksOf` **一行都不用改**；展开后 `Sub_1` 自身不再是节点。
+  ② **内嵌 `endEvent` 改写成 `SUBPROCESS_EXIT_TYPE`** —— 不改的话令牌到达内嵌结束事件会被判
+     **终结**，子流程出口后面的节点永远走不到，且没有任何报错（最难查的一类静默截断）。
+  ③ **`CallActivity` = 子实例 + 等待 + 自动回归**。子实例 id **确定性**（`callInstanceIdOf`，
+     重入加序号防 `ALREADY_EXISTS`）；父令牌 `waiting`（不是待办）；子实例终态 → `resumeParent()`
+     沿 `parent.tokenId` 放行并推进；父实例终态 → `haltLiveChildren()` 连坐终止在跑的子实例。
+  ④ **★ 后续动作一律在 `queue.run()` 之外做**（`followUp()`）—— 子实例常常**一建就跑完**，
+     于是要回头唤醒父实例；若这段留在父实例的队列里就是「父等子、子等父」的**自锁**
+     （`runtime/queue.ts` 档首写明不支持重入，且要求"在 engine 层拦"）。
+  ⑤ **版本绑定读 `extension['floken:call'].version`，缺即抛**（INV-16）—— 绝不回退到"最新版"。
+  ⑥ `AdHocSubProcess` / `Transaction` / 事件子流程（`triggeredByEvent`）→ 显式抛并指名归属
+     FR-E18 / FR-E13 / FR-E24。
 
 ### 阶段 E7 · 子流程 / 调用活动深化（v1.x）
 
@@ -1188,6 +1209,7 @@ class EngineError extends Error {
 | 2026-09-30 | **D-13 落地**：测试代码纳入类型检查 —— 新增 `tsconfig.test.json`（Bundler 解析），`check:types` 改跑 **2 个 project**；`06` §3/§6 写死形制。**反向验收**：注入类型错误 → 新口径红、旧口径不红 | §9 / §10 / `06` | D-13 | `verify` 输出「check:types — 2 个 project（src + test）」 |
 | 2026-09-30 | **T9 落地**：`actions/{catalog,compile,gates}.ts` —— 19 项动作映射表（20 个可提交名字）、设计期开关校验（DV-2/3/5、AC-E2/E15）；与 `03` §4 主表**逐字对账**；公开面只导出动作名与 `enabledActionNames` | §5 / §9 / §10 | T9 / D-18 | `verify` PASSED + 探针 **29/29** + **274 单测** + `src+test` 类型检查 0 err（本轮 D-13 抓出 5 处写错的码名） |
 | 2026-10-01 | **T16 落地**：`nodes/events.ts`（事件 6 类）+ `nodes/gateways.ts`（网关 5 类）+ `runtime/loop.ts` 的分叉 / 汇聚 + `runtime/engine.ts` 的条件接线；**D-49** 汇聚判据改为图可达性（包容网关不再死锁）、**D-50** 合流必须在推进之前、**D-51** 条件走惰性解析 + `ConditionUnresolved` 哨兵重跑、**D-53** `Token.branch` 收口 **D-47**（并行下 `rollbackTo` 只撤本分支）、**D-55** `payload` 在探测之前并入；**482 单测** + 探针 **60/60** | §5 / §9 / §10 | T16 / D-42 / D-47 / D-48~D-55 | `verify` PASSED + 两个 project 类型检查 0 err |
+| 2026-10-01 | **T18 落地**：`nodes/activities.ts`（活动 / 子流程 4 类）+ `nodes/graph.ts` 接入内嵌展开 + `runtime/engine.ts` 的子实例链路。内嵌子流程**在建图时拍平**（内嵌 `endEvent` → `subProcessExit`，否则令牌会被判终结、出口后的节点永远走不到）；`CallActivity` = **子实例 + 等待 + 自动回归**（子实例 id 确定性、父令牌 `waiting`、子实例终态唤醒父实例、父实例终态连坐终止子实例）；★ 后续动作一律放在 `queue.run()` **之外**（否则「子实例一建就跑完 → 回头唤醒父实例」= 自锁）；版本绑定读 `extension['floken:call'].version`，**缺即抛**（INV-16）；`AdHocSubProcess` / `Transaction` / 事件子流程显式抛并指名 FR-E18 / FR-E13 / FR-E24。另补 **AC-E1 巡检**（20 个可提交名逐个不得抛 `ACTION_UNKNOWN` + 反证）；**572 单测** + 探针 **73/73** | §5 / §6.1 / §7.1 / §9 / §10 | T18 / INV-16 / D-62~D-66 | `verify` PASSED + 两个 project 类型检查 0 err |
 | 2026-10-01 | **T17 落地**：`nodes/tasks.ts`（任务 8 类）+ `nodes/flows.ts`（连线与数据 4 类）+ `eval/script.ts`（FEEL 脚本求值）+ 副作用接线（`LoopContext.effectsOf` + `NodeEffectUnresolved` 哨兵重跑）；**D-56** `sendTask` 与 `intermediateThrowEvent` 同处置（显式抛错，ADR-006 事件集定死 10 个）、**D-57** 非 FEEL 脚本先查 `handlers` 表、**D-58** 服务重试归内核外、**D-59** FEEL 结果落 `variables[nodeId]`、**D-60** 副作用按 `${nodeId}::${tokenId}` 缓存且条件取「此刻」变量快照、**D-61** 源码扫描必须去注释；**538 单测** + 探针 **69/69** | §5 / §7.3 / §9 / §10 | T17 / D-52 / D-56~D-61 | `verify` PASSED + 两个 project 类型检查 0 err（产物层双层扫描：无 `new Function` / `node:vm` / `eval(`） |
 | 2026-10-01 | **D-21 / D-31 在模型层修根因**：`floken-moddle` 的 `shouldTerminate()` 重排规则序（先按 `mode` 判，`pending === 0` 的多数决兜底只对票签生效）；引擎侧 `convergence.ts` 的 `mode:'all' && rejected>0` 短路**整块删除**，对账测试取消例外格改为逐格全一致（>300 组）；**482 单测** + 探针 **60/60** | §5 / §9 / §10 | D-19 / D-21 / D-31 | `verify` PASSED + 两个 project 类型检查 0 err（moddle 侧 299 单测全绿 + dist 已重建同步） |
 | 2026-10-01 | **T15 落地**：`CompiledAction.post` + `runtime/loop.ts` 的 `applyPost()` —— **AC-E6 委派回归**（B 办完回到 A、节点不变、A 再办才推进）、**AC-E7 转办**（`nodeId` 不变、不留回归路径）、`takeBack` / `revoke` 回滚下游（截断 + 取消在途 + 差分精确点名）；**D-34 收口**（组内回退 = 整组重来 + 解散组）；**440 单测** + 探针 **56/56** | §7.1 / §9 / §10 | T15 / D-34 / D-44~D-47 | `verify` PASSED + 两个 project 类型检查 0 err |
@@ -1262,3 +1284,8 @@ class EngineError extends Error {
 | **D-59** | **FEEL 脚本的结果落在 `variables[nodeId]`** | BPMN 的结果变量走 `ioSpecification` / `dataOutput`，而模型层（L3）未兑现该字段 —— 此处不发明扩展键（那要动模型层并跨包发版），也**不静默丢弃结果**（脚本白跑）。按「节点 id」落，可推导、可追溯；将来 `ioSpecification` 兑现时改为「优先取它、缺省回退 nodeId」，不破坏已有流程 | ✅ 已落地（`eval/script.ts` + `resolveEffect`）。注意与**条件**的处置相反：脚本结果是**数据**，`null` 照写（三值语义的合法值）；条件必须收敛成二值，`null` 必抛（D-38） |
 | **D-60** ⚠️ | **副作用外源解析 + 按 `${nodeId}::${tokenId}` 缓存；条件上下文取「此刻」变量快照** | 两条缺一都会出事：① **不缓存** ⇒ 惰性解析每重跑一轮就调一次宿主（同一封邮件发 N 次）；② **缓存键不含 `tokenId`** ⇒ 并行分支上两个令牌同时到达同一个 `serviceTask`，第二个拿到第一个的结果；③ **条件哨兵不带变量快照** ⇒ 解析用的是提交前的旧变量，于是「`scriptTask` 把 amount 改成 9000、网关却按旧值走分支」—— §7.2 头号事故换一副面孔出现 | ✅ 已落地（`nodes/tasks.ts` 的 `NodeEffectUnresolved` + `eval/condition.ts` 的 `ConditionUnresolved.variables` + `engine.ts` 的 `effects` / `conditions` 两个 Map）。探针与单测各有「handler 只被调 1 次」与「落在高分分支」两条断言 |
 | **D-61** | **「禁止动态执行」的源码扫描必须去掉注释再扫** | 本包的注释里**正大光明地写着**「禁止 `eval` / `new Function` / `node:vm`」（那是规格引用）。不去注释的话，门禁会因为"文档里提到了它"而红 —— 那等于逼着实现把红线说明从注释里删掉，本末倒置。另：`engine.ts` 里那条错误提示的**字符串字面量**也不逐字写这三个名字（同样原因） | ✅ 已落地（`test/tasks.test.ts` 的 `stripComments` + 探针扫 `dist/*.js`，产物层已无注释故直接扫） |
+| **D-62** ⚠️ | **`AuditEntry.action` 出现第三类取值**：`callActivityReturn`（子实例回归） | `03` §9.1 原文写「19 项动作名 或 内核原语名」，而"子实例自己跑完了"既不是用户提交的动作、也不是某个原语。若复用 `approve` 之类就等于**伪造一条操作记录** —— 审计是合规主源，这条不能凑 | ✅ 已落地（常量 `CALL_RETURN_ACTION`）。门 2 下宿主完成回归时须传**同一个名字**，审计才对得上。⏳ 待回写 `03` §9.1 的注释 |
+| **D-63** ⚠️ | **`CallActivity` 的版本绑定落在 `extension['floken:call'].version`，没有即抛** | BPMN **没有**"被调用版本"这个标准属性（Camunda 用自家 `calledElementVersion`，不是 OMG 的），模型层也无对应一等字段。而 INV-16 要求**设计期显式绑定** —— 引擎若回退"最新版"，就是「主流程没改、子流程悄悄换版，在途实例行为随发布而变」，且**没有任何报错**（AC-E10 要防的正是这个） | ✅ 已落地（`nodes/activities.ts` 的 `callTargetOf`）。⏳ 待模型层把它升成一等字段（届时本档只需改取值处，语义不变） |
+| **D-64** ⚠️ | **内嵌 `endEvent` 在展开时改写为 `subProcessExit`** | 不改的话 `runToWait` 一见 `endEvent` 就把令牌判**终结** —— 子流程出口后面的节点永远走不到，且没有任何报错（比抛错难查得多）。这是"拍平"方案唯一的语义陷阱 | ✅ 已落地（`SUBPROCESS_EXIT_TYPE`，落到自动直通）。测试钉住「内嵌结束事件的 `type` **不是** `endEvent`」 |
+| **D-65** ⚠️ | **`CallActivity` 的后续动作必须在 `queue.run()` 之外**（`followUp()`） | 子实例**一建就跑完**（被调用流程里没有人工节点）是常态，于是要回头唤醒父实例。若这段留在父实例的队列里就是「父等子、子等父」的**自锁** —— 而 `runtime/queue.ts` 档首写明**刻意不做重入检测**，并点名"应在 engine 层拦" | ✅ 已落地（`submit` = `queue.run(doSubmit)` → `followUp`；`startChild` / `resumeParent` 各自入**自己的**队列）。顺序：父队列已返回 → 建子实例 → 子实例终态 → 再入父队列唤醒 |
+| **D-66** ⚠️ | **父实例终态必须连坐终止在跑的子实例**（`haltLiveChildren`） | 父实例一终止，`resumeParent()` 就**永远不会**再触发 —— 子实例会继续产生待办，而宿主看主流程已是终态。「案子都撤了、子流程还在催人审批」是这类引擎的典型事故，且**没有任何报错** | ✅ 已落地（终止子实例 + 取消在途令牌 + 投影移除待办 + 递归到孙实例） |

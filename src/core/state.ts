@@ -176,6 +176,30 @@ export interface InstanceStateHeader {
 
 // ---------------- 体 ----------------
 
+/**
+ * ★ `CallActivity` 子实例指回父实例的指针（T18）。
+ *
+ * 只带**定位用的三元组**，不带状态副本：子实例结束时要靠它把父实例里那条
+ * 停在 `callActivity` 上的令牌唤醒，而"父实例现在什么样"必须**现读**（读快照、CAS 写），
+ * 缓存一份下来就是典型的脏读。
+ *
+ * ⚠️ 与 `childInstanceIds` 是**两个方向**的记录：父记"我起了哪些子实例"（终止时要连坐），
+ *   子记"我该回哪里去"（结束时要唤醒）。缺任何一条，父子之间就会断。
+ */
+export interface InstanceParent {
+  readonly instanceId: string;
+  /** 父实例上那个 `callActivity` 节点 */
+  readonly nodeId: string;
+  /** 父实例上停在那个节点的令牌（**令牌 id 在实例内唯一**，故它是可靠的定位键） */
+  readonly tokenId: string;
+}
+
+/**
+ * 实例状态 —— **分两层**（§6.1）。
+ *
+ * ⚠️ 本接口是 `Header` 与 `Body` 的交叉类型，字段**不分组**存放；
+ * 取 Header 用 `headerOf()`（逐字段列举，绝不用 rest 解构）。
+ */
 export interface InstanceStateBody {
   /** 引擎内部结构，宿主当不透明 JSON */
   tokens: Token[];
@@ -196,6 +220,8 @@ export interface InstanceStateBody {
   starter?: string;
   /** `CallActivity` 子实例（不新增接口） */
   childInstanceIds?: string[];
+  /** ★ 本实例是某个 `CallActivity` 的子实例时的回归指针；父实例**没有**本字段 */
+  parent?: InstanceParent;
 }
 
 export type InstanceState = InstanceStateHeader & InstanceStateBody;
@@ -428,6 +454,23 @@ export function assertInstanceState(state: InstanceState, path = '$'): void {
     if (!isNonEmptyString(state.completedNodes[i])) {
       fail(`completedNodes[${i}] must be a non-empty string`);
     }
+  }
+
+  if (state.childInstanceIds !== undefined) {
+    if (!Array.isArray(state.childInstanceIds)) fail('childInstanceIds must be an array when present');
+    for (let i = 0; i < state.childInstanceIds.length; i += 1) {
+      if (!isNonEmptyString(state.childInstanceIds[i])) {
+        fail(`childInstanceIds[${i}] must be a non-empty string`);
+      }
+    }
+  }
+
+  const p = state.parent;
+  if (p !== undefined) {
+    if (p === null || typeof p !== 'object') fail('parent must be an object when present');
+    if (!isNonEmptyString(p.instanceId)) fail('parent.instanceId must be a non-empty string');
+    if (!isNonEmptyString(p.nodeId)) fail('parent.nodeId must be a non-empty string');
+    if (!isNonEmptyString(p.tokenId)) fail('parent.tokenId must be a non-empty string');
   }
 
   if (!isPlainObject(state.variables)) fail('variables must be a plain object');

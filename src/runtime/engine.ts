@@ -24,7 +24,7 @@
  *      `ctx.next`（宿主最常见的用法是「看下下一步是谁再决定要不要放行」）。
  *   ⑨ 事件在**最后**且**不 await**：`EventSink` 的语义是「丢了不影响流程」（ADR-006）。
  *
- * ⚠️ `deliverMessage` / `deliverSignal` / `exportTrace` 属 T20 / T18，不在本档。
+ * ⚠️ `deliverMessage` / `deliverSignal` / `exportTrace` 属 T20 / T22，不在本档。
  */
 
 import type { ApproverSpec } from '@floken-io/moddle';
@@ -61,12 +61,14 @@ import type {
   StateStore,
   TaskProjection,
 } from '../core/spi.js';
-import type { ActionRecord, InstanceState, Token } from '../core/state.js';
+import type { ActionRecord, AuditEntry, InstanceParent, InstanceState, Token } from '../core/state.js';
 import { STATE_SCHEMA_VERSION, cloneState, headerOf, isTerminalStatus } from '../core/state.js';
 import type { TaskDelta } from '../core/task.js';
 import type { EngineEvent, TaskEvent } from '../core/events.js';
 import { assertTokensInGraph, createProcessGraph } from '../nodes/graph.js';
 import type { OutFlow, ProcessGraph } from '../nodes/graph.js';
+import { CALL_RETURN_ACTION, callReturnOf } from '../nodes/activities.js';
+import type { PendingCall } from '../nodes/activities.js';
 import type { NodeEffect, TaskEffectKind } from '../nodes/tasks.js';
 import {
   asUnresolvedEffect,
@@ -379,6 +381,8 @@ export function createEngine(config: EngineConfig): Engine {
     readonly apply: (draft: InstanceState) => InstanceState;
     /** ★ 本次推进里由节点副作用产出的事件（**槽位 9** 投递，见 `pendingEvents` 注释） */
     readonly pendingEvents: readonly EngineEvent[];
+    /** ★ 本次推进里停在 `callActivity` 上、待建的子实例（T18；与 `pendingEvents` 同套路） */
+    readonly pendingCalls: readonly PendingCall[];
   }> {
     const { state, calls, graph, at, record } = params;
     const stepInput: StepInput = {
@@ -427,6 +431,8 @@ export function createEngine(config: EngineConfig): Engine {
 
     /** ★ 副作用产出的事件；由 `start()` / `submit()` 在槽位 9 统一投递 */
     const pendingEvents: EngineEvent[] = [];
+    /** ★ 待建的子实例（`callActivity`）；由 `start()` / `submit()` 在**队列之外**兑现 */
+    const pendingCalls: PendingCall[] = [];
 
     for (let round = 0; ; round += 1) {
       try {
@@ -453,15 +459,18 @@ export function createEngine(config: EngineConfig): Engine {
 
         return {
           pendingEvents,
+          pendingCalls,
           apply: (draft: InstanceState): InstanceState => {
             const r = step(
               draft,
               { graph, at, assigneesOf: (nodeId) => resolved.get(nodeId) ?? [], conditionsOf, effectsOf },
               stepInput,
             );
-            // 只有**真值跑**产出的事件算数：探测跑的结果一律丢弃（它可能被重试掉）
+            // 只有**真值跑**产出的东西算数：探测跑的结果一律丢弃（它可能被重试掉）
             pendingEvents.length = 0;
             for (const e of r.events) pendingEvents.push(e);
+            pendingCalls.length = 0;
+            for (const c of r.pendingCalls) pendingCalls.push(c);
             return r.next;
           },
         };
@@ -572,123 +581,359 @@ export function createEngine(config: EngineConfig): Engine {
      *    那时也拿得到更完整的上下文。
      */
     emitAll(sink, [...eventsOf({ before: [], delta, next }), ...built.pendingEvents]);
+
+    /*
+     * ★ 后续动作（建子实例 / 唤醒父实例）**不在队列里做** —— 见 `followUp()` 档首。
+     *   发起本身不入队（实例此刻还不存在，没有可串行的对象），故这里直接调。
+     */
+    await followUp(next, { next, pendingCalls: built.pendingCalls });
     return instanceId;
   }
 
   async function submit(instanceId: string, action: ActionInput): Promise<TaskDelta> {
     // 槽位 0：per-instance FIFO 串行（NFR-E5 主防线）—— 同实例的两次提交永不交错
-    return queue.run(instanceId, async () => {
-      assertActionInput(action, 'action');
+    const outcome = await queue.run(instanceId, () => doSubmit(instanceId, action));
+    await followUp(outcome.next, outcome);
+    return outcome.delta;
+  }
 
-      // 槽位 1
-      const state = await store.load(instanceId);
-      if (state === null || state === undefined) throw stateNotFound(instanceId);
+  /**
+   * `submit()` 的**受队列保护**的那一段（槽位 0~9）。
+   *
+   * 拆出来是为了让「后续动作」落在队列**之外** —— 详见 `followUp()`。
+   */
+  async function doSubmit(
+    instanceId: string,
+    action: ActionInput,
+  ): Promise<AdvanceOutcome & { readonly delta: TaskDelta }> {
+    // 槽位 1
+    const state = await store.load(instanceId);
+    if (state === null || state === undefined) throw stateNotFound(instanceId);
 
+    /*
+     * ★ INV-2 必须在**编译之前**判（不能只靠 `plan()` 里那道）：
+     *   终态实例一个活令牌都没有，`compileAction()` 会先撞上「无法唯一定位令牌」而抛
+     *   `STATE_SHAPE_INVALID` —— 真因（实例已结束）被包装成一条完全无关的错。
+     */
+    if (isTerminalStatus(state.status)) {
+      throw stateTerminal(state.instanceId, state.status, action.action);
+    }
+
+    // 槽位 3（ADR-007）：时间在调 plan() **之前**填好
+    const at = action.at ?? now();
+    const input: ActionInput = action.at === undefined ? { ...action, at } : action;
+
+    // 槽位 2 的前置：图纸与图（INV-3 的判定点）
+    const graph = await graphOf(state);
+    assertTokensInGraph(state, graph);
+
+    const tokenId = resolveSubjectToken(state, input);
+    const subject = tokenId === undefined ? undefined : state.tokens.find((t) => t.id === tokenId);
+    const nodeId = subject?.nodeId;
+    const approval = nodeId === undefined ? undefined : graph.approvalOf(nodeId);
+
+    // 槽位 2：受理校验 + 编译（换人 / 加签需要办理人，先解析）
+    const assignees = await resolveActionAssignees(input, nodeId, state, graph, approverSource);
+    const compiled = compileAction(input, state, {
+      approval,
+      nextOf: graph.nextOf,
+      startNodeId: graph.startNodeId,
+      ...(tokenId !== undefined ? { tokenId } : {}),
+      ...(assignees !== undefined ? { assignees } : {}),
+      ...(payloadString(input.payload, 'groupId') !== undefined
+        ? { groupId: payloadString(input.payload, 'groupId') as string }
+        : {}),
+      ...(payloadStringArray(input.payload, 'reduceTokenIds') !== undefined
+        ? { reduceTokenIds: payloadStringArray(input.payload, 'reduceTokenIds') as string[] }
+        : {}),
+    });
+
+    // 事件的字段来源：`removed` 只有 taskId，事件里的 nodeId / assignee 只能从旧视图取
+    const before = tasksOf(state, graph);
+
+    // 槽位 4（纯函数）：动作语义经 D-18 的接缝进来
+    /*
+     * ★ `record` 与 `plan()` 里的 `lastAction` **同一口径**（`{name, actor, at}`），
+     *   故节点副作用产出的事件与 `delta.action` 必然同源 —— 否则重放时对不上。
+     */
+    const record: ActionRecord = { name: input.action, actor: input.actor, at };
+    const built = await buildApply({
       /*
-       * ★ INV-2 必须在**编译之前**判（不能只靠 `plan()` 里那道）：
-       *   终态实例一个活令牌都没有，`compileAction()` 会先撞上「无法唯一定位令牌」而抛
-       *   `STATE_SHAPE_INVALID` —— 真因（实例已结束）被包装成一条完全无关的错。
+       * ★ 传给探测/闭包的是**已并入 payload 增量**的状态。
+       *   `plan()` 在 ④.5 先并变量、④.6 才调 `apply` —— 探测必须用同一份，
+       *   否则「表单里把 amount 改成 9000、网关却按旧值走分支」（§7.2 要防的头号事故）。
        */
-      if (isTerminalStatus(state.status)) {
-        throw stateTerminal(state.instanceId, state.status, action.action);
-      }
+      state: withPayload(state, input.payload),
+      calls: compiled.calls,
+      graph,
+      at,
+      record,
+      ...(compiled.vote !== undefined ? { vote: compiled.vote } : {}),
+      ...(compiled.post !== undefined ? { post: compiled.post } : {}),
+      ...(input.target !== undefined ? { rejectTarget: input.target } : {}),
+    });
+    const result = plan(state, input, {
+      clock,
+      ...(maxAuditEntries !== undefined ? { maxAuditEntries } : {}),
+      apply: built.apply,
+      tasks: (s) => tasksOf(s, graph),
+    });
 
-      // 槽位 3（ADR-007）：时间在调 plan() **之前**填好
-      const at = action.at ?? now();
-      const input: ActionInput = action.at === undefined ? { ...action, at } : action;
+    /*
+     * 槽位 5 / 8 共用的只读上下文。
+     * ★ `action` 取 `result.delta.action` —— 与 `lastAction` / `auditTrail` **同一份对象**，
+     *   宿主从三个通道看到的动作事实必然一致（各造一份就会在重放时对不上）。
+     */
+    const ctx = freezeActionContext({
+      action: result.delta.action,
+      state: headerOf(state),
+      next: headerOf(result.next),
+      delta: result.delta,
+    });
 
-      // 槽位 2 的前置：图纸与图（INV-3 的判定点）
-      const graph = await graphOf(state);
-      assertTokensInGraph(state, graph);
+    // 槽位 5：门 1 前钩子 —— **可否决**（在 save 之前，故否决 = 状态未变）
+    if (hooks?.beforeAction !== undefined) {
+      const verdict = await hooks.beforeAction(ctx);
+      if (verdict === false) throw actionVetoed(input.action, instanceId);
+    }
 
-      const tokenId = resolveSubjectToken(state, input);
-      const subject = tokenId === undefined ? undefined : state.tokens.find((t) => t.id === tokenId);
-      const nodeId = subject?.nodeId;
-      const approval = nodeId === undefined ? undefined : graph.approvalOf(nodeId);
+    // 槽位 6：唯一权威提交点（CAS）
+    await store.save(result.next, state.rev);
+    // 槽位 7：投影（可选）
+    if (projection !== undefined) await projection.apply(instanceId, result.delta);
+    // 槽位 8：门 1 后钩子 —— await 且**不吞**（至少一次，宿主幂等；失败时状态已落库）
+    if (hooks?.afterAction !== undefined) await hooks.afterAction(ctx);
 
-      // 槽位 2：受理校验 + 编译（换人 / 加签需要办理人，先解析）
-      const assignees = await resolveActionAssignees(input, nodeId, state, graph, approverSource);
-      const compiled = compileAction(input, state, {
-        approval,
-        nextOf: graph.nextOf,
-        startNodeId: graph.startNodeId,
-        ...(tokenId !== undefined ? { tokenId } : {}),
-        ...(assignees !== undefined ? { assignees } : {}),
-        ...(payloadString(input.payload, 'groupId') !== undefined
-          ? { groupId: payloadString(input.payload, 'groupId') as string }
-          : {}),
-        ...(payloadStringArray(input.payload, 'reduceTokenIds') !== undefined
-          ? { reduceTokenIds: payloadStringArray(input.payload, 'reduceTokenIds') as string[] }
-          : {}),
+    // 槽位 9：事件（不 await、失败不影响流程）
+    emitAll(
+      sink,
+      [
+        ...eventsOf({ before, delta: result.delta, next: result.next, previousStatus: state.status }),
+        // ★ 节点副作用产出的事件（`manualTask` 的留痕）—— 状态已落库，此刻投递才安全
+        ...built.pendingEvents,
+      ],
+    );
+
+    return { next: result.next, pendingCalls: built.pendingCalls, delta: result.delta };
+  }
+
+  // ---------------- ★ CallActivity：子实例的创建 / 回归 / 连坐终止（T18） ----------------
+
+  /**
+   * ★ 「后续动作」—— 建本次推进新产生的子实例 + 自己终态时的收尾。
+   *
+   * ⚠️ **必须在 `queue.run()` 之外调用**（这是本函数存在的全部理由）：
+   *   `queue` 是「链尾 + 影子 Promise」，**不支持重入**（`runtime/queue.ts` 档首写明了
+   *   「正确做法是在 engine 层拦，而不是改本档」）。而子实例一旦**立刻跑完**
+   *   （被调用的流程里没有人工节点 —— 真实场景里这是常态），就要**回头唤醒父实例**；
+   *   这段若留在父实例的队列里，就是「父等子、子等父」的**自锁**。
+   *
+   *   放到队列之外后顺序是这样：`queue.run(parent)` 已返回 → 建子实例（入**子实例**的队列）
+   *   → 子实例终态 → 再 `queue.run(parent)` 唤醒 —— 每一步开始时上一步的队列都已空，不会自锁。
+   */
+  async function followUp(parent: InstanceState, outcome: AdvanceOutcome): Promise<void> {
+    // ① 建本次推进新产生的子实例（顺序 = 定义顺序，故行为确定、可重放）
+    for (const call of outcome.pendingCalls) {
+      await startChild({
+        instanceId: call.instanceId,
+        processId: call.processId,
+        definitionVersion: call.definitionVersion,
+        variables: { ...call.variables },
+        starter: parent.starter ?? parent.instanceId,
+        ...(parent.tenantId !== undefined ? { tenantId: parent.tenantId } : {}),
+        parent: { instanceId: parent.instanceId, nodeId: call.nodeId, tokenId: call.tokenId },
       });
+    }
 
-      // 事件的字段来源：`removed` 只有 taskId，事件里的 nodeId / assignee 只能从旧视图取
-      const before = tasksOf(state, graph);
+    if (isTerminalStatus(outcome.next.status)) {
+      // ② 自己是别人的子实例 → 唤醒父实例
+      if (outcome.next.parent !== undefined) await resumeParent(outcome.next);
+      // ③ 自己终态 → 还没跑完的子实例一起停掉
+      await haltLiveChildren(outcome.next);
+    }
+  }
 
-      // 槽位 4（纯函数）：动作语义经 D-18 的接缝进来
-      /*
-       * ★ `record` 与 `plan()` 里的 `lastAction` **同一口径**（`{name, actor, at}`），
-       *   故节点副作用产出的事件与 `delta.action` 必然同源 —— 否则重放时对不上。
-       */
-      const record: ActionRecord = { name: input.action, actor: input.actor, at };
-      const built = await buildApply({
-        /*
-         * ★ 传给探测/闭包的是**已并入 payload 增量**的状态。
-         *   `plan()` 在 ④.5 先并变量、④.6 才调 `apply` —— 探测必须用同一份，
-         *   否则「表单里把 amount 改成 9000、网关却按旧值走分支」（§7.2 要防的头号事故）。
-         */
-        state: withPayload(state, input.payload),
-        calls: compiled.calls,
-        graph,
+  /** 建一个子实例（入它自己的队列，随后的 `followUp` 在队列之外） */
+  async function startChild(spec: ChildSpec): Promise<void> {
+    const outcome = await queue.run(spec.instanceId, () => doStartChild(spec));
+    await followUp(outcome.next, outcome);
+  }
+
+  /**
+   * 子实例的创建 —— 形状与 `start()` **逐字对齐**（同样的槽位、同样的事件、同样的审计首条），
+   * 差别只有三处：instanceId 由父实例**确定性**给定、初始变量是父实例那一刻的快照、多一个 `parent` 指针。
+   */
+  async function doStartChild(spec: ChildSpec): Promise<AdvanceOutcome> {
+    const at = now();
+    // ★ INV-16 的兑现处：按**绑定的版本**取图，不是"最新版"
+    const graph = await graphOf({
+      processId: spec.processId,
+      definitionVersion: spec.definitionVersion,
+    });
+
+    const base: InstanceState = {
+      instanceId: spec.instanceId,
+      processId: spec.processId,
+      definitionVersion: spec.definitionVersion,
+      status: 'running',
+      rev: 0, // ★ INSERT 信号
+      stateSchema: STATE_SCHEMA_VERSION,
+      startedAt: at,
+      updatedAt: at,
+      tokens: [{ id: 'tk_start', nodeId: graph.startNodeId, state: 'active' }],
+      completedNodes: [],
+      variables: { ...spec.variables },
+      auditTrail: [],
+      starter: spec.starter,
+      parent: spec.parent,
+    };
+    if (spec.tenantId !== undefined) base.tenantId = spec.tenantId;
+
+    const record: ActionRecord = { name: 'start', actor: spec.starter, at };
+    const built = await buildApply({ state: base, calls: [], graph, at, record });
+    const looped = built.apply(cloneState(base));
+
+    const next: InstanceState = {
+      ...looped,
+      rev: 1,
+      lastAction: record,
+      auditTrail: [{ seq: 1, at, actor: spec.starter, action: 'start', nodeId: graph.startNodeId }],
+    };
+    const delta: TaskDelta = {
+      rev: next.rev,
+      action: record,
+      added: tasksOf(next, graph),
+      removed: [],
+      changed: [],
+      instance: headerOf(next),
+    };
+
+    await store.save(next, 0); // INSERT
+    if (projection !== undefined) await projection.apply(spec.instanceId, delta);
+    // 与 `start()` 同款：**不触发门 1 `hooks`**（D-27）
+    emitAll(sink, [...eventsOf({ before: [], delta, next }), ...built.pendingEvents]);
+
+    return { next, pendingCalls: built.pendingCalls };
+  }
+
+  /** 子实例到终态 → 唤醒父实例那条停在 `callActivity` 上的令牌 */
+  async function resumeParent(child: InstanceState): Promise<void> {
+    const p = child.parent;
+    if (p === undefined) return;
+    const outcome = await queue.run(p.instanceId, () => doResumeParent(child, p));
+    if (outcome !== undefined) await followUp(outcome.next, outcome);
+  }
+
+  async function doResumeParent(
+    child: InstanceState,
+    p: InstanceParent,
+  ): Promise<AdvanceOutcome | undefined> {
+    const parent = await store.load(p.instanceId);
+    if (parent === null || parent === undefined) throw stateNotFound(p.instanceId);
+
+    /*
+     * ★ 父已终态 / 那条令牌已经不等了 → **静默返回**（这是正常路径，不是错误）：
+     *   「终止主流程时子流程还在跑」是真实场景，子实例随后自己结束，不该炸。
+     */
+    if (isTerminalStatus(parent.status)) return undefined;
+    const token = parent.tokens.find((t) => t.id === p.tokenId);
+    if (token === undefined || token.state !== 'waiting') return undefined;
+
+    const graph = await graphOf(parent);
+    const to = graph.nextOf(p.nodeId);
+    if (to === undefined) throw definitionMissing(parent.processId, parent.definitionVersion);
+
+    const at = now();
+    // 审计的 `actor` = **子实例最后那个操作人**（"张三办完子流程 → 父流程继续"）
+    const actor = child.lastAction?.actor ?? child.starter ?? child.instanceId;
+    const record: ActionRecord = { name: CALL_RETURN_ACTION, actor, at, nodeId: p.nodeId };
+
+    /*
+     * 探测用的基准状态 = **已放行**的父状态（`callReturnOf` 是纯函数，探测与真值跑同一份）。
+     */
+    const resumed = callReturnOf(parent, p, to);
+    const built = await buildApply({ state: resumed, calls: [], graph, at, record });
+    const before = tasksOf(parent, graph);
+    const result = plan(parent, { action: CALL_RETURN_ACTION, actor, at }, {
+      clock,
+      ...(maxAuditEntries !== undefined ? { maxAuditEntries } : {}),
+      apply: (draft) => built.apply(callReturnOf(draft, p, to)),
+      tasks: (s) => tasksOf(s, graph),
+    });
+
+    await store.save(result.next, parent.rev);
+    if (projection !== undefined) await projection.apply(p.instanceId, result.delta);
+    /*
+     * ⚠️ **刻意不触发门 1 `hooks`**：与 `start()` 同一判据（D-27）——
+     *   这不是一次用户提交，"可否决"没有意义（否决了子流程也已经跑完）。
+     */
+    emitAll(sink, [
+      ...eventsOf({ before, delta: result.delta, next: result.next, previousStatus: parent.status }),
+      ...built.pendingEvents,
+    ]);
+
+    return { next: result.next, pendingCalls: built.pendingCalls };
+  }
+
+  /** 自己终态 → 把还没跑完的子实例一起停掉 */
+  async function haltLiveChildren(parent: InstanceState): Promise<void> {
+    for (const childId of parent.childInstanceIds ?? []) await haltChild(childId);
+  }
+
+  /**
+   * ★ 停掉一个子实例（父实例已终态）。
+   *
+   * 为什么必须做：父实例一终止，`resumeParent()` 就**永远不会**再触发 —— 那些子实例
+   * 会继续产生待办，而宿主看主流程已经是终态了。「案子都撤了、子流程还在催人审批」
+   * 是这类引擎最典型的事故之一，且没有任何报错可循。
+   *
+   * ⚠️ 递归（孙实例）是在 `queue.run(childId)` 里调 `queue.run(grandchildId)` ——
+   *   **不同 key，不冲突**（`queue` 只保证同一个 key 串行）。
+   */
+  async function haltChild(childId: string): Promise<void> {
+    await queue.run(childId, async () => {
+      const child = await store.load(childId);
+      if (child === null || child === undefined) return;
+      if (isTerminalStatus(child.status)) return;
+
+      const at = now();
+      const record: ActionRecord = {
+        name: 'terminate',
+        actor: child.lastAction?.actor ?? child.starter ?? childId,
         at,
-        record,
-        ...(compiled.vote !== undefined ? { vote: compiled.vote } : {}),
-        ...(compiled.post !== undefined ? { post: compiled.post } : {}),
-        ...(input.target !== undefined ? { rejectTarget: input.target } : {}),
-      });
-      const result = plan(state, input, {
-        clock,
-        ...(maxAuditEntries !== undefined ? { maxAuditEntries } : {}),
-        apply: built.apply,
-        tasks: (s) => tasksOf(s, graph),
-      });
-
-      /*
-       * 槽位 5 / 8 共用的只读上下文。
-       * ★ `action` 取 `result.delta.action` —— 与 `lastAction` / `auditTrail` **同一份对象**，
-       *   宿主从三个通道看到的动作事实必然一致（各造一份就会在重放时对不上）。
-       */
-      const ctx = freezeActionContext({
-        action: result.delta.action,
-        state: headerOf(state),
-        next: headerOf(result.next),
-        delta: result.delta,
-      });
-
-      // 槽位 5：门 1 前钩子 —— **可否决**（在 save 之前，故否决 = 状态未变）
-      if (hooks?.beforeAction !== undefined) {
-        const verdict = await hooks.beforeAction(ctx);
-        if (verdict === false) throw actionVetoed(input.action, instanceId);
+      };
+      const next: InstanceState = {
+        ...cloneState(child),
+        status: 'terminated',
+        rev: child.rev + 1,
+        updatedAt: at,
+        endedAt: at,
+        lastAction: record,
+        tokens: child.tokens.map((t) =>
+          LIVE_TOKEN_STATES.includes(t.state) ? { ...t, state: 'cancelled' as const } : t,
+        ),
+        auditTrail: appendAudit(child.auditTrail, { at, actor: record.actor, action: record.name }),
+      };
+      if (maxAuditEntries !== undefined && next.auditTrail.length > maxAuditEntries) {
+        next.auditTrail = next.auditTrail.slice(next.auditTrail.length - maxAuditEntries);
       }
 
-      // 槽位 6：唯一权威提交点（CAS）
-      await store.save(result.next, state.rev);
-      // 槽位 7：投影（可选）
-      if (projection !== undefined) await projection.apply(instanceId, result.delta);
-      // 槽位 8：门 1 后钩子 —— await 且**不吞**（至少一次，宿主幂等；失败时状态已落库）
-      if (hooks?.afterAction !== undefined) await hooks.afterAction(ctx);
+      const graph = await graphOf(child);
+      const before = tasksOf(child, graph);
+      const delta: TaskDelta = {
+        rev: next.rev,
+        action: record,
+        added: [],
+        removed: before.map((t) => t.taskId),
+        changed: [],
+        instance: headerOf(next),
+      };
 
-      // 槽位 9：事件（不 await、失败不影响流程）
-      emitAll(
-        sink,
-        [
-          ...eventsOf({ before, delta: result.delta, next: result.next, previousStatus: state.status }),
-          // ★ 节点副作用产出的事件（`manualTask` 的留痕）—— 状态已落库，此刻投递才安全
-          ...built.pendingEvents,
-        ],
-      );
+      await store.save(next, child.rev);
+      if (projection !== undefined) await projection.apply(childId, delta);
+      emitAll(sink, eventsOf({ before, delta, next, previousStatus: child.status }));
 
-      return result.delta;
+      await haltLiveChildren(next);
     });
   }
 
@@ -842,6 +1087,37 @@ function manualTaskEvents(params: {
 }
 
 // ---------------- 内部 helpers ----------------
+
+/** 一次推进的产出 —— `followUp()` 的输入（建子实例 / 收尾都要它） */
+interface AdvanceOutcome {
+  /** 推进后的状态（**权威**：`childInstanceIds` / `parent` / 令牌的停等都在它上面） */
+  readonly next: InstanceState;
+  /** 本次推进里停在 `callActivity` 上、待建的子实例 */
+  readonly pendingCalls: readonly PendingCall[];
+}
+
+/** 建一个子实例所需的全部信息（instanceId 由父实例**确定性**给定） */
+interface ChildSpec {
+  readonly instanceId: string;
+  readonly processId: string;
+  readonly definitionVersion: number;
+  readonly variables: Readonly<Record<string, unknown>>;
+  readonly starter: string;
+  readonly tenantId?: string;
+  readonly parent: InstanceParent;
+}
+
+/** 追加一条审计（INV-4：`seq` 取现有最大值 +1，对已被裁剪的审计同样成立） */
+function appendAudit(
+  trail: readonly AuditEntry[],
+  entry: Omit<AuditEntry, 'seq'>,
+): AuditEntry[] {
+  let max = 0;
+  for (const e of trail) {
+    if (typeof e.seq === 'number' && e.seq > max) max = e.seq;
+  }
+  return [...trail, { ...entry, seq: max + 1 }];
+}
 
 /**
  * 并入本次提交的变量增量（与 `plan()` ④.5 **同一口径**）。

@@ -88,6 +88,47 @@ const input = (action: string, extra: Partial<ActionInput> = {}): ActionInput =>
   ...extra,
 });
 
+// ---------------- ★ AC-E1：20 个可提交名逐个都能进入受理路径 ----------------
+
+/**
+ * ★ AC-E1 的机器可判定部分：主表里的每个名字都**真的被受理路径认得**。
+ *
+ * 判据取「不抛 `ENGINE_ACTION_UNKNOWN`」：那是「这个名字不在主表里」的码。
+ * 一旦它出现在巡检里，就说明**表里写了一行、编译器却不认** ——
+ * 正是「19 项动作」这个对外承诺最怕的静默缺口。
+ *
+ * ⚠️ 其余的错（目标不合法 / 办理人为空 / 缺意见 / 未开启）都是**动作域**的正常拒绝，
+ *    它们恰恰证明这个动作被**认出来**了，故不算失败。
+ */
+const UNKNOWN_ACTION_CODE = ENGINE_ERROR_CODES.ACTION_UNKNOWN;
+
+describe('⑨ AC-E1：20 个可提交名逐个都能进入受理路径', () => {
+  it('每个名字要么编译成功，要么抛**动作域**的错；绝不抛 `ACTION_UNKNOWN`', () => {
+    const unknownCode = UNKNOWN_ACTION_CODE;
+    for (const name of ACTION_NAMES) {
+      const needsTarget = (ROLLBACK_ACTIONS as readonly string[]).includes(name);
+      let code: string | null = null;
+      try {
+        compileAction(
+          input(name, {
+            comment: '自动化 AC-E1 巡检',
+            ...(needsTarget ? { target: 'Task_1' } : {}),
+          }),
+          state(),
+          fullCtx(),
+        );
+      } catch (e) {
+        code = (e as { code?: string }).code ?? null;
+      }
+      expect(code, `动作 '${name}' 被当成了未知动作（${code}）`).not.toBe(UNKNOWN_ACTION_CODE);
+    }
+  });
+
+  it('★ 反证：表里没有的名字 → `ACTION_UNKNOWN`（上面的"不是该码"才有意义）', () => {
+    expectCode(() => compileAction(input('noSuchAction'), state(), fullCtx()), UNKNOWN_ACTION_CODE);
+  });
+});
+
 // ---------------- ① 表行数自检不变式 ----------------
 
 describe('① 主表口径自检（`03` §192~197）', () => {

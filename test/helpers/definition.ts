@@ -34,6 +34,21 @@ export interface TestNode {
   implementation?: string;
   /** `operationRef`（`serviceTask` 的 handler 查找键） */
   operationRef?: string;
+  /**
+   * T18：内嵌子流程的**内嵌元素**（`FlowNode.nodes` / `flows`）。
+   * 给了它（且 `triggeredByEvent` 不为 true）→ 建图时会被**展开**成父图的一部分。
+   */
+  nodes?: readonly TestNode[];
+  flows?: readonly TestFlow[];
+  /** `triggeredByEvent`（事件子流程 → 不展开，运行期显式抛错，FR-E24 / T21） */
+  triggeredByEvent?: boolean;
+  /** `calledElement`（`callActivity`：被调用流程的 processId） */
+  calledElement?: string;
+  /**
+   * `floken:call` 扩展（`callActivity` 的**版本绑定**，INV-16）。
+   * 缺它 → 建图 / 推进时抛（引擎**不**替宿主取最新版）。
+   */
+  call?: Record<string, unknown>;
 }
 
 export interface TestFlow {
@@ -45,37 +60,53 @@ export interface TestFlow {
   condition?: string;
 }
 
-export function makeDefinition(opts: {
-  id?: string;
-  version?: number;
-  nodes: readonly TestNode[];
-  flows: readonly TestFlow[];
-}): ProcessDefinition {
-  const nodes: FlowNode[] = opts.nodes.map((n) => {
+function buildNodes(list: readonly TestNode[]): FlowNode[] {
+  return list.map((n) => {
     const node: Record<string, unknown> = { id: n.id, type: n.type };
     if (n.name !== undefined) node.name = n.name;
     if (n.formKey !== undefined) node.formKey = n.formKey;
     if (n.defaultFlow !== undefined) node.defaultFlow = n.defaultFlow;
     if (n.approval !== undefined) node.extension = { 'floken:approval': n.approval };
+    if (n.call !== undefined) {
+      node.extension = { ...(node.extension as Record<string, unknown> | undefined), 'floken:call': n.call };
+    }
     if (n.script !== undefined) node.script = n.script;
     if (n.scriptFormat !== undefined) node.scriptFormat = n.scriptFormat;
     if (n.implementation !== undefined) node.implementation = n.implementation;
     if (n.operationRef !== undefined) node.operationRef = n.operationRef;
+    if (n.triggeredByEvent !== undefined) node.triggeredByEvent = n.triggeredByEvent;
+    if (n.calledElement !== undefined) node.calledElement = n.calledElement;
+    if (n.nodes !== undefined) node.nodes = buildNodes(n.nodes);
+    if (n.flows !== undefined) node.flows = buildFlows(n.flows);
     return node as unknown as FlowNode;
   });
+}
 
-  const flows: Flow[] = opts.flows.map((f, i) => ({
+function buildFlows(list: readonly TestFlow[]): Flow[] {
+  return list.map((f, i) => ({
     id: f.id ?? `Flow_${i + 1}`,
     from: f.from,
     to: f.to,
     ...(f.condition === undefined ? {} : { condition: f.condition }),
   }));
+}
+
+export function makeDefinition(opts: {
+  id?: string;
+  version?: number;
+  /** ★ 流程 id（缺省 `Process_1`）。T18 起 `CallActivity` 要造**另一个** processId 的定义 */
+  processId?: string;
+  nodes: readonly TestNode[];
+  flows: readonly TestFlow[];
+}): ProcessDefinition {
+  const nodes = buildNodes(opts.nodes);
+  const flows = buildFlows(opts.flows);
 
   return {
     schemaVersion: '1.0.0',
     id: opts.id ?? 'Definitions_1',
     ...(opts.version === undefined ? {} : { version: opts.version }),
-    processes: [{ id: 'Process_1', nodes, flows }],
+    processes: [{ id: opts.processId ?? 'Process_1', nodes, flows }],
   };
 }
 
@@ -116,6 +147,21 @@ export function expenseDefinition(): ProcessDefinition {
       { from: 'Task_finance', to: 'End_1' },
     ],
   });
+}
+
+/**
+ * ★ 多流程 / 多版本的 `DefinitionSource`（T18：`CallActivity` 要按**绑定版本**取另一份定义）。
+ *
+ * 键 = `${processId}@${version}`。取不到返回 `null`（与 `03` §8.1 的契约一致）。
+ */
+export function mapSource(
+  entries: Readonly<Record<string, ProcessDefinition>>,
+): { getDefinition(pid: string, v: number): Promise<ProcessDefinition | null> } {
+  return {
+    async getDefinition(pid: string, v: number): Promise<ProcessDefinition | null> {
+      return entries[`${pid}@${v}`] ?? null;
+    },
+  };
 }
 
 /** 单版本 `DefinitionSource`（AC-E10：按 `(processId, version)` 取，取不到返回 `null`） */

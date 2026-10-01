@@ -27,7 +27,7 @@
  *
  * ⚠️ **能力边界（诚实标注）**：
  *   - 原语级审计（`TraceEntry.kind:'primitive'`）→ 见 **D-23**；
- *   - `deliver*` 与 `exportTrace`（T20、T18）均未实现 —— 表现为**显式抛错**而非静默降级。
+ *   - `deliver*`（T20）与 `exportTrace`（T22）均未实现 —— 表现为**显式抛错**而非静默降级。
  *
  * ## ★ T16：并行分支在这里落地（分叉 / 汇聚两条新路径）
  *
@@ -62,6 +62,8 @@ import type { InstanceState, Token } from '../core/state.js';
 import { cloneState, isTerminalStatus } from '../core/state.js';
 import type { TaskStatus, TaskView } from '../core/task.js';
 import { assertEventSupported, eventBehaviorOf } from '../nodes/events.js';
+import { activityBehaviorOf, assertActivitySupported, parkForCall } from '../nodes/activities.js';
+import type { PendingCall } from '../nodes/activities.js';
 import { assertNotDataNode } from '../nodes/flows.js';
 import type { OutFlow } from '../nodes/graph.js';
 import { isWaitingNode } from '../nodes/graph.js';
@@ -175,6 +177,18 @@ export interface LoopResult {
    *   就会出现「事件说办完了、状态却没落库」的不一致。
    */
   readonly events: readonly EngineEvent[];
+  /**
+   * ★ 本次推进里**停在 `callActivity` 上、需要建子实例**的那些（T18）。
+   *
+   * 与 `events` 同一套路：纯循环**建不了**实例（那要写存储），只能把"该建什么"
+   * 作为**纯数据**交出去，由 `runtime/engine.ts` 兑现。
+   *
+   * ⚠️ 门 2（宿主自编排）下宿主自己兑现：子实例的 `parent` 指针与父实例的
+   *   `childInstanceIds` 都由 `parkForCall()` 算好并在 `next` 里，宿主只需按
+   *   `PendingCall` 建出实例；子实例到终态后调 `plan()` 并施加 `callReturnOf()`
+   *   即可完成回归 —— 两条路径的形状因此仍然一致。
+   */
+  readonly pendingCalls: readonly PendingCall[];
 }
 
 /**
@@ -435,6 +449,7 @@ export function runToWait(state: InstanceState, ctx: LoopContext): LoopResult {
   let cur = cloneState(state);
   const landings: string[] = [];
   const events: EngineEvent[] = [];
+  const pendingCalls: PendingCall[] = [];
   const budget = { steps: 0 };
 
   /*
@@ -449,7 +464,7 @@ export function runToWait(state: InstanceState, ctx: LoopContext): LoopResult {
    */
   for (let round = 0; round < MAX_STEPS; round += 1) {
     const merged = joinPass(cur, ctx);
-    cur = advanceTokens(cur, ctx, landings, budget, events);
+    cur = advanceTokens(cur, ctx, landings, budget, events, pendingCalls);
     if (!merged) break;
   }
 
@@ -458,7 +473,7 @@ export function runToWait(state: InstanceState, ctx: LoopContext): LoopResult {
     cur.status = 'completed';
   }
 
-  return { next: cur, landings, events };
+  return { next: cur, landings, events, pendingCalls };
 }
 
 /**
@@ -472,6 +487,7 @@ function advanceTokens(
   landings: string[],
   budget: { steps: number },
   events: EngineEvent[],
+  pendingCalls: PendingCall[],
 ): InstanceState {
   const next = cloneState(state);
   /*
@@ -546,6 +562,33 @@ function advanceTokens(
         assertTaskSupported(type, token.nodeId, taskBehavior);
         if (taskBehavior === 'effect') applyEffect(next, token, ctx, events);
         // 'wait' → 落到下面的 `settleAssignee`；'pass' 与已消费的 'effect' → 自动直通
+      }
+
+      // ④ 活动族（T18）
+      const activityBehavior = activityBehaviorOf(type);
+      if (activityBehavior !== undefined) {
+        assertActivitySupported(type, token.nodeId, activityBehavior);
+        if (activityBehavior === 'call') {
+          /*
+           * ★ INV-16 的落点：`callTargetOf` 在「没绑定版本」时**抛**（不回退到最新版）。
+           *   兜底那条 `stateShapeInvalid` 只是防"节点不在图里"这种不可能状态 ——
+           *   真发生了也要报出来，绝不静默当成"不用调用、直接走过去"。
+           */
+          const target = ctx.graph.callTargetOf(token.nodeId);
+          if (target === undefined) {
+            throw stateShapeInvalid(`node '${token.nodeId}' is a callActivity without a call target`, {
+              nodeId: token.nodeId,
+              instanceId: next.instanceId,
+            });
+          }
+          pendingCalls.push(parkForCall(next, token, target));
+          /*
+           * ★ 稳定点：令牌停在这里等子实例回来。
+           *   ⚠️ **不**进 `landings` —— 它不是待办（没有办理人要解析），
+           *   塞进去会让引擎去 `ApproverSource` 问一个根本不存在的人。
+           */
+          break;
+        }
       }
 
       if (isWaitingNode(type)) {

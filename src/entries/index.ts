@@ -37,6 +37,7 @@ export type {
   VoteOutcome,
   AuditEntry,
   ActionRecord,
+  InstanceParent,
   InstanceStateHeader,
   InstanceStateBody,
   InstanceState,
@@ -211,6 +212,23 @@ export type { InstanceQueue } from '../runtime/queue.js';
 export { step, castVote, promoteSequential, settleGroups, applyPost } from '../runtime/loop.js';
 export type { LoopContext, LoopResult, StepInput } from '../runtime/loop.js';
 
+// ---------------- ★ 子流程 / 调用活动（§6 / T18 · 门 2 同样要能完成） ----------------
+
+/**
+ * ★ 为什么**必须公开** `callReturnOf()` 与 `CALL_RETURN_ACTION`：
+ *
+ *   门 2（宿主自编排）下 `step()` 会返回 `pendingCalls` —— 子实例由宿主自己建、自己存。
+ *   而当子实例走到终态时，**父实例那条停在 `callActivity` 上的令牌要放它继续走**，
+ *   这一步同样是宿主自己包事务做。缺了本函数，宿主就得自己写一份
+ *   「放行 `waiting` 令牌 + 记账 + 清办理人」，于是 §7.1「两条路径不得分叉」
+ *   从**结构保证**退化成**纪律问题**（与 `step()` 必须公开同一条理由）。
+ *
+ *   `CALL_RETURN_ACTION` 是写进父实例审计的那个动作名 —— 宿主用自己的 `plan()`
+ *   完成回归时要传同一个名字，审计才对得上（它是**第三类**动作名，见该函数注释）。
+ */
+export { CALL_RETURN_ACTION, callReturnOf } from '../nodes/activities.js';
+export type { PendingCall } from '../nodes/activities.js';
+
 // ---------------- 事件派生与投递（§7.3 · ADR-006） ----------------
 
 /**
@@ -232,7 +250,7 @@ export type { EmitInput } from '../runtime/emit.js';
  * `start` / `submit` 是日常路径；`plan()` 是门 2（强一致自编排）的入口，
  * 引擎实例上的 `plan` 只是给它补上 `EngineConfig.clock` / `maxAuditEntries`（ADR-007）。
  *
- * ⚠️ `deliverMessage` / `deliverSignal`（T20）与 `exportTrace`（T18）尚未实现 ——
+ * ⚠️ `deliverMessage` / `deliverSignal`（T20）与 `exportTrace`（T22）尚未实现 ——
  *    `Engine` 接口会随它们的落地扩展，此处**刻意不提前声明**（声明了就得给实现）。
  */
 export { createEngine } from '../runtime/engine.js';
