@@ -70,6 +70,13 @@ export interface TestNode {
    * 缺它 → 建图 / 推进时抛（引擎**不**替宿主取最新版）。
    */
   call?: Record<string, unknown>;
+  /**
+   * ★ ADR-009：直接挂到 `node.extension` 上的**任意额外键**（宿主自定义扩展属性）。
+   *
+   * 与 `approval` 合并进同一个袋子（真实模型里它们本来共存），
+   * 用来测「`floken:*` 被排除、其余原样给出」。
+   */
+  extension?: Record<string, unknown>;
 }
 
 export interface TestFlow {
@@ -90,6 +97,9 @@ function buildNodes(list: readonly TestNode[]): FlowNode[] {
     if (n.approval !== undefined) node.extension = { 'floken:approval': n.approval };
     if (n.call !== undefined) {
       node.extension = { ...(node.extension as Record<string, unknown> | undefined), 'floken:call': n.call };
+    }
+    if (n.extension !== undefined) {
+      node.extension = { ...(node.extension as Record<string, unknown> | undefined), ...n.extension };
     }
     if (n.script !== undefined) node.script = n.script;
     if (n.scriptFormat !== undefined) node.scriptFormat = n.scriptFormat;

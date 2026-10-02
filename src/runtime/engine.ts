@@ -152,6 +152,43 @@ export interface EngineConfig {
   clock?: () => string;
   /** INV-17 审计上限 */
   maxAuditEntries?: number;
+  /**
+   * ★ ADR-009：把宿主自定义扩展属性**并入求值上下文**（opt-in）。
+   *
+   * 不声明 → 只给 `ctx.nodeExtensions` / `ctx.targetExtensions` 两个**只读**字段，
+   * **不并入** `variables`（0.0.1 语义逐字不变）。
+   */
+  extensionVars?: ExtensionVarsOption;
+}
+
+/**
+ * ★ ADR-009 的 opt-in 配置。
+ *
+ * 为什么并入形态是**两个对象**而不是把键平铺进 `variables`：
+ * 平铺的撞车面是「每个键」（表单字段 / 脚本产出的变量都可能同名），
+ * 撞了就要决出胜负 —— 静默覆盖正是 §7.2 要防的头号事故。
+ * 挂成 `variables.node` / `variables.target` 后，撞车面降到「两个名字」，
+ * 且语义天然分层：**设计期配置** vs **运行期数据**。
+ */
+export interface ExtensionVarsOption {
+  /**
+   * ★ **当前节点**扩展属性并入后的顶层键名（默认 `'node'`）。
+   *
+   * ⚠️ 若流程变量里已有同名键 → 抛 `ENGINE_OPTION_INVALID`（**不静默覆盖**，细则⑦）。
+   * 撞了就改这个名字，不要去改业务变量 —— 那会把业务数据挤掉。
+   */
+  key?: string;
+  /** ★ **目标节点**扩展属性并入后的顶层键名（默认 `'target'`）；冲突处置同 `key` */
+  targetKey?: string;
+  /**
+   * ★ 类型还原表：`'acme:slaHours'` → `'number'`。
+   *
+   * 为什么必须有：`moddle` 从 XML 读回的扩展属性**一律是字符串**（实测 `48 → "48"`），
+   * 而 `slaHours > 24` 遇到 `"48"` 会按字符串比较 → 抛错。
+   * 引擎**不猜类型**（`"48"` 究竟是数字还是编号？猜 = 静默错误），按本表声明转换。
+   * 二期改由模型内 `floken:extensionTypes` 声明块承载（仍是 `floken:` 命名空间）。
+   */
+  casts?: Readonly<Record<string, 'number' | 'boolean' | 'iso-date'>>;
 }
 
 export interface StartOptions {
@@ -252,6 +289,7 @@ const ENGINE_CONFIG_KEYS = [
   'hooks',
   'clock',
   'maxAuditEntries',
+  'extensionVars',
 ] as const;
 
 function assertEngineConfig(config: unknown): void {
@@ -297,6 +335,54 @@ function assertEngineConfig(config: unknown): void {
     const n = c.maxAuditEntries;
     if (typeof n !== 'number' || !Number.isInteger(n) || n < 1) {
       throw optionInvalid('maxAuditEntries', 'must be a positive integer', n);
+    }
+  }
+  assertExtensionVars(c.extensionVars);
+}
+
+/**
+ * ★ ADR-009：`extensionVars` 的形状校验（**禁止静默忽略**，D-7 同款纪律）。
+ *
+ * 为什么连 `casts` 的取值都要一个个查：写错成 `'int'` / `'Number'` 时，
+ * 引擎会"认不出 → 原样给字符串"，而运行期的表现是
+ * `slaHours > 24` 拿字符串去比 → 抛一个**看不出根因**的条件错误。
+ * 在配置期就拒掉，宿主一眼能改。
+ */
+function assertExtensionVars(v: unknown): void {
+  if (v === undefined) return;
+  if (typeof v !== 'object' || v === null || Array.isArray(v)) {
+    throw optionInvalid('extensionVars', 'must be a plain object', v);
+  }
+  const o = v as Record<string, unknown>;
+  const allowed = ['key', 'targetKey', 'casts'] as const;
+  for (const key of Object.keys(o)) {
+    if (!(allowed as readonly string[]).includes(key)) {
+      throw optionUnknown(`extensionVars.${key}`, allowed);
+    }
+  }
+  const assertKeyName = (field: string): void => {
+    const k = o[field];
+    if (k === undefined) return;
+    if (typeof k !== 'string' || k.length === 0 || k.includes('.')) {
+      throw optionInvalid(`extensionVars.${field}`, 'must be a non-empty string without "."', k);
+    }
+  };
+  assertKeyName('key');
+  assertKeyName('targetKey');
+  if (o.casts !== undefined) {
+    const casts = o.casts;
+    if (typeof casts !== 'object' || casts === null || Array.isArray(casts)) {
+      throw optionInvalid('extensionVars.casts', 'must be a plain object', casts);
+    }
+    const kinds = ['number', 'boolean', 'iso-date'] as const;
+    for (const [key, kind] of Object.entries(casts as Record<string, unknown>)) {
+      if (!(kinds as readonly string[]).includes(kind as string)) {
+        throw optionInvalid(
+          `extensionVars.casts['${key}']`,
+          `must be one of ${kinds.join(' | ')}`,
+          kind,
+        );
+      }
     }
   }
 }
@@ -366,6 +452,121 @@ function newInstanceId(): string {
   return `pi_${Date.now().toString(36)}_${instanceSeq.toString(36)}_${rand}`;
 }
 
+// ---------------- ★ ADR-009：自定义扩展属性并入求值上下文 ----------------
+
+/** 扩展属性的声明类型（`extensionVars.casts` 的取值） */
+type ExtensionCast = 'number' | 'boolean' | 'iso-date';
+
+/**
+ * ★ 按声明还原类型（ADR-009 细则⑧）。
+ *
+ * 为什么**不猜**：`moddle` 从 XML 读回的扩展属性一律是字符串，`"48"` 究竟是数字 48
+ * 还是编号 "48"，引擎无从判断 —— 猜错的表现是「条件按字符串比较，抛一个看不出根因的错」。
+ * 故：声明了就按声明转，**转不动就抛**（不是静默原样返回）。
+ *
+ * `iso-date` 刻意**不做解析** —— Q33：引擎 `dist` 不得出现时态库，时间语义归宿主 / 调度方。
+ * 它在这里的用处是「标明这是日期字符串」，转换即原样透传。
+ */
+function applyExtensionCast(key: string, value: unknown, kind: ExtensionCast): unknown {
+  if (kind === 'number') {
+    if (typeof value === 'number') return value;
+    if (typeof value === 'string' && value.trim() !== '') {
+      const n = Number(value);
+      if (!Number.isNaN(n)) return n;
+    }
+  } else if (kind === 'boolean') {
+    if (typeof value === 'boolean') return value;
+    if (value === 'true') return true;
+    if (value === 'false') return false;
+  } else {
+    return value; // 'iso-date'：原样透传（引擎不解析时间）
+  }
+  throw optionInvalid(
+    `extensionVars.casts['${key}']`,
+    `declared as '${kind}' but the value cannot be converted`,
+    value,
+  );
+}
+
+/**
+ * ★ 去掉命名空间前缀（`acme:priority` → `priority`）—— **只作用于并入层**。
+ *
+ * 为什么必须去前缀（实测结论，不是偏好）：键带冒号时 **FEEL 引用不到它** ——
+ *   - `target.acme:priority` → `FeelSyntaxError: Unexpected token ':'`；
+ *   - `target["acme:priority"]` → **`null`**（`[...]` 在 FEEL 里是列表筛选/索引，不是对象取键）。
+ * 于是"并进了却读不出来"，等于功能不存在。故并入层一律去前缀，
+ * 而**只读字段 `nodeExtensions` 保留前缀**（原样，供宿主在非 FEEL 场景使用）。
+ */
+function stripExtPrefix(key: string): string {
+  const i = key.indexOf(':');
+  return i === -1 ? key : key.slice(i + 1);
+}
+
+/** 把一袋扩展属性转成并入用的对象（去前缀 + 应用 cast）；空袋 → `undefined` */
+function castExtensionBag(
+  bag: Readonly<Record<string, unknown>> | undefined,
+  casts: Readonly<Record<string, ExtensionCast>> | undefined,
+): Record<string, unknown> | undefined {
+  if (bag === undefined) return undefined;
+  const out: Record<string, unknown> = {};
+  for (const [key, value] of Object.entries(bag)) {
+    const kind = casts?.[key];
+    const v = kind === undefined ? value : applyExtensionCast(key, value, kind);
+    const name = stripExtPrefix(key);
+    /*
+     * ★ 去前缀之后**同名** = 两个命名空间用了同一个名字（`acme:level` 与 `hr:level`）。
+     * 此时并入哪一个都是静默丢数据 —— 抛错，让宿主去改名或收窄前缀。
+     * （只读字段仍带前缀，信息没丢；这里只是拒绝**自动**二选一。）
+     */
+    if (Object.prototype.hasOwnProperty.call(out, name)) {
+      throw optionInvalid(
+        'extensionVars',
+        `two extension keys collapse to the same variable name '${name}' after stripping the namespace prefix`,
+        { name, bag: Object.keys(bag) },
+      );
+    }
+    out[name] = v;
+  }
+  return out;
+}
+
+/**
+ * ★ 并入求值上下文（ADR-009 细则⑤⑥⑦）。
+ *
+ * ⚠️ 只影响**求值上下文**，**绝不写进 `InstanceState.variables`** ——
+ * 否则状态膨胀，且快照里存两份真相（设计期配置与运行期数据混在一起）。
+ */
+function mergeExtensionVars(
+  base: Readonly<Record<string, unknown>>,
+  nodeExt: Readonly<Record<string, unknown>> | undefined,
+  targetExt: Readonly<Record<string, unknown>> | undefined,
+  opt: ExtensionVarsOption | undefined,
+): Readonly<Record<string, unknown>> {
+  if (opt === undefined) return base; // 细则⑤：不声明 = 现状语义
+
+  const casts = opt.casts as Readonly<Record<string, ExtensionCast>> | undefined;
+  const nodeBag = castExtensionBag(nodeExt, casts);
+  const targetBag = castExtensionBag(targetExt, casts);
+  if (nodeBag === undefined && targetBag === undefined) return base;
+
+  const out: Record<string, unknown> = { ...base };
+  const put = (name: string, bag: Record<string, unknown> | undefined): void => {
+    if (bag === undefined) return;
+    // 细则⑦：撞车**抛错**，不静默覆盖
+    if (Object.prototype.hasOwnProperty.call(out, name)) {
+      throw optionInvalid(
+        'extensionVars',
+        `cannot merge extension vars: a variable named '${name}' already exists — rename via extensionVars.key / targetKey`,
+        { name, existing: out[name] },
+      );
+    }
+    out[name] = bag;
+  };
+  put(opt.key ?? 'node', nodeBag);
+  put(opt.targetKey ?? 'target', targetBag);
+  return out;
+}
+
 // ---------------- 工厂 ----------------
 
 export function createEngine(config: EngineConfig): Engine {
@@ -396,6 +597,8 @@ export function createEngine(config: EngineConfig): Engine {
    *   （每轮至少多解析一条 ⇒ 轮数 ≤ 条件数 + 1，必然收敛）。
    */
   const condition: ConditionHandler = config.conditionHandler ?? createFeelConditionHandler();
+  /** ★ ADR-009：自定义扩展属性并入求值上下文（opt-in；不声明 = 只给只读字段、不并入） */
+  const extensionVars: ExtensionVarsOption | undefined = config.extensionVars;
   /** `serviceTask` / 非 FEEL `scriptTask` 的实现表（**不注入 = 该类节点报「未配置」**） */
   const handlers: ServiceHandler | undefined = config.handlers;
   /**
@@ -481,7 +684,8 @@ export function createEngine(config: EngineConfig): Engine {
       if (flow.expression === undefined) return true;
       const value = conditions.get(flow.id);
       if (value === undefined) {
-        throw unresolvedCondition(flow.id, flow.expression, nodeId, variables);
+        // ★ ADR-009 细则②：带上 `flow.to`，重跑时才能取「这条分支通向的节点」的扩展属性
+        throw unresolvedCondition(flow.id, flow.expression, nodeId, variables, flow.to);
       }
       return value;
     };
@@ -585,13 +789,19 @@ export function createEngine(config: EngineConfig): Engine {
             instanceId: state.instanceId,
           });
         }
+        const nodeExt = graph.extensionsOf(pending.nodeId);
+        const targetExt =
+          pending.toNodeId === undefined ? undefined : graph.extensionsOf(pending.toNodeId);
         conditions.set(
           pending.flowId,
           await evaluateCondition(condition, pending.expression, {
             instanceId: state.instanceId,
             nodeId: pending.nodeId,
             // ★ 用**到达该网关那一刻**的变量快照（哨兵带来），不是提交前的旧值
-            variables: pending.variables,
+            //   ⚠️ 扩展属性只在**求值上下文**里并入，绝不写回 state（ADR-009 细则⑨）
+            variables: mergeExtensionVars(pending.variables, nodeExt, targetExt, extensionVars),
+            nodeExtensions: nodeExt,
+            targetExtensions: targetExt,
           }),
         );
       }

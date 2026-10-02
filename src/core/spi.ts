@@ -184,6 +184,25 @@ export interface ConditionCtx {
   instanceId: string;
   nodeId: string;
   variables: Readonly<Record<string, unknown>>;
+  /**
+   * ★ **当前节点**（`nodeId`，即条件所在的网关 / 活动）上的宿主自定义扩展属性（ADR-009）。
+   *
+   * - 键**带前缀**原样给出（`acme:priority`），引擎**不解释**其语义；
+   * - 排除 `floken:*`（引擎自己的键）；**只含标量**；
+   * - 没有 → `undefined`（不填空对象）。
+   *
+   * ⚠️ 它**恒给**（不需任何配置）；"自动并入 `variables`"才需要 opt-in（见 `EngineConfig.extensionVars`）。
+   */
+  nodeExtensions: Readonly<Record<string, unknown>> | undefined;
+  /**
+   * ★ 该条件所在**顺序流的目标节点**上的自定义扩展属性（ADR-009 细则②）。
+   *
+   * 为什么必须两个都给：条件挂在**顺序流**上，而"加急等级"这类业务属性通常挂在
+   * **审批节点**（目标）而不是网关（当前节点）上 —— 只给一个，另一个场景就得回退到手写 handler。
+   *
+   * ⚠️ 求值时**拿不到目标**（如宿主在门 2 自提供 `conditionsOf` 闭包）→ `undefined`。
+   */
+  targetExtensions: Readonly<Record<string, unknown>> | undefined;
 }
 
 /**

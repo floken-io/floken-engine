@@ -3,6 +3,37 @@
 本包遵循 [Semantic Versioning](https://semver.org/)，格式参考 [Keep a Changelog](https://keepachangelog.com/)。
 0.x 阶段跨包依赖写 `>=x.y.z <1.0.0`（不用 `^`）。
 
+## 0.0.2 — 2026-10-02
+
+### 新增
+
+- ★ **宿主自定义扩展属性（ADR-009）**：`@floken-io/designer` 上配的自定义属性（`node.extension['acme:priority']`）
+  现在能被条件直接用，不必再注入 `conditionHandler` 手写回查。分两级：
+  - **第一级（恒给，无需配置）**：`ConditionCtx` 增 `nodeExtensions`（当前节点）与
+    `targetExtensions`（该分支的**目标节点**）两个只读字段。键**带前缀**原样给出，排除 `floken:*`、**只含标量**。
+  - **第二级（opt-in）**：配置 `EngineConfig.extensionVars` 后并入求值上下文，
+    挂成 `variables.node` / `variables.target`，条件可直接写 `target.priority = "high"`。
+- ★ **类型还原可按声明做**：`extensionVars.casts`（如 `{ 'acme:slaHours': 'number' }`）。
+  起因是 XML 往返后扩展属性的值**一律是字符串**（实测 `48 → "48"`），而 `"48" > 24` 会按字符串比较；
+  引擎**不猜类型**（猜 = 静默错误），按声明转换，转不动就抛 `ENGINE_OPTION_INVALID`。
+
+### 变更
+
+- `ConditionUnresolved` 内部哨兵增 `toNodeId`（原先只带源节点，取不到目标节点的扩展属性）。
+  该哨兵**不是**公开 API 的一部分（引擎吞掉并重试），宿主不会收到它。
+
+### 兼容性
+
+- **不声明 `extensionVars` 时行为与 0.0.1 逐字一致**：只读字段是纯增量，`variables` 一个键都不多。
+- ⚠️ 已知代价（行为已钉死、文档如实写明）：**不 opt-in 却在表达式里写 `target.*`
+  → 不报错、静默走另一条分支**（`target` 未定义时等值比较求值为 `false`，
+  与 `amount > 5000` 缺变量求值为 `null` 而抛错的语义不同）。
+
+### 验证
+
+- 单测 **701**（+16，新增 `test/extension-vars.test.ts`）；冷启动探针 **103**（+5，跑真 `dist/`）；
+  `verify` 六道门禁全绿。
+
 ## 0.0.1 — 2026-10-01
 
 首发。令牌制流程内核 + 中国式审批动作，覆盖 `03` 的阶段 **E1~E9**（685 单测 / `verify` 六道门禁全绿 /

@@ -54,6 +54,32 @@ export const TERMINAL_NODE_TYPES: readonly string[] = ['endEvent'];
 /** `floken:approval` 的扩展键（与 moddle 的 `ExtensionBag` 键名逐字一致） */
 export const APPROVAL_EXT_KEY = 'floken:approval';
 
+/**
+ * ★ 引擎**自己的**扩展键前缀（ADR-009）。
+ *
+ * `extensionsOf()` 会**排除**这个前缀下的全部键：
+ *   ① 不外泄引擎内部语义（`floken:approval` 是引擎的输入，不是宿主该读的东西）；
+ *   ② `floken:approval` 是**对象**，塞进求值上下文会污染，而 ADR-009 只承诺给标量。
+ *
+ * ⚠️ 排除的是"前缀"而不是"固定几个键名"：将来引擎再挂 `floken:xxx`，自动一并排除，
+ * 不需要回到这里补名单（补名单 = 迟早漏一个）。
+ */
+export const FLOKEN_EXT_PREFIX = 'floken:';
+
+/** `moddle` 保全袋里第三方原样快照的键（不是属性，不给宿主） */
+const RAW_SNAPSHOT_KEY = '_extensionElements';
+
+/**
+ * ★ ADR-009 细则④：**只给标量**。
+ *
+ * 与 `moddle` 的 XML 层同一口径（结构化值写不进 XML 属性，走 `_extensionElements` 快照），
+ * 宿主不必记两套规则。对象 / 数组 / 函数一律跳过 —— 尤其是**函数**：
+ * 它会让后续任何 `JSON.stringify`（state 落库、诊断详情）静默丢字段或炸掉。
+ */
+function isScalarValue(v: unknown): boolean {
+  return v === null || typeof v === 'string' || typeof v === 'number' || typeof v === 'boolean';
+}
+
 /** 一条**出向流**（引擎视角）：条件已归一化成"表达式文本或空" */
 export interface OutFlow {
   readonly id: string;
@@ -187,6 +213,17 @@ export interface ProcessGraph {
    * 而不是等触发 —— 那时已经写了一半状态。
    */
   boundaryOf(nodeId: string): readonly BoundaryBinding[];
+  /**
+   * ★ 该节点上的**宿主自定义**扩展属性（ADR-009 细则①②③④）。
+   *
+   * 给出去的是**原样键值**，引擎**不解释** `acme:priority` 是什么意思 ——
+   * 解释权 100% 在宿主（源码里不得出现任何具体宿主前缀）。
+   *
+   * - 排除 `floken:*`（引擎自己的键）与 `_extensionElements`（第三方原样快照）；
+   * - **只留标量**；
+   * - **一个都没有 → `undefined`**（不填空对象 —— 调用方要能区分「没配」与「配了但被过滤空」）。
+   */
+  extensionsOf(nodeId: string): Readonly<Record<string, unknown>> | undefined;
 }
 
 /**
@@ -259,6 +296,8 @@ export function createProcessGraph(
   }
 
   const approvalCache = new Map<string, NormalizedApproval | undefined>();
+  /** ADR-009：宿主自定义扩展属性袋（按节点缓存，与 `approvalCache` 同套路） */
+  const extCache = new Map<string, Readonly<Record<string, unknown>> | undefined>();
   /**
    * ★ 边界事件索引：`attachedTo` → 挂在它上面的边界事件（T21）。
    *
@@ -387,6 +426,25 @@ export function createProcessGraph(
     },
 
     hasApproval: (nodeId) => nodes.get(nodeId)?.extension?.[APPROVAL_EXT_KEY] !== undefined,
+
+    extensionsOf(nodeId) {
+      if (extCache.has(nodeId)) return extCache.get(nodeId);
+      const raw = nodes.get(nodeId)?.extension;
+      let value: Readonly<Record<string, unknown>> | undefined;
+      if (raw !== undefined && typeof raw === 'object' && raw !== null && !Array.isArray(raw)) {
+        const out: Record<string, unknown> = {};
+        for (const [key, v] of Object.entries(raw)) {
+          if (key.startsWith(FLOKEN_EXT_PREFIX)) continue; // 细则③：不外泄引擎自己的键
+          if (key === RAW_SNAPSHOT_KEY) continue;
+          if (!isScalarValue(v)) continue; // 细则④：只给标量
+          out[key] = v;
+        }
+        // 细则「没配 → undefined」：全被过滤掉时也算"没有"，不返回空对象
+        value = Object.keys(out).length > 0 ? Object.freeze(out) : undefined;
+      }
+      extCache.set(nodeId, value);
+      return value;
+    },
 
     scriptOf: (nodeId) => {
       const s = nodes.get(nodeId)?.script;

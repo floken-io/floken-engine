@@ -694,6 +694,13 @@ class EngineError extends Error {
 - [ADR-005] 表达式：复用 `@floken-io/feel` 的 S-FEEL 模式 — **不自研迷你求值器**
 - [ADR-006] 事件粒度：节点级 5 + 实例级 5 — **不做连线级 / 内核生命周期**
 - [ADR-007] 时间源：时钟经 `EngineConfig.clock` 注入，`plan()` 保持纯 — **引擎不在判定里直接读系统时钟**
+- [ADR-008] 事务口子：`save(next, expectedRev, ctx?)` 显式可选第三参 — **引擎只透传 `ctx`、绝不解释它**（⏳ 2026-10-01 拍板，待落地；为 M5 `@floken-io/store` 铺路）
+- `nodes/graph.ts`：增 `extensionsOf(nodeId)`（排除 `floken:*`、只留标量、带缓存，与 `approvalCache` 同套路）。**已完成**
+- `eval/condition.ts`：`ConditionUnresolved` 增 **`toNodeId`**（哨兵原本只带源节点，拿不到目标节点）。**已完成**
+- `runtime/engine.ts`：`conditionsOf` 抛哨兵时带上 `flow.to`；求值点构造两袋 + opt-in 并入（去前缀 + cast，冲突抛 `OPTION_INVALID`）。**已完成**
+- `test/extension-vars.test.ts`（新增 16 例）+ 冷启动探针 ADR-009 段。**已完成**：698→701 单测、探针 98→102 全绿，`verify PASSED`。
+
+- [ADR-009] 自定义扩展属性：**只读给全**（`ctx.nodeExtensions` / `ctx.targetExtensions`，带前缀）+ **可选并入**求值上下文（`variables.node` / `variables.target`，**去前缀**、opt-in）；引擎仍**只认 `floken:` 命名空间**，不解释宿主前缀（✅ 2026-10-02 拍板**并已落地**，随 `engine@0.0.2` 发布）
 
 ---
 
@@ -910,6 +917,102 @@ class EngineError extends Error {
 - 有测试钉死两条：**不传 `at`/`clock` 必抛**（证明实现里没有隐藏的系统时钟回退）；
   **给了 `at` 时 `clock` 绝不被调用**（给它一个会抛错的 clock，若被调用则红）。
 - `03` §12 已补 **NFR-E11**（「时间源必须可注入」），`03` §1 的 `ActionInput.at` / `PlanOptions` 同步补上。
+
+---
+
+### ADR-008：事务口子 —— `save(next, expectedRev, ctx?)` 显式可选第三参
+
+- **状态**：✅ **已接受**（2026-10-01 拍板）｜ ⏳ **待落地**｜ **日期**：2026-10-01
+
+**背景**：NFR-E8 与 ADR-004 都承诺「宿主可经 `plan()` 把业务写与状态提交并入同一事务」，
+但 `StateStore.save` **只有两参**，宿主**没有任何入口**把外部事务句柄递进去 ——
+这条保证目前只是文档承诺、**没有实现路径**。M5 的 `@floken-io/store`（TypeORM，多库）必须落这个口子，
+否则「业务写 + 状态提交同事务」无法兑现（Node 没有 ambient transaction，这是 ADR-004 已论证过的）。
+
+**候选选项**
+1. **`save` 加可选第三参 `ctx`（显式）** —— 优点：可测、可诊断、不依赖 async context；可选 → 不传时与现状逐字同构（零 breaking）。
+   缺点：接口多一参。
+2. **`AsyncLocalStorage` 隐式传递事务** —— 优点：不改 SPI 签名（NestJS 常见做法）。
+   缺点：**隐式**——事务边界藏在上下文里，难测、难诊断；异步穿透失败时是静默错误（最危险的一类）。
+3. **给 `StateStore` 长事务接口（`begin` / `commit` / `rollback`）** —— **直接否决**：
+   违反 ADR-004「引擎内不做事务」与 §7.2 已写死的「禁止长出事务接口」，且把内存实现的门槛抬高。
+
+**决定**：采用 **选项 1**。
+
+**理由**：显式优于隐式（ADR-007 同一原则：不确定性/副作用要在**边界处显式注入**，不能藏在深层调用里）；
+`ctx?:` 可选保证了**不传即现状**，已发布的 0.0.1 语义不变；内存实现可安全忽略它，不增加任何负担。
+
+**后果**
+- 正面：官方 `store` 与宿主自研实现都能把 `save` 并入自己的事务；内核仍**零基础设施依赖**。
+- 负面 / 代价：接口多一参；契约套件要补「透传」用例。
+- ★ **边界（写死）**：`ctx` 对引擎是**完全不透明的值** —— 引擎只透传、**绝不解释**（源码里不得出现 `ctx.tx` 之类的窥探）。
+  故类型定为 `unknown`，**不得引入 TypeORM 或任何驱动的类型**。`createMemoryStore()` 直接忽略它。
+
+**落地（待办）**
+- `core/spi.ts`：`save(next: InstanceState, expectedRev: number, ctx?: unknown): Promise<void>`。
+- `store/memory.ts`：签名同步，**忽略** `ctx`。
+- `runtime/engine.ts`：调用点原样透传（引擎自己不产生 `ctx`，默认 `undefined`）。
+- `conformance/store.ts`：补一条 —— store 收到的 `ctx` 与调用点传入的必须是**同一引用**（证明是透传、没有被改造）。
+- `03` §8.1 的 `StateStore` 行已改为 `save(next, expectedRev, ctx?)`。
+
+---
+
+### ADR-009：自定义扩展属性 —— 只读给全 + **可选**并入求值上下文
+
+- **状态**：✅ **已接受**（2026-10-02 用户拍板「引擎原生给」）｜ ✅ **已落地**（同日，随 `engine@0.0.2`）｜ **日期**：2026-10-02
+
+**背景**：宿主在 `@floken-io/designer` 里配的自定义扩展属性（`acme:priority`）落在 `node.extension['acme:priority']`，
+`moddle` 保证存得下、导得出、往返保真（`02-designer` §6.3 实测）。但引擎从 `extension` 里**只认两个键**
+（`floken:approval` / `floken:call`），自定义键**不会**进入求值上下文 —— 实测把条件写成 `slaHours > 24`
+抛 `ENGINE_OPTION_INVALID: Invalid condition expression 'slaHours > 24'`。
+宿主想用只能注入 `conditionHandler`、靠 `ctx.nodeId` 回查定义再并入变量（实测可跑通，但**每个项目重复约 10 行**，
+且各人写法不一，是最容易写歪的一段胶水）。
+
+**候选选项**
+1. **维持现状**（文档写「默认不认 + 三条路径」）—— 否决：胶水重复、且人人写得不一样。
+2. **自动把扩展属性平铺进 `variables`（去前缀）** —— **否决**：撞车面 = **每个键**都可能与表单字段 / 脚本产出的变量同名；
+   一旦同名就要决出胜负，静默覆盖正是 §7.2 要防的头号事故（"分支按错的值走"）。
+3. ★ **只读字段给全 + 可选（opt-in）并入** —— **采纳**，见下。
+4. **引擎识别宿主前缀并解释其语义** —— **否决**：引擎开始"认识"宿主命名空间，与 Q46 的代价描述正是同一件事；本 ADR 的前提是**引擎只认 `floken:`**。
+
+**决定**：采用 **选项 3**。九条细则（★ 前四条是"默认零行为变化"的保证）：
+
+| # | 细则 | 内容 |
+|---|---|---|
+| ① | **只读字段恒给** | `ConditionCtx` 增 `nodeExtensions` / `targetExtensions`（`Readonly<Record<string, unknown>>`）。**不配置也永远给** —— 纯增字段，0.0.1 行为逐字不变 |
+| ② | **谁的扩展** | `nodeExtensions` = **当前节点**（`ctx.nodeId`，即条件所在的网关/活动）；`targetExtensions` = **该条件所在顺序流的目标节点**（`OutFlow.to`）。二者都要，因为"加急等级"通常挂在**审批节点**（目标）而不是网关上。**取不到 → `undefined`**（不抛、不填空对象） |
+| ③ | **排除 `floken:*`** | 引擎自己的键（`floken:approval` 是对象）**一律不出现在给宿主的两袋里** —— ① 不外泄内部语义；② 对象值塞进求值上下文会污染 |
+| ④ | **只给标量** | 与 `moddle` XML 层同一口径（结构化值写不进属性）：`string` / `number` / `boolean` / `null` 给，对象与数组**跳过**。口径贯穿，宿主不用记两套规则 |
+| ⑤ | **默认不并入** | 自动并入会改变既有流程的求值结果。**只有**宿主显式声明 `EngineConfig.extensionVars` 才并入 —— 不声明 = 现状语义 |
+| ⑥ | **并入形态：两个对象，不平铺** | 挂成 `variables.node` / `variables.target`（键名可配）。FEEL 写 `target.priority = "high"`。**理由**：把"设计期配置"与"运行期数据"分成两个命名空间，撞车面从「每个键」降到「两个名字」 |
+| ⑥b | ★ **并入层的键要去前缀** | 实测：键带冒号时 **FEEL 根本引用不到它** —— `target.acme:priority` → `FeelSyntaxError: Unexpected token ':'`；`target["acme:priority"]` → **`null`**（`[...]` 在 FEEL 里是列表筛选/索引，不是对象取键）。故并入层写 `priority`，而**只读字段保留前缀**（`acme:priority`，原样）。去前缀后**同节点内不同前缀同名** → 抛 `OPTION_INVALID`（不静默二选一） |
+| ⑦ | **冲突 → 抛错，不静默** | 变量名已被占用（如用户自己有个 `node` 变量）→ 抛 **`ENGINE_OPTION_INVALID`**（复用现有码，**不新增第 20 个抛出码 / 第 3 个诊断码**），hint 指名改用 `extensionVars.key`。仅在 opt-in 后才可能发生 |
+| ⑧ | **类型还原靠宿主声明** | XML 往返后值**一律是字符串**（实测 `48 → "48"`），而 `slaHours > 24` 遇到 `"48"` 会按字符串比较 → 抛错。引擎**不猜类型**（猜 = 静默错误），按 `EngineConfig.extensionVars.casts` 声明转换；**二期**改由模型内 `floken:extensionTypes` 声明块承载（仍是 `floken:` 命名空间，不破本 ADR 前提） |
+| ⑨ | **不进 state、不破纯度** | 并入只发生在 `buildApply()` 的重跑里（`runtime/engine.ts`，唯一不纯文件），**写进求值上下文、绝不写进 `InstanceState.variables`**（否则状态膨胀且快照里存两份真相）。`plan()` 门 2 不经过它 —— 宿主自提供 `conditionsOf` 闭包， purity 不受影响 |
+
+**理由**：①+⑤ 让这次改动**对未 opt-in 的既有用户完全无感**（0.0.1 → 0.0.2 零 breaking）；
+②③⑥ 把「到底读的是谁的属性」这个最容易含糊的点一次定死；④ 与 XML 层同口径；
+⑦ 沿用项目铁律「冲突不静默」；⑧ 承认引擎不知道 cast、把声明权留给宿主（与 Q37「取人外置」同一思路）。
+
+**后果**
+- 正面：宿主自定义扩展属性「配了就能用」，不必人人写 handler；`ctx.nodeExtensions` 还顺带让自定义 handler 少查一次定义。
+- 负面 / 代价：`ConditionCtx` 多两个字段；多一个 `EngineConfig.extensionVars` 配置项（**文档负担**，官网 SPI 页要写清"默认不并入"）；
+  类型还原一期靠宿主在配置里再声明一次 cast（**两处声明**，二期由模型内声明块收敛）。
+- ★ **边界（写死）**：引擎**仍然只认 `floken:` 命名空间**。给出去的是**原样键值**，引擎不解释 `acme:priority` 是什么意思 ——
+  解释权 100% 在宿主。源码里不得出现任何具体宿主前缀。
+
+- ★ **已知代价（必须写进文档，不许含糊）**：**不 opt-in 却在表达式里写 `target.*` → 不报错、静默走另一条分支**
+  （`target` 未定义时 `target.priority = "high"` 求值为 **false** —— 等值比较 `null ≠ "high"`；
+  对比 `amount > 5000` 缺变量求值为 `null` → 按 D-38 抛错，两者三值语义不同）。
+  引擎**不解析表达式**去猜"你是不是想引用扩展属性"，这条只能靠宿主 opt-in 避免（测试已把该行为钉死）。
+
+**落地（已完成的实际改动）**
+- `core/spi.ts`：`ConditionCtx` 增 `nodeExtensions` / `targetExtensions`；`EngineConfig` 增 `extensionVars?: ExtensionVarsOption`。
+- `nodes/graph.ts`：增 `extensionsOf(nodeId)`（排除 `floken:*`、只留标量、带缓存，与 `approvalCache` 同套路）。
+- `eval/condition.ts`：`ConditionUnresolved` 增 **`toNodeId`**（哨兵现在只带源节点，拿不到目标节点）。
+- `runtime/engine.ts`：`conditionsOf` 抛哨兵时带上 `flow.to`；求值点构造两袋 + opt-in 并入（冲突抛 `OPTION_INVALID`）。
+- `test/`：补用例 —— 默认不并入（既有行为不变）/ opt-in 后 `target.priority` 命中 / 结构化值被跳过 / 变量名冲突抛错 / `floken:*` 不外泄。
+- 发 `engine@0.0.2`（与 ADR-008 同版）。
 
 ---
 
@@ -1486,3 +1589,4 @@ class EngineError extends Error {
 | **D-87** | ★ **原语级审计（旧 `TraceEntry.kind:'primitive'`）正式否决**；`kind` 改为 **「审批 / 非审批」两档**（`'approval' \| 'system'`） | 原方案是把 10 个原语的调用逐条写进 `auditTrail`（**D-23**），T22 重新裁决后否决，两条理由：① **run-to-wait 的令牌推进根本不走 `advance` 原语** —— `runtime/loop.ts` 直接改 `token.nodeId`，于是"按原语记"的轨迹里**没有令牌移动**，恰恰是"轨迹"最该有的那一半（名不副实却看不出来）；② 一次提交会炸出几十条，`maxAuditEntries` 的语义会从「保留最近 N **次变更**」扭曲成「保留最近两次提交」，且裁剪会砍在**一次提交的内部**。改判之后：`kind` 的判据是「**是不是 19 项审批动作之一**」（取 `ACTION_NAMES` 而非"已知非审批名单" —— 后者会让将来新增的系统动作**静默变成 `approval`**）；`start` / `callActivityReturn` / `deliverMessage` / `deliverSignal` 一律 `system` | ✅ 已落地（`runtime/trace.ts` 的 `traceKindOf` + `SYSTEM_AUDIT_ACTIONS`）。断言：19 项逐个判 `approval`；4 个系统名逐个判 `system`；两张名单**无交集**；未知名 → `system` |
 | **D-88** | ★ **`AuditEntry` 的 `tokenId` / `from` / `to` 由 `plan()` 填**，定位令牌**只准走 `subjectTokenOf()`**（已从 `engine.ts` 收口到 `core/task.ts`） | 「谁办的、从哪到哪」是 `exportTrace()` 的全部内容，而**只有 `plan()` 同时握着推进前的 `state` 与推进后的 `next`** —— 换任何一处都拿不到完整 before/after。⚠️ 定位判据若两处各写一份（"看起来差不多"的那种），就会出现「审计说办的是 A 分支、实际推进的是 B 分支」，而两份代码单独看都对。ⓐ 认不出时**留空而不猜**（会签下猜错 = `exportTrace()` 显示"李四办了两次"）；ⓑ 令牌**终结**（`completed` / `cancelled`）**照记 `to`** —— 走到 `End_1` 正是最后一跳，只有令牌**被移除**（会签展开取代占位令牌）才缺席；ⓒ `start()` 那条也补了（`tk_start`：`Start_1 → 第一个待办`），它是轨迹第一行 | ✅ 已落地（`runtime/plan.ts` ⑦ + `runtime/engine.ts` 的 `start()`）。断言：单令牌 / 会签按 actor 认领 / 认不出留空 / 终结照记 / 移除缺席 |
 | **D-89** | ★ **`exportTrace()` 返回 `TraceResult` 而不是 `TraceEntry[]`** | 审计被 `maxAuditEntries` 裁剪之后，裸数组与完整轨迹**从数组上看不出区别** —— 宿主会把"只剩最近 3 条"当成"一共就 3 条"，这是 INV-17「不得静默丢弃」在**读侧**的同一个洞（写侧已有 `ENGINE_AUDIT_TRUNCATED` 诊断）。ⓐ 判据取「首条 `seq` 是否 > 1」（INV-4 保证 seq 从 1 起、无空洞）⇒ **不必**新增状态字段（新增就要动 `stateSchema` 与迁移表）；ⓑ `droppedFromSeq` / `droppedToSeq` 与 `plan()` 那条诊断的 `details.dropped*` **同名同口径** | ✅ 已落地（`runtime/trace.ts` 的 `traceOf`）。断言：seq 从 1 起 → `truncated:false`；首条 seq=5 → `truncated:true` + 区间 1~4；`maxAuditEntries:1` 端到端只剩 1 条却报丢 1~2 |
+| **D-90** ⚠️ | **`AuthResolver` 接口已发布但内核**不调用** `canAct()`（0.0.1 现状，待收口）** | 写官网教程做实测时发现：`EngineConfig.authResolver` 只在配置项白名单里出现（拼错才报 `OPTION_UNKNOWN`），`runtime/engine.ts` **没有任何一处**调用 `canAct()` —— 注入后返回 `false`，提交照样成功。★ 这不是"鉴权被绕过"的漏洞（部署契约本就是「任务中心是唯一对外入口，内核 API 不公开」），而是**接口与实现不一致**：对外宣称 11 项 SPI 可用，实际只有 10 项生效。ⓐ 收口有两条路：在 `doSubmit()` 里调用 `canAct()` 并在 `false` 时抛 `ENGINE_ACTION_VETOED`（复用现有码，不新增第 20 个），或**明确降级为"设计预留"并从对外口径里撤下**；ⓑ 在收口之前，**任何对外文档 / 官网都必须写明"当前版本内核不调用"**，绝不能写成"注入即生效"——那会让宿主误以为鉴权已经落地 | ⏳ 待收口（2026-10-02 官网实测发现）。现状已写入官网 `engine/guide/spi` 与 `engine/guide/errors` 的警示块 |

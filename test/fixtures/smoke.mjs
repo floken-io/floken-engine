@@ -2529,6 +2529,115 @@ await checkAsync('T22 · 实例不存在 → ENGINE_STATE_NOT_FOUND（不返回�
   }
 });
 
+// ---------------- ADR-009 · 宿主自定义扩展属性（真跑 dist 产物） ----------------
+
+const extDef = () =>
+  defOf(
+    'Process_1',
+    [
+      { id: 'Start_1', type: 'startEvent' },
+      {
+        id: 'GW',
+        type: 'exclusiveGateway',
+        extension: { 'acme:gwTag': 'main' },
+      },
+      {
+        id: 'Task_urgent',
+        type: 'userTask',
+        extension: {
+          'floken:approval': { approvers: [{ type: 'user', value: 'u_boss' }] },
+          'acme:priority': 'high',
+          'acme:slaHours': '48',
+          'acme:tags': ['finance'], // 结构化 → 应被跳过
+        },
+      },
+      {
+        id: 'Task_normal',
+        type: 'userTask',
+        extension: {
+          'floken:approval': { approvers: [{ type: 'user', value: 'u_staff' }] },
+          'acme:priority': 'low',
+        },
+      },
+      { id: 'End_1', type: 'endEvent' },
+    ],
+    [
+      { id: 'Flow_1', from: 'Start_1', to: 'GW' },
+      { id: 'Flow_2', from: 'GW', to: 'Task_urgent', condition: 'target.priority = "high"' },
+      { id: 'Flow_3', from: 'GW', to: 'Task_normal' },
+      { id: 'Flow_4', from: 'Task_urgent', to: 'End_1' },
+      { id: 'Flow_5', from: 'Task_normal', to: 'End_1' },
+    ],
+  );
+
+/** 收集落到的待办（`nodeId/assignee`） */
+const projectionOf = (seen) => ({
+  async apply(_id, delta) { for (const v of delta.added) seen.push(`${v.nodeId}/${v.assignee}`); },
+  async sync() { /* 无对账场景 */ },
+});
+
+await checkAsync('ADR-009 · ★ opt-in 后 **内置 FEEL** 写 `target.priority = "high"` 真选中加急分支', async () => {
+  const seen = [];
+  const { engine } = engineOn(extDef(), { extensionVars: {}, projection: projectionOf(seen) });
+  await engine.start('Process_1', { definitionVersion: 1, starter: 'u_x' });
+  sameArray(seen, ['Task_urgent/u_boss'], '★ 判据是真走了哪条分支，不是"调过并入函数"');
+});
+
+await checkAsync('ADR-009 · ★ 不 opt-in → 同一个表达式**静默走另一条分支**（行为钉死，文档要如实警示）', async () => {
+  const seen = [];
+  const { engine } = engineOn(extDef(), { projection: projectionOf(seen) });
+  await engine.start('Process_1', { definitionVersion: 1, starter: 'u_x' });
+  // `target` 未定义 → 等值比较求值为 false（不是 null），故**不抛错**地走错分支
+  sameArray(seen, ['Task_normal/u_staff'], '不 opt-in 的代价：安静地走错');
+});
+
+await checkAsync('ADR-009 · 只读字段恒给：`floken:*` 不外泄、结构化值跳过、键带前缀', async () => {
+  const seen = [];
+  const { engine } = engineOn(extDef(), {
+    projection: projectionOf(seen),
+    conditionHandler: {
+      evaluate(_expr, ctx) {
+        seen.push(JSON.stringify({ n: ctx.nodeExtensions, t: ctx.targetExtensions }));
+        return false;
+      },
+    },
+  });
+  await engine.start('Process_1', { definitionVersion: 1, starter: 'u_x' });
+  const bag = JSON.parse(seen.find((s) => s.includes('gwTag')));
+  eq(bag.n['acme:gwTag'], 'main', '当前节点 = 网关自己的属性');
+  eq(bag.t['acme:priority'], 'high', '目标节点 = 分支通向的节点');
+  eq(bag.t['floken:approval'], undefined, '★ 引擎自己的键不外泄');
+  eq(bag.t['acme:tags'], undefined, '★ 结构化值被跳过（与 XML 层同口径）');
+  eq(bag.t['acme:slaHours'], '48', '★ XML 往返后是字符串 —— cast 由宿主声明');
+});
+
+await checkAsync('ADR-009 · cast：声明 number 后 `"48"` 变 48；不声明则原样（引擎不猜类型）', async () => {
+  const seen = [];
+  const { engine } = engineOn(extDef(), {
+    extensionVars: { casts: { 'acme:slaHours': 'number' } },
+    projection: projectionOf(seen),
+    conditionHandler: {
+      evaluate(_expr, ctx) { seen.push(ctx.variables); return false; },
+    },
+  });
+  await engine.start('Process_1', { definitionVersion: 1, starter: 'u_x' });
+  const vars = seen.find((v) => typeof v === 'object' && 'target' in v);
+  eq(vars.target.slaHours, 48, '按声明还原成数字');
+  eq(typeof vars.target.slaHours, 'number', '类型是 number，不是 "48"');
+  eq(vars.node.gwTag, 'main', '并入层已去前缀（FEEL 引用不到带冒号的键）');
+});
+
+await checkAsync('ADR-009 · 变量名撞车 → 抛 OPTION_INVALID（不静默覆盖业务变量）', async () => {
+  const { engine } = engineOn(extDef(), { extensionVars: {} });
+  try {
+    await engine.start('Process_1', { definitionVersion: 1, starter: 'u_x', variables: { node: { mine: 1 } } });
+    throw new Error('应当抛错');
+  } catch (e) {
+    eq(e.code, 'ENGINE_OPTION_INVALID', '错误码');
+    assert(String(e.details?.reason ?? '').includes('node'), 'reason 要点名撞了哪个键');
+  }
+});
+
 // ---------------- 汇总 ----------------
 
 let failed = 0;

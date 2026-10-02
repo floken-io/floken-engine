@@ -182,6 +182,14 @@ export class ConditionUnresolved extends Error {
   readonly expression: string;
   readonly nodeId: string;
   /**
+   * ★ 该条件所在顺序流的**目标节点**（ADR-009 细则②）。
+   *
+   * 只有带上它，重跑时才能取出「这条分支通向的那个节点」的自定义扩展属性。
+   * 拿不到时为 `undefined`（宿主在门 2 自提供 `conditionsOf` 闭包时不会发生本哨兵，
+   * 但引擎自己的调用点**恒有** `OutFlow.to`）。
+   */
+  readonly toNodeId: string | undefined;
+  /**
    * ★ **到达该网关那一刻**的变量快照（T17）。
    *
    * 为什么必须由哨兵带出来：解析发生在**重跑**里，那时拿不到"当时"的状态。
@@ -195,12 +203,14 @@ export class ConditionUnresolved extends Error {
     expression: string,
     nodeId: string,
     variables: Readonly<Record<string, unknown>> = {},
+    toNodeId: string | undefined = undefined,
   ) {
     super(`condition of flow '${flowId}' is not resolved yet`);
     this.flowId = flowId;
     this.expression = expression;
     this.nodeId = nodeId;
     this.variables = variables;
+    this.toNodeId = toNodeId;
   }
 }
 
@@ -210,8 +220,9 @@ export function unresolvedCondition(
   expression: string,
   nodeId: string,
   variables: Readonly<Record<string, unknown>> = {},
+  toNodeId: string | undefined = undefined,
 ): ConditionUnresolved {
-  return new ConditionUnresolved(flowId, expression, nodeId, variables);
+  return new ConditionUnresolved(flowId, expression, nodeId, variables, toNodeId);
 }
 
 /** 判定并取出哨兵内容；不是哨兵 → `undefined`（**原样交给上层，绝不吞**） */

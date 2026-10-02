@@ -21,6 +21,9 @@ const ctxOf = (variables: Record<string, unknown>): ConditionCtx => ({
   instanceId: 'pi_1',
   nodeId: 'Gateway_1',
   variables,
+  // ★ ADR-009 的两个只读字段**恒在**（不 opt-in 也可能有值）；这里不造扩展属性 → `undefined`
+  nodeExtensions: undefined,
+  targetExtensions: undefined,
 });
 
 const feel = createFeelConditionHandler();
