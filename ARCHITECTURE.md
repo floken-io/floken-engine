@@ -1478,9 +1478,9 @@ class EngineError extends Error {
      `evaluateCondition()` 一处、无旁路，T14 那行"⏳ 网关接线在 T16"同步收口；
   ⑤ **D-41**（feel `warnings` 成功路径不上报）→ 明确改标 **v1.x**（要带就得扩
      `ConditionHandler.evaluate` 的返回类型，属 SPI 变更，不是顺手能做的）。
-  ⚠️ **仍挂 ⏳ 且本轮不冒充已闭环的**：**D-63**（`floken:call.version` 待模型层升成一等字段 ——
-  要改的是 `floken-moddle`，本包改不了）、**D-33**（加签的汇聚语义）、**D-27**（`startHooks` 若
-  将来要"发起后立刻通知"应单独立项）。这三条都不是"回写文档"能关的。
+  ⚠️ **仍挂 ⏳ 且本轮不冒充已闭环的**：**D-33**（加签的汇聚语义）、**D-27**（`startHooks` 若
+  将来要"发起后立刻通知"应单独立项）。这两条都不是"回写文档"能关的。
+  （**D-63** 已于 2026-10-03 由 Q48 S6 关闭 —— moddle v2 的 `call` 一等字段。）
 
 ---
 
@@ -1579,7 +1579,7 @@ class EngineError extends Error {
 | **D-60** ⚠️ | **副作用外源解析 + 按 `${nodeId}::${tokenId}` 缓存；条件上下文取「此刻」变量快照** | 两条缺一都会出事：① **不缓存** ⇒ 惰性解析每重跑一轮就调一次宿主（同一封邮件发 N 次）；② **缓存键不含 `tokenId`** ⇒ 并行分支上两个令牌同时到达同一个 `serviceTask`，第二个拿到第一个的结果；③ **条件哨兵不带变量快照** ⇒ 解析用的是提交前的旧变量，于是「`scriptTask` 把 amount 改成 9000、网关却按旧值走分支」—— §7.2 头号事故换一副面孔出现 | ✅ 已落地（`nodes/tasks.ts` 的 `NodeEffectUnresolved` + `eval/condition.ts` 的 `ConditionUnresolved.variables` + `engine.ts` 的 `effects` / `conditions` 两个 Map）。探针与单测各有「handler 只被调 1 次」与「落在高分分支」两条断言 |
 | **D-61** | **「禁止动态执行」的源码扫描必须去掉注释再扫** | 本包的注释里**正大光明地写着**「禁止 `eval` / `new Function` / `node:vm`」（那是规格引用）。不去注释的话，门禁会因为"文档里提到了它"而红 —— 那等于逼着实现把红线说明从注释里删掉，本末倒置。另：`engine.ts` 里那条错误提示的**字符串字面量**也不逐字写这三个名字（同样原因） | ✅ 已落地（`test/tasks.test.ts` 的 `stripComments` + 探针扫 `dist/*.js`，产物层已无注释故直接扫） |
 | **D-62** ⚠️ | **`AuditEntry.action` 出现第三类取值**：`callActivityReturn`（子实例回归） | `03` §9.1 原文写「19 项动作名 或 内核原语名」，而"子实例自己跑完了"既不是用户提交的动作、也不是某个原语。若复用 `approve` 之类就等于**伪造一条操作记录** —— 审计是合规主源，这条不能凑 | ✅ 已落地（常量 `CALL_RETURN_ACTION`）。门 2 下宿主完成回归时须传**同一个名字**，审计才对得上。✅ **已回写 `03` §9.1 的 `AuditEntry.action` 取值分类（2026-10-01 · T23，连同 D-87 的"原语永不进审计"一并写死）** |
-| **D-63** ⚠️ | **`CallActivity` 的版本绑定落在 `extension['floken:call'].version`，没有即抛** | BPMN **没有**"被调用版本"这个标准属性（Camunda 用自家 `calledElementVersion`，不是 OMG 的），模型层也无对应一等字段。而 INV-16 要求**设计期显式绑定** —— 引擎若回退"最新版"，就是「主流程没改、子流程悄悄换版，在途实例行为随发布而变」，且**没有任何报错**（AC-E10 要防的正是这个） | ✅ 已落地（`nodes/activities.ts` 的 `callTargetOf`）。⏳ 待模型层把它升成一等字段（届时本档只需改取值处，语义不变） |
+| **D-63** ✅ | **`CallActivity` 的版本绑定**：没有即抛 | BPMN **没有**"被调用版本"这个标准属性（Camunda 用自家 `calledElementVersion`，不是 OMG 的）。而 INV-16 要求**设计期显式绑定** —— 引擎若回退"最新版"，就是「主流程没改、子流程悄悄换版，在途实例行为随发布而变」，且**没有任何报错**（AC-E10 要防的正是这个） | ✅ **已闭环（2026-10-03，Q48 S6）**：moddle v2 把 `call` 升为**一等字段** `CallSpec { processId, version }`（`01` §4.3），引擎 `callTargetOf()` 改读 `node.call`，**`floken:call` 前缀随 XML 一起消失**；701 单测 + 103 探针全绿 |
 | **D-64** ⚠️ | **内嵌 `endEvent` 在展开时改写为 `subProcessExit`** | 不改的话 `runToWait` 一见 `endEvent` 就把令牌判**终结** —— 子流程出口后面的节点永远走不到，且没有任何报错（比抛错难查得多）。这是"拍平"方案唯一的语义陷阱 | ✅ 已落地（`SUBPROCESS_EXIT_TYPE`，落到自动直通）。测试钉住「内嵌结束事件的 `type` **不是** `endEvent`」 |
 | **D-65** ⚠️ | **`CallActivity` 的后续动作必须在 `queue.run()` 之外**（`followUp()`） | 子实例**一建就跑完**（被调用流程里没有人工节点）是常态，于是要回头唤醒父实例。若这段留在父实例的队列里就是「父等子、子等父」的**自锁** —— 而 `runtime/queue.ts` 档首写明**刻意不做重入检测**，并点名"应在 engine 层拦" | ✅ 已落地（`submit` = `queue.run(doSubmit)` → `followUp`；`startChild` / `resumeParent` 各自入**自己的**队列）。顺序：父队列已返回 → 建子实例 → 子实例终态 → 再入父队列唤醒 |
 | **D-66** ⚠️ | **父实例终态必须连坐终止在跑的子实例**（`haltLiveChildren`） | 父实例一终止，`resumeParent()` 就**永远不会**再触发 —— 子实例会继续产生待办，而宿主看主流程已是终态。「案子都撤了、子流程还在催人审批」是这类引擎的典型事故，且**没有任何报错** | ✅ 已落地（终止子实例 + 取消在途令牌 + 投影移除待办 + 递归到孙实例） |

@@ -42,13 +42,12 @@
  *
  *   被调用定义的版本**必须**是设计期显式写的，引擎**不**替宿主"取最新版" ——
  *   那正是 `AC-E10` 要防的事：主流程没改，被调用的子流程悄悄换了版本，
- *   在途实例的行为随发布而变。故版本读 `extension['floken:call'].version`，
+ *   在途实例的行为随发布而变。故版本读 **一等字段 `node.call.version`**，
  *   **没有就抛**（不是回退、不是猜）。
  *
- *   ⚠️ 为什么是 extension 而不是一等字段：BPMN **没有**"被调用版本"这个标准属性
- *   （Camunda 用自家 `calledElementVersion` 属性，不是 OMG 的），而模型层目前也没有对应的一等字段。
- *   此处按 `01-moddle` §4.5 的 extension 袋约定落键 `floken:call`，
- *   待模型层把它升成一等字段后本档只需改取值处 —— **语义不变**。
+ *   ★ **moddle v2（Q48）**：`call` 已是模型的一等字段 `CallSpec { processId, version }`
+ *   —— 没有"被调用版本"这个标准 BPMN 属性（Camunda 用自家的 `calledElementVersion`，
+ *   不是 OMG 的），所以模型层自己定义了这个一等字段，**D-63 由此关闭**。
  */
 
 import type { Flow, FlowNode } from '@floken-io/moddle';
