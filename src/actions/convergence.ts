@@ -17,17 +17,29 @@
  *      这一步**必须**在引擎侧，因为「令牌」是引擎的概念，模型层没有。
  */
 
-import {
-  requiredVotes,
-  // ★ 加别名：本文件要导出**引擎侧**的 `shouldTerminate`，与模型层同名会撞车。
-  //   用 `model` 前缀也顺带提醒读者：算法在模型层，这里只是适配。
-  shouldTerminate as modelShouldTerminate,
-} from '@floken-io/moddle';
 import type { ApprovalMode, NormalizedApproval, OnReject, VoteSpec } from '@floken-io/moddle';
 
 import { voteConfigInvalid, stateShapeInvalid } from '../core/errors.js';
+import { requirePeer } from '../core/peer.js';
 import { LIVE_TOKEN_STATES } from '../core/primitives.js';
 import type { Token, TokenState } from '../core/state.js';
+
+/**
+ * 惰性取 `@floken-io/moddle` 的汇聚算法（Q49：peer 依赖，不再内置）。
+ *
+ * ★ 只取本档用到的两个函数；`Pick` 让「引擎到底依赖 moddle 的哪几个符号」**可枚举**，
+ *   将来 peer 升级时一眼看出影响面。
+ * ★ 原本的 `shouldTerminate as modelShouldTerminate` 别名改由 `moddle().shouldTerminate`
+ *   承担 —— 与引擎侧同名导出不再撞车，语义还更直白。
+ */
+type ModdleConvergence = Pick<typeof import('@floken-io/moddle'), 'requiredVotes' | 'shouldTerminate'>;
+let moddleCache: ModdleConvergence | undefined;
+function moddle(): ModdleConvergence {
+  return (moddleCache ??= requirePeer<ModdleConvergence>('@floken-io/moddle', {
+    neededFor: 'countersign convergence: requiredVotes() / shouldTerminate()',
+    range: '>=0.0.4 <0.1.0',
+  }));
+}
 
 // ---------------- 上下文（`ARCHITECTURE.md` §6.3） ----------------
 
@@ -168,7 +180,7 @@ function voteSpecOf(ctx: ConvergeCtx): VoteSpec | undefined {
  */
 export function requiredOf(ctx: ConvergeCtx): number {
   assertConvergeCtx(ctx);
-  return requiredVotes(ctx.total, voteSpecOf(ctx));
+  return moddle().requiredVotes(ctx.total, voteSpecOf(ctx));
 }
 
 /**
@@ -182,7 +194,7 @@ export function requiredOf(ctx: ConvergeCtx): number {
 export function evaluateConvergence(ctx: ConvergeCtx): ConvergenceResult {
   assertConvergeCtx(ctx);
   const vote = voteSpecOf(ctx);
-  const required = requiredVotes(ctx.total, vote);
+  const required = moddle().requiredVotes(ctx.total, vote);
 
   /*
    * ★ D-21 / D-31 —— **已在模型层修正（2026-10-01），引擎侧短路随之删除**。
@@ -195,7 +207,7 @@ export function evaluateConvergence(ctx: ConvergeCtx): ConvergenceResult {
    * 短路遂整块删除 —— 否则就是**两份事实源**，将来必然漂移（D-19 的教训）。
    * 对账测试（③）已去掉该格的例外，一旦模型层再退化会立即红。
    */
-  const r = modelShouldTerminate(ctx.mode, ctx.total, ctx.approved, ctx.rejected, {
+  const r = moddle().shouldTerminate(ctx.mode, ctx.total, ctx.approved, ctx.rejected, {
     onReject: ctx.onReject,
     ...(vote === undefined ? {} : { vote }),
   });

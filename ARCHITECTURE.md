@@ -652,6 +652,13 @@ interface ActionContext {
 
 ```ts
 // 门 2：强一致（宿主自编排）
+//
+// ⚠️ 见 **D-91**：`plan()` 不传 `options.apply` 时**令牌不推进** —— `next` 只涨 `rev`
+//    并追加一条审计，**全程不报错**（实测：连审两次，`to` 三次都是 `Task_apply`）。
+//    而 `apply` 承载的是动作语义（原语调用序列），所需的 `compileAction()` **未导出**
+//    ⇒ 宿主目前组装不出完整的 `apply`。
+//    故门 2 的适用面 = 「在 `submit()` 之外补一段强一致的业务写」（计票表、业务主表），
+//    **不能**用来替掉 `submit()` 去推进流程。
 await db.tx(async (t) => {
   const state = await store.load(instanceId);                    // store 已绑定 t（宿主实现）
   const { next, delta } = engine.plan(state, { action: 'reject', actor, at: now() });
@@ -959,7 +966,17 @@ class EngineError extends Error {
 
 ### ADR-009：自定义扩展属性 —— 只读给全 + **可选**并入求值上下文
 
-- **状态**：✅ **已接受**（2026-10-02 用户拍板「引擎原生给」）｜ ✅ **已落地**（同日，随 `engine@0.0.2`）｜ **日期**：2026-10-02
+- **状态**：✅ **已接受**（2026-10-02 用户拍板「引擎原生给」）｜ ✅ **已落地**（同日，随 `engine@0.0.2`）｜ ★ **2026-10-03 改定（用户拍板：放开）**｜ **日期**：2026-10-02
+
+> ★ **2026-10-03 改定（随 `moddle@0.1.0` 的 JSON-only 重做一起）** —— 下表 ③ / ④ / ⑧ 三条已改：
+> | 项 | 原（0.0.2） | 现（0.0.3 起） |
+> |---|---|---|
+> | ③ 排除判据 | 排除 `floken:*` **前缀** | 排除**模型一等字段键 `NODE_RESERVED_KEYS`**（从 `@floken-io/moddle` 惰性取，引擎**不另写一份**） |
+> | ④ 值的范围 | **只给标量** | **结构化值也给**，只排除函数与 `undefined` |
+> | ⑧ 类型还原起因 | XML 往返后值一律字符串 | v2 是 JSON、值不受序列化约束；但**作者写 `"48"` 就还是字符串**，故 `casts` 仍需保留 |
+>
+> 理由：前缀机制随 XML 一起消失（`approval` / `call` 已是一等字段）；「只给标量」的唯一来源是
+> 「XML 属性只能装字符串」，JSON 里没有这个约束。放开后 opt-in 可直接写 `node.rule.maxAmount > 5000`。
 
 **背景**：宿主在 `@floken-io/designer` 里配的自定义扩展属性（`acme:priority`）落在 `node.extension['acme:priority']`，
 `moddle` 保证存得下、导得出、往返保真（`02-designer` §6.3 实测）。但引擎从 `extension` 里**只认两个键**
@@ -981,13 +998,13 @@ class EngineError extends Error {
 |---|---|---|
 | ① | **只读字段恒给** | `ConditionCtx` 增 `nodeExtensions` / `targetExtensions`（`Readonly<Record<string, unknown>>`）。**不配置也永远给** —— 纯增字段，0.0.1 行为逐字不变 |
 | ② | **谁的扩展** | `nodeExtensions` = **当前节点**（`ctx.nodeId`，即条件所在的网关/活动）；`targetExtensions` = **该条件所在顺序流的目标节点**（`OutFlow.to`）。二者都要，因为"加急等级"通常挂在**审批节点**（目标）而不是网关上。**取不到 → `undefined`**（不抛、不填空对象） |
-| ③ | **排除 `floken:*`** | 引擎自己的键（`floken:approval` 是对象）**一律不出现在给宿主的两袋里** —— ① 不外泄内部语义；② 对象值塞进求值上下文会污染 |
-| ④ | **只给标量** | 与 `moddle` XML 层同一口径（结构化值写不进属性）：`string` / `number` / `boolean` / `null` 给，对象与数组**跳过**。口径贯穿，宿主不用记两套规则 |
+| ③ | ★ **排除模型一等字段键**（2026-10-03 改定） | 排除 `NODE_RESERVED_KEYS`（`approval` / `call` / `script` …，**从 moddle 取**）：① 模型自己的键不外泄；② 它们已是一等字段，袋里再塞一份会让「哪个生效」变成未定义行为。⚠️ 原为「排除 `floken:*` 前缀」，前缀机制随 XML 消失 |
+| ④ | ★ **结构化值也给**（2026-10-03 改定） | 只排除**函数**与 `undefined`，对象/数组**原样给出**。⚠️ 原为「只给标量」，那条约束来自「XML 属性只能装字符串」，JSON 里没有 |
 | ⑤ | **默认不并入** | 自动并入会改变既有流程的求值结果。**只有**宿主显式声明 `EngineConfig.extensionVars` 才并入 —— 不声明 = 现状语义 |
 | ⑥ | **并入形态：两个对象，不平铺** | 挂成 `variables.node` / `variables.target`（键名可配）。FEEL 写 `target.priority = "high"`。**理由**：把"设计期配置"与"运行期数据"分成两个命名空间，撞车面从「每个键」降到「两个名字」 |
 | ⑥b | ★ **并入层的键要去前缀** | 实测：键带冒号时 **FEEL 根本引用不到它** —— `target.acme:priority` → `FeelSyntaxError: Unexpected token ':'`；`target["acme:priority"]` → **`null`**（`[...]` 在 FEEL 里是列表筛选/索引，不是对象取键）。故并入层写 `priority`，而**只读字段保留前缀**（`acme:priority`，原样）。去前缀后**同节点内不同前缀同名** → 抛 `OPTION_INVALID`（不静默二选一） |
 | ⑦ | **冲突 → 抛错，不静默** | 变量名已被占用（如用户自己有个 `node` 变量）→ 抛 **`ENGINE_OPTION_INVALID`**（复用现有码，**不新增第 20 个抛出码 / 第 3 个诊断码**），hint 指名改用 `extensionVars.key`。仅在 opt-in 后才可能发生 |
-| ⑧ | **类型还原靠宿主声明** | XML 往返后值**一律是字符串**（实测 `48 → "48"`），而 `slaHours > 24` 遇到 `"48"` 会按字符串比较 → 抛错。引擎**不猜类型**（猜 = 静默错误），按 `EngineConfig.extensionVars.casts` 声明转换；**二期**改由模型内 `floken:extensionTypes` 声明块承载（仍是 `floken:` 命名空间，不破本 ADR 前提） |
+| ⑧ | **类型还原靠宿主声明** | ★ **v2 改口径**：值不再受序列化约束（JSON 里 `48` 存进去就是 `48`），但**作者自己写 `"48"` 就还是字符串**，`slaHours > 24` 遇到 `"48"` 会按字符串比较 → 抛错。引擎**不猜类型**（猜 = 静默错误），按 `EngineConfig.extensionVars.casts` 声明转换；**二期**改由模型内 `floken:extensionTypes` 声明块承载 |
 | ⑨ | **不进 state、不破纯度** | 并入只发生在 `buildApply()` 的重跑里（`runtime/engine.ts`，唯一不纯文件），**写进求值上下文、绝不写进 `InstanceState.variables`**（否则状态膨胀且快照里存两份真相）。`plan()` 门 2 不经过它 —— 宿主自提供 `conditionsOf` 闭包， purity 不受影响 |
 
 **理由**：①+⑤ 让这次改动**对未 opt-in 的既有用户完全无感**（0.0.1 → 0.0.2 零 breaking）；
@@ -1590,3 +1607,4 @@ class EngineError extends Error {
 | **D-88** | ★ **`AuditEntry` 的 `tokenId` / `from` / `to` 由 `plan()` 填**，定位令牌**只准走 `subjectTokenOf()`**（已从 `engine.ts` 收口到 `core/task.ts`） | 「谁办的、从哪到哪」是 `exportTrace()` 的全部内容，而**只有 `plan()` 同时握着推进前的 `state` 与推进后的 `next`** —— 换任何一处都拿不到完整 before/after。⚠️ 定位判据若两处各写一份（"看起来差不多"的那种），就会出现「审计说办的是 A 分支、实际推进的是 B 分支」，而两份代码单独看都对。ⓐ 认不出时**留空而不猜**（会签下猜错 = `exportTrace()` 显示"李四办了两次"）；ⓑ 令牌**终结**（`completed` / `cancelled`）**照记 `to`** —— 走到 `End_1` 正是最后一跳，只有令牌**被移除**（会签展开取代占位令牌）才缺席；ⓒ `start()` 那条也补了（`tk_start`：`Start_1 → 第一个待办`），它是轨迹第一行 | ✅ 已落地（`runtime/plan.ts` ⑦ + `runtime/engine.ts` 的 `start()`）。断言：单令牌 / 会签按 actor 认领 / 认不出留空 / 终结照记 / 移除缺席 |
 | **D-89** | ★ **`exportTrace()` 返回 `TraceResult` 而不是 `TraceEntry[]`** | 审计被 `maxAuditEntries` 裁剪之后，裸数组与完整轨迹**从数组上看不出区别** —— 宿主会把"只剩最近 3 条"当成"一共就 3 条"，这是 INV-17「不得静默丢弃」在**读侧**的同一个洞（写侧已有 `ENGINE_AUDIT_TRUNCATED` 诊断）。ⓐ 判据取「首条 `seq` 是否 > 1」（INV-4 保证 seq 从 1 起、无空洞）⇒ **不必**新增状态字段（新增就要动 `stateSchema` 与迁移表）；ⓑ `droppedFromSeq` / `droppedToSeq` 与 `plan()` 那条诊断的 `details.dropped*` **同名同口径** | ✅ 已落地（`runtime/trace.ts` 的 `traceOf`）。断言：seq 从 1 起 → `truncated:false`；首条 seq=5 → `truncated:true` + 区间 1~4；`maxAuditEntries:1` 端到端只剩 1 条却报丢 1~2 |
 | **D-90** ⚠️ | **`AuthResolver` 接口已发布但内核**不调用** `canAct()`（0.0.1 现状，待收口）** | 写官网教程做实测时发现：`EngineConfig.authResolver` 只在配置项白名单里出现（拼错才报 `OPTION_UNKNOWN`），`runtime/engine.ts` **没有任何一处**调用 `canAct()` —— 注入后返回 `false`，提交照样成功。★ 这不是"鉴权被绕过"的漏洞（部署契约本就是「任务中心是唯一对外入口，内核 API 不公开」），而是**接口与实现不一致**：对外宣称 11 项 SPI 可用，实际只有 10 项生效。ⓐ 收口有两条路：在 `doSubmit()` 里调用 `canAct()` 并在 `false` 时抛 `ENGINE_ACTION_VETOED`（复用现有码，不新增第 20 个），或**明确降级为"设计预留"并从对外口径里撤下**；ⓑ 在收口之前，**任何对外文档 / 官网都必须写明"当前版本内核不调用"**，绝不能写成"注入即生效"——那会让宿主误以为鉴权已经落地 | ⏳ 待收口（2026-10-02 官网实测发现）。现状已写入官网 `engine/guide/spi` 与 `engine/guide/errors` 的警示块 |
+| **D-91** ⚠️ | **门 2 示例（§7.3）不传 `plan()` 的 `apply` 接缝 → 令牌不推进（静默）**；且宿主**无法**自行组装 `apply`（`compileAction()` 未导出） | 写官网「审计日志」页做实测时发现：`engine.plan(state, {action:'approve',actor})` 不传 `apply` 时，返回的 `next` **只涨 `rev` 并追加一条审计**，令牌停在原节点 —— 实测三步流程连审两次，`auditTrail` 的 `to` 三次都是 `Task_apply`、`status` 始终 `running`，**全程不报错**。§7.3 那段门 2 示例（`await db.tx(...)`）就没传 `apply`，照抄即踩。ⓐ 根因是 D-18 的两条接缝：`apply` 承载**动作语义**（原语调用序列），由 `submit()` 用 `compileAction()` 预先算好再闭包传入；而 `compileAction()` **刻意不导出**（见 `entries/index.ts` §动作层注释，避免把 `ACTION_SPECS` 内部结构钉成 semver 约束）⇒ 宿主拿不到 `PrimitiveCall[]`，做不出完整 `apply`。ⓑ 后果：**「门 2 = 强一致」目前只对「与动作语义无关的写」成立**（票签计票、回退业务表等宿主自己的 SQL），**不能**用来替掉 `submit()` 推进流程。ⓒ 收口三条路：① 导出一个 `createActionApplier()` 之类的工厂（把 `compileAction` + `step` 的组装收口，宿主只传已解析的 `assigneesOf`/`conditionsOf`）；② 把门 2 的定位**改口径**为「宿主在 `submit()` 之外补强一致写」并在文档里写死禁令；③ 让 `plan()` 在无 `apply` 时**抛错**而不是静默只涨 rev（改契约，代价最大）。ⓓ 收口之前：**任何门 2 示例都必须显式写出 `apply` 或标注"本例不推进令牌"**，绝不能给一段照抄就静默失效的代码 | ⏳ 待收口（2026-10-03 官网实测发现）。官网 `engine/guide/concurrency` 已写出「不传 `apply` 令牌不推进」；本文件 §7.3 示例待补警告 |

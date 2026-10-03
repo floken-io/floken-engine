@@ -268,9 +268,6 @@ function rename(n: FlowNode, prefix: string): FlowNode {
 
 // ---------------- CallActivity 的版本绑定（INV-16） ----------------
 
-/** ★ `callActivity` 的版本绑定扩展键（见档首"版本绑定"一节） */
-export const CALL_EXT_KEY = 'floken:call';
-
 /** 被调用目标：`processId` + **设计期显式绑定**的 `definitionVersion` */
 export interface CallTarget {
   readonly processId: string;
@@ -288,28 +285,29 @@ export interface CallTarget {
 export function callTargetOf(node: FlowNode | undefined): CallTarget | undefined {
   if (node === undefined || node.type !== 'callActivity') return undefined;
 
-  const raw = node.extension?.[CALL_EXT_KEY];
-  const version =
-    raw !== null && typeof raw === 'object' && !Array.isArray(raw)
-      ? (raw as Record<string, unknown>)['version']
-      : undefined;
+  /*
+   * ★ moddle v2（Q48）：`call` 是**一等字段**（`CallSpec { processId, version }`），
+   * v1 的 `extension['floken:call']` 随前缀机制一起消失。
+   */
+  const call = node.call as { version?: unknown; processId?: unknown } | undefined;
+  const version = call?.['version'];
   if (typeof version !== 'number' || !Number.isInteger(version) || version < 1) {
     throw stateShapeInvalid(
       `callActivity '${node.id}' must bind an explicit definition version (INV-16)`,
       {
         nodeId: node.id,
         // 诊断文案**刻意不逐字写**禁用 API 名（有一道源码扫描门禁），语义照样讲清楚
-        hint: `在该节点的 extension['${CALL_EXT_KEY}'] 上写 { version: <正整数> }；引擎不替宿主取最新版（AC-E10）`,
+        hint: `在该节点的一等字段 call 上写 { processId, version: <正整数> }；引擎不替宿主取最新版（AC-E10）`,
         got: version === undefined ? 'undefined' : String(version),
       },
     );
   }
 
-  const processId = typeof node.calledElement === 'string' ? node.calledElement.trim() : '';
+  const processId = typeof call?.['processId'] === 'string' ? call['processId'].trim() : '';
   if (processId === '') {
-    throw stateShapeInvalid(`callActivity '${node.id}' has no calledElement (the process to call)`, {
+    throw stateShapeInvalid(`callActivity '${node.id}' has no call.processId (the process to call)`, {
       nodeId: node.id,
-      hint: '给该节点写 calledElement = 被调用流程的 processId',
+      hint: '给该节点写 call = { processId: 被调用流程的 id, version: <正整数> }',
     });
   }
 

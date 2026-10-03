@@ -3,6 +3,61 @@
 本包遵循 [Semantic Versioning](https://semver.org/)，格式参考 [Keep a Changelog](https://keepachangelog.com/)。
 0.x 阶段跨包依赖写 `>=x.y.z <1.0.0`（不用 `^`）。
 
+## 0.0.3 — 2026-10-03
+
+★ 本次含**两项破坏性变更**（Q49 跨包 peer 化 + Q48 联动 Model JSON v2），
+`@floken-io/moddle` 的 peer 范围收紧到 `>=0.1.0 <0.2.0`。
+
+### 破坏性变更 · 一：`@floken-io/moddle` / `@floken-io/feel` 改为 peer（Q49）
+
+五个包之间**一律 peer，不再内置**。必需性按源码实际用法定：
+
+| peer | 必需性 | 说明 |
+|---|---|---|
+| `@floken-io/moddle` | **必需** | `normalizeApproval()` 在建图时同步调用，缺了就建不了图 |
+| `@floken-io/feel` | 可选 | 条件的默认 FEEL 实现，不装则网关条件必须自己提供 `conditionHandler` |
+
+- 新增 `src/core/peer.ts`：**惰性 + 同步**三级解析 —— ① `registerPeer()` 宿主注入
+  → ② `createRequire(import.meta.url)` → ③ 抛 `ENGINE_PEER_MISSING`。
+  - ★ 同步能成立靠 **Node ≥22.12 的 `createRequire` 可加载纯 ESM**（实测 moddle 114 / feel 45 个导出键），
+    故引擎的同步 API 一个都不用改成异步。
+  - 取 `createRequire` 必须走 `process.getBuiltinModule('module')`，**不能**静态 import
+    `node:module`（打包器会 externalize，浏览器连包都加载不了）。
+  - ⚠️ 本机 `.npmrc` 有 `legacy-peer-deps=true` 时 npm **不会自动装** peer
+    → `devDependencies` 里必须显式钉版本，且**宿主项目必须自己装**。
+- 新增错误码族第 5 类 **`PEER_`**（`ENGINE_PEER_MISSING`）；抛出码 19 → **20** 个。
+- 公开 `registerPeer` / `unregisterPeer` / `hasPeer` / `requirePeer` / `tryPeer`。
+- ⚠️ **绝不内置兜底实现**：缺失就抛并给安装命令。自带「简化版算法」会让两个实现悄悄分叉。
+
+### 破坏性变更 · 二：Model JSON v2 形状（Q48 的 S6 联动）
+
+`@floken-io/moddle` 0.1.0 起是 JSON-only，形状重做，引擎读取点同步改：
+
+- **`processes[]` 整层删除**：定义从 `def.processes[0]` 改为**顶层 `nodes` / `flows`**，
+  `createProcessGraph` 直接用 `definition.id !== processId` 判 `definitionMissing`。
+- **`approval` 提升为一等字段**：原读 `node.extension['floken:approval']`，现读 **`node.approval`**。
+- **`call` 提升为一等字段**：`callActivity` 的子流程引用改读 **`node.call`**（`{ processId, version }`）；
+  报错 hint 同步改指「在该节点的一等字段 `call` 上写 `{ processId, version }`」。
+- **`script` 改结构**：`script` + `scriptFormat` 两个字段 → **`script: { body, language }`**。
+- **`schemaVersion` 必须是 `2.0.0`**：引擎校验器对 major ≠ 2 直接报 error，**不提供 v1 → v2 迁移**。
+
+### 变更 · ADR-009 改定（用户 2026-10-03 拍板：放开）
+
+`nodeExtensions` / `targetExtensions` 的两条限制随 XML 一起松开：
+
+- **排除判据**：原排除 `floken:*` **前缀**（前缀机制随 XML 消失）→ 改为排除**模型一等字段键**
+  （`NODE_RESERVED_KEYS`，**从 `@floken-io/moddle` 取，引擎不另写一份**）。
+- **值的范围**：原**只给标量** → 改为**结构化值也给**（`{ maxAmount: 5000, tags: ['vip'] }` 原样给出），
+  **只排除函数**与 `undefined`。
+- 收益：opt-in 后可直接写 `node.rule.maxAmount > 5000` 这类表达式。
+- 三条硬边界不变：**默认不并入求值上下文** / **绝不写进 `InstanceState.variables`** /
+  引擎只认 moddle 给的保留键清单。
+
+### 验证
+
+- 单测 **701/701** 全绿；冷启动探针 **103/103** 全绿（跑真 `dist/`）；`verify` 门禁全绿。
+- 夹具与探针全部迁到 v2 形状（`test/helpers/definition.ts` / `test/fixtures/smoke.mjs`）。
+
 ## 0.0.2 — 2026-10-02
 
 ### 新增

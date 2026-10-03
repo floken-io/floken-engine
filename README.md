@@ -10,10 +10,22 @@
 ## 安装
 
 ```bash
-npm i @floken-io/engine
+npm i @floken-io/engine @floken-io/moddle
 ```
 
-`@floken-io/feel` 是默认依赖，装完即可在网关上写 `amount > 5000` 这样的条件，无需额外接线。
+**`@floken-io/moddle` 是必需 peer**（审批配置由它归一化）；缺失时引擎抛
+`ENGINE_PEER_MISSING` 并在 `hint` 里给出安装命令——不内置兜底实现。
+
+`@floken-io/feel` 是**可选** peer，装了即可在网关上写 `amount > 5000` 这样的条件，无需额外接线。
+
+浏览器 / 打包器环境里 `node:module` 取不到，用 `registerPeer()` 显式注入：
+
+```ts
+import { registerPeer } from '@floken-io/engine';
+import * as moddle from '@floken-io/moddle';
+
+registerPeer('@floken-io/moddle', moddle);   // 任何 engine 调用之前执行一次
+```
 
 ## 快速开始
 
@@ -22,26 +34,23 @@ npm i @floken-io/engine
 ```ts
 import { createEngine, createMemoryStore } from '@floken-io/engine';
 
-// 流程定义：通常由 @floken-io/moddle 从 BPMN XML 读进来，这里直接手写
+// 流程定义：通常由 @floken-io/designer 产出，这里直接手写（Model JSON v2 形状）
 const def = {
-  schemaVersion: '1.0.0',
-  id: 'Definitions_1',
-  processes: [{
-    id: 'Process_1',
-    nodes: [
-      { id: 'Start_1', type: 'startEvent' },
-      { id: 'Task_1', type: 'userTask',
-        extension: { 'floken:approval': { approvers: [{ type: 'user', value: 'u_manager' }] } } },
-      { id: 'Task_2', type: 'userTask',
-        extension: { 'floken:approval': { approvers: [{ type: 'user', value: 'u_finance' }] } } },
-      { id: 'End_1', type: 'endEvent' },
-    ],
-    flows: [
-      { id: 'f1', from: 'Start_1', to: 'Task_1' },
-      { id: 'f2', from: 'Task_1', to: 'Task_2' },
-      { id: 'f3', from: 'Task_2', to: 'End_1' },
-    ],
-  }],
+  schemaVersion: '2.0.0',
+  id: 'Process_1',
+  nodes: [
+    { id: 'Start_1', type: 'startEvent' },
+    { id: 'Task_1', type: 'userTask',
+      approval: { approvers: [{ type: 'user', value: 'u_manager' }] } },
+    { id: 'Task_2', type: 'userTask',
+      approval: { approvers: [{ type: 'user', value: 'u_finance' }] } },
+    { id: 'End_1', type: 'endEvent' },
+  ],
+  flows: [
+    { id: 'f1', from: 'Start_1', to: 'Task_1' },
+    { id: 'f2', from: 'Task_1', to: 'Task_2' },
+    { id: 'f3', from: 'Task_2', to: 'End_1' },
+  ],
 };
 
 const engine = createEngine({
@@ -128,7 +137,7 @@ console.log(trace.entries.map((e) => `${e.seq} ${e.actor} ${e.action} ${e.from} 
 | 包 | 用途 |
 |---|---|
 | [`@floken-io/feel`](https://www.npmjs.com/package/@floken-io/feel) | FEEL 表达式语言 |
-| [`@floken-io/moddle`](https://www.npmjs.com/package/@floken-io/moddle) | BPMN 2.0 模型与 XML 转换 |
+| [`@floken-io/moddle`](https://www.npmjs.com/package/@floken-io/moddle) | Model JSON 数据模型与校验（**必需 peer**） |
 | [`@floken-io/dmn`](https://www.npmjs.com/package/@floken-io/dmn) | DMN 1.5 决策引擎 |
 | `@floken-io/engine` | 流程内核与审批动作（本包） |
 | `@floken-io/designer` | 流程画布与审批配置面板（开发中） |

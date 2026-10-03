@@ -6,6 +6,10 @@
  *
  * ★ 只造**最小合法**的图：`createProcessGraph` 只认 `startEvent` / `userTask` / `endEvent`
  *   三类（T11 边界），多出向与子流程刻意不在本夹具里 —— 它们的语义还没实现。
+ *
+ * ★ **moddle v2（Q48）形状变更**：`processes[]` 已删除、节点与连线上提；
+ *   `approval` / `call` 提升为**一等字段**（v1 住在 `extension['floken:*']` 里）。
+ *   本夹具把这些差异**收在这一处**，701 个用例不必逐个改。
  */
 import type { Flow, FlowNode, ProcessDefinition } from '@floken-io/moddle';
 
@@ -20,7 +24,7 @@ export interface TestNode {
    * 只在「一条条件都没中」时才走。
    */
   defaultFlow?: string;
-  /** `floken:approval` 的原始配置（未归一化 —— 归一化由 `createProcessGraph` 做） */
+  /** ★ v2 一等字段：`approval`（v1 是 `extension['floken:approval']`） */
   approval?: Record<string, unknown>;
   /**
    * T17：任务类节点的取参。**只造引擎真的会读的那几个字段**，
@@ -66,15 +70,15 @@ export interface TestNode {
    */
   cancelActivity?: boolean;
   /**
-   * `floken:call` 扩展（`callActivity` 的**版本绑定**，INV-16）。
-   * 缺它 → 建图 / 推进时抛（引擎**不**替宿主取最新版）。
+   * ★ v2 一等字段：`call`（`CallSpec { processId, version }`）。
+   * 旧写法 `calledElement` 仍接受 —— 夹具会把它并进 `call.processId`。
    */
   call?: Record<string, unknown>;
   /**
    * ★ ADR-009：直接挂到 `node.extension` 上的**任意额外键**（宿主自定义扩展属性）。
    *
-   * 与 `approval` 合并进同一个袋子（真实模型里它们本来共存），
-   * 用来测「`floken:*` 被排除、其余原样给出」。
+   * v2 起 `extension` 是**任意 JSON**（无前缀、不限标量）；一等字段（`approval` / `call` …）
+   * 与它分开存 —— 用来测「保留键被排除、其余原样给出」。
    */
   extension?: Record<string, unknown>;
 }
@@ -94,19 +98,23 @@ function buildNodes(list: readonly TestNode[]): FlowNode[] {
     if (n.name !== undefined) node.name = n.name;
     if (n.formKey !== undefined) node.formKey = n.formKey;
     if (n.defaultFlow !== undefined) node.defaultFlow = n.defaultFlow;
-    if (n.approval !== undefined) node.extension = { 'floken:approval': n.approval };
-    if (n.call !== undefined) {
-      node.extension = { ...(node.extension as Record<string, unknown> | undefined), 'floken:call': n.call };
+    if (n.approval !== undefined) node.approval = n.approval;
+    // ★ v2：`call` 是一等字段；旧写法 `calledElement` 并进它的 `processId`
+    if (n.call !== undefined || n.calledElement !== undefined) {
+      node.call = {
+        ...(n.call ?? {}),
+        ...(n.calledElement === undefined ? {} : { processId: n.calledElement }),
+      };
     }
-    if (n.extension !== undefined) {
-      node.extension = { ...(node.extension as Record<string, unknown> | undefined), ...n.extension };
+    if (n.extension !== undefined) node.extension = { ...(n.extension as Record<string, unknown>) };
+    if (n.script !== undefined) node.script = { body: n.script };
+    if (n.scriptFormat !== undefined) {
+      node.script = { ...(node.script as Record<string, unknown> | undefined), language: n.scriptFormat };
     }
-    if (n.script !== undefined) node.script = n.script;
-    if (n.scriptFormat !== undefined) node.scriptFormat = n.scriptFormat;
     if (n.implementation !== undefined) node.implementation = n.implementation;
     if (n.operationRef !== undefined) node.operationRef = n.operationRef;
     if (n.triggeredByEvent !== undefined) node.triggeredByEvent = n.triggeredByEvent;
-    if (n.calledElement !== undefined) node.calledElement = n.calledElement;
+    // `calledElement` 已在上面并进 `call.processId`（v2 一等字段）
     if (n.attachedTo !== undefined) node.attachedTo = n.attachedTo;
     if (n.cancelActivity !== undefined) node.cancelActivity = n.cancelActivity;
     if (n.messageRef !== undefined) node.messageRef = n.messageRef;
@@ -137,11 +145,17 @@ export function makeDefinition(opts: {
   const nodes = buildNodes(opts.nodes);
   const flows = buildFlows(opts.flows);
 
+  /*
+   * ★ v2：一个定义**就是**一个流程，没有 `processes[]`。
+   * 于是「定义 id」与「流程 id」合一 —— 取 `processId` 优先（引擎按它建图）。
+   */
   return {
-    schemaVersion: '1.0.0',
-    id: opts.id ?? 'Definitions_1',
+    schemaVersion: '2.0.0',
+    // ★ `id` 选项保留仅为兼容旧夹具的书写（它不再影响建图）；身份一律由 `processId` 决定
+    id: opts.processId ?? 'Process_1',
     ...(opts.version === undefined ? {} : { version: opts.version }),
-    processes: [{ id: opts.processId ?? 'Process_1', nodes, flows }],
+    nodes,
+    flows,
   };
 }
 
@@ -157,7 +171,7 @@ export const userApproval = (value: string, extra: Record<string, unknown> = {})
  */
 export function expenseDefinition(): ProcessDefinition {
   return makeDefinition({
-    id: 'Definitions_expense',
+    processId: 'Process_1',
     version: 1,
     nodes: [
       { id: 'Start_1', type: 'startEvent', name: '提交报销' },

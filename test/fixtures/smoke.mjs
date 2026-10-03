@@ -76,14 +76,24 @@ check('SPI 分组 3+4+2+2，且扁平化后与 SPI_NAMES 逐项一致', () => {
 
 // ---------------- 错误码 ----------------
 
-check('抛出码 19 个（ACTION 8 / STATE 7 / PERSIST 2 / OPTION 2）', () => {
+check('抛出码 20 个（ACTION 8 / STATE 7 / PERSIST 2 / OPTION 2 / PEER 1）', () => {
   const codes = Object.values(m.ENGINE_ERROR_CODES);
-  eq(codes.length, 19, '总数');
+  eq(codes.length, 20, '总数');
   eq(byPrefix(codes, 'ACTION'), 8, 'ACTION 族');
   eq(byPrefix(codes, 'STATE'), 7, 'STATE 族');
   eq(byPrefix(codes, 'PERSIST'), 2, 'PERSIST 族');
   eq(byPrefix(codes, 'OPTION'), 2, 'OPTION 族');
-  eq(byPrefix(codes, 'ACTION') + byPrefix(codes, 'STATE') + byPrefix(codes, 'PERSIST') + byPrefix(codes, 'OPTION'), 19, '四族之和');
+  // Q49（2026-10-03）：五个包之间一律 peer，缺失在运行期才暴露 → 新增 PEER 族。
+  eq(byPrefix(codes, 'PEER'), 1, 'PEER 族');
+  eq(
+    byPrefix(codes, 'ACTION') +
+      byPrefix(codes, 'STATE') +
+      byPrefix(codes, 'PERSIST') +
+      byPrefix(codes, 'OPTION') +
+      byPrefix(codes, 'PEER'),
+    20,
+    '五族之和',
+  );
   assert(new Set(codes).size === codes.length, '码值有重复');
   // T12 新增：门 1 否决。与 ACTION_NOT_ALLOWED 的区别是「设计期开关 vs 运行期宿主否决」
   eq(m.ENGINE_ERROR_CODES.ACTION_VETOED, 'ENGINE_ACTION_VETOED', 'ACTION_VETOED');
@@ -300,8 +310,8 @@ check('conformance 公开面 = 4 个运行时导出（内部断言工具未泄�
  *   探针直接拿自己造的两版定义跑一遍 —— 既验公开面，也验「套件在真实产物上跑得动」。
  */
 await checkAsync('T19 · `runDefinitionConformance` 可跑：合规实现全绿，忽略 version 的必红', async () => {
-  const v1 = { schemaVersion: '1.0.0', id: 'D1', version: 1, processes: [{ id: 'probe', nodes: [], flows: [] }] };
-  const v2 = { schemaVersion: '1.0.0', id: 'D2', version: 2, processes: [{ id: 'probe', nodes: [{ id: 'X', type: 'userTask' }], flows: [] }] };
+  const v1 = { schemaVersion: '2.0.0', id: 'probe', version: 1, nodes: [], flows: [] };
+  const v2 = { schemaVersion: '2.0.0', id: 'probe', version: 2, nodes: [{ id: 'X', type: 'userTask' }], flows: [] };
   const fixtures = [
     { processId: 'probe', version: 1, definition: v1 },
     { processId: 'probe', version: 2, definition: v2 },
@@ -591,25 +601,31 @@ check('T10 · INV-9：restTokenIds 精确点名残余在途令牌', () => {
 });
 
 /**
- * ★ **D-19 的落点**：`dist/index.js` 从「零运行时依赖」变成**依赖 `@floken-io/moddle`**
- * （T10 起真正消费模型层的汇聚算法）。这件事必须**可断言**，
- * 否则将来有人再加一个第三方依赖也不会被发现 —— 白名单就是在这里守的。
+ * ★ **Q49（2026-10-03 拍板）的落点**：五个包之间**一律 peer，不再内置**。
+ *
+ * 于是本条判据整个反过来 —— 产物里**不该再出现任何静态 import 的 `@floken-io/*`**：
+ * 兄弟包改由 `core/peer.ts` 在运行期按名字解析（Node 侧 `createRequire`，
+ * 浏览器侧 `registerPeer()` 注入），「依赖谁」从**构建期**挪到了**运行期**。
+ *
+ * ⚠️ D-19 的红线**没放松**（汇聚算法仍必须在模型层、引擎不得自带一份副本）：
+ *    上面那条白名单删了，改由「peer 解析目标必须在产物里出现」继续守 ——
+ *    加载器把包名写成字符串常量，若哪天被误删 / 被摇树掉，这条会立刻红。
  */
-/**
- * ⚠️ 白名单 **两个**（不是"只允许 moddle"）：`03-engine` §7.4 的 **Q30** 已拍板
- * `@floken-io/feel` 是 engine 的**普通依赖**（不是可选 peer）——「金额 > N 走谁」是
- * 中国式审批最高频的场景，不能默认装出来的引擎条件分支是坏的（T14 接线后本条才变红）。
- */
-const ALLOWED_EXTERNAL_DEPS = ['@floken-io/moddle', '@floken-io/feel'];
+const PEER_SPECIFIERS = ['@floken-io/moddle', '@floken-io/feel'];
 
-check('T10 · D-19：产物的外部依赖**只允许** moddle + feel（Q30）', () => {
+check('T10 · D-19：产物**零静态**兄弟包依赖（Q49 peer 化）', () => {
   const src = readFileSync(new URL('../../dist/index.js', import.meta.url), 'utf8');
   const externals = [...src.matchAll(/^import[\s\S]*?from\s+'([^']+)'/gm)]
     .map((x) => x[1])
     .filter((s) => !s.startsWith('./'));
-  const unexpected = externals.filter((s) => !ALLOWED_EXTERNAL_DEPS.includes(s));
-  eq(unexpected.length, 0, `计划外的外部依赖：${unexpected.join(', ') || '无'}`);
-  assert(externals.includes('@floken-io/moddle'), '应当依赖 @floken-io/moddle（汇聚算法在模型层）');
+  const flokenStatic = externals.filter((s) => s.startsWith('@floken-io/'));
+  eq(flokenStatic.length, 0, `产物不得静态 import 兄弟包（实得 ${flokenStatic.join(', ') || '无'}）`);
+  // 除 node: 内置外不许有别的静态外部依赖
+  const thirdParty = externals.filter((s) => !s.startsWith('node:'));
+  eq(thirdParty.length, 0, `计划外的外部依赖：${thirdParty.join(', ') || '无'}`);
+  for (const name of PEER_SPECIFIERS) {
+    assert(src.includes(name), `peer 解析目标 ${name} 应出现在产物中（证明接线未被摇掉）`);
+  }
 });
 
 // ---------------- T11 冒烟：createEngine 端到端（AC-E13「零配置跑通报销」） ----------------
@@ -622,36 +638,31 @@ check('T10 · D-19：产物的外部依赖**只允许** moddle + feel（Q30）',
 const T_SMOKE = '2026-10-01T00:00:00.000Z';
 
 const expenseDef = {
-  schemaVersion: '1.0.0',
-  id: 'Definitions_expense',
+  schemaVersion: '2.0.0',
+  id: 'Process_1',
   version: 1,
-  processes: [
-    {
-      id: 'Process_1',
-      nodes: [
+nodes: [
         { id: 'Start_1', type: 'startEvent', name: '提交报销' },
         {
           id: 'Task_apply',
           type: 'userTask',
           name: '部门经理审批',
           formKey: 'form_expense',
-          extension: { 'floken:approval': { approvers: [{ type: 'user', value: 'u_manager' }] } },
+          approval: { approvers: [{ type: 'user', value: 'u_manager' }] },
         },
         {
           id: 'Task_finance',
           type: 'userTask',
           name: '财务审批',
-          extension: { 'floken:approval': { approvers: [{ type: 'user', value: 'u_finance' }] } },
+          approval: { approvers: [{ type: 'user', value: 'u_finance' }] },
         },
         { id: 'End_1', type: 'endEvent', name: '结束' },
       ],
-      flows: [
+  flows: [
         { id: 'Flow_1', from: 'Start_1', to: 'Task_apply' },
         { id: 'Flow_2', from: 'Task_apply', to: 'Task_finance' },
         { id: 'Flow_3', from: 'Task_finance', to: 'End_1' },
       ],
-    },
-  ],
 };
 
 const makeProjection = () => {
@@ -932,19 +943,15 @@ check('T13 新增导出齐备（门 2 自编排要独立完成汇聚就靠它们
  * 这是「中国式审批」的头号场景在**产物层**的复现 —— vitest 那份跑的是 `src/`。
  */
 const countersignDef = {
-  schemaVersion: '1.0.0',
-  id: 'Definitions_countersign',
-  processes: [
-    {
-      id: 'Process_cs',
-      nodes: [
+  schemaVersion: '2.0.0',
+  id: 'Process_cs',
+nodes: [
         { id: 'Start_1', type: 'startEvent' },
         {
           id: 'Task_sign',
           type: 'userTask',
           name: '会签',
-          extension: {
-            'floken:approval': {
+          approval: {
               approvers: [
                 { type: 'user', value: 'u1' },
                 { type: 'user', value: 'u2' },
@@ -953,25 +960,20 @@ const countersignDef = {
               mode: 'all',
               onReject: 'abort',
             },
-          },
         },
         {
           id: 'Task_next',
           type: 'userTask',
           name: '下一节点',
-          extension: {
-            'floken:approval': { approvers: [{ type: 'user', value: 'u9' }] },
-          },
+          approval: { approvers: [{ type: 'user', value: 'u9' }] },
         },
         { id: 'End_1', type: 'endEvent' },
       ],
-      flows: [
+  flows: [
         { id: 'F1', from: 'Start_1', to: 'Task_sign' },
         { id: 'F2', from: 'Task_sign', to: 'Task_next' },
         { id: 'F3', from: 'Task_next', to: 'End_1' },
       ],
-    },
-  ],
 };
 
 await checkAsync('会签冒烟（T13）：3 人展开 → 全员通过 → 汇聚推进 → 完成', async () => {
@@ -1110,17 +1112,24 @@ await checkAsync('T14 · AC-E9 无豁免：坏 handler 的返回值被挡在出�
 check('T14 · Q33：dist 内无时态说明符（条件求值路径不碰时态）', () => {
   const files = readdirSync('dist').filter((f) => f.endsWith('.js'));
   const specifiers = new Set();
+  let all = '';
   for (const f of files) {
     const src = readFileSync(`dist/${f}`, 'utf8');
+    all += src;
     for (const mm of src.matchAll(/(?:from|import)\s*\(?\s*['"]([^'"]+)['"]/g)) {
       specifiers.add(mm[1]);
     }
   }
   const hits = [...specifiers].filter((s) => /^temporal|^@floken-io\/feel\/temporal/.test(s));
   eq(hits.length, 0, `时态说明符（实得 ${JSON.stringify(hits)}）`);
+  /*
+   * ★ Q49 后条件求值**不再静态 import** `@floken-io/feel`（改由 peer 加载器按名字解析），
+   *   所以「默认依赖已接线」这条改守**解析目标字符串**是否还在产物里 ——
+   *   包名被摇树掉 / 写错名字，这条立刻红。
+   */
   assert(
-    [...specifiers].some((s) => s === '@floken-io/feel'),
-    '条件求值确实引用了 @floken-io/feel（默认依赖已接线）',
+    all.includes('@floken-io/feel'),
+    '条件求值的 peer 解析目标 @floken-io/feel 仍在产物中（接线未被摇掉）',
   );
 });
 
@@ -1128,59 +1137,48 @@ check('T14 · Q33：dist 内无时态说明符（条件求值路径不碰时态�
 
 /** `Start_1 → Task_a（u_a，可委派/转办）→ Task_b（u_b）→ End_1` */
 const regressDef = {
-  schemaVersion: '1.0.0',
-  id: 'Definitions_regress',
+  schemaVersion: '2.0.0',
+  id: 'Process_1',
   version: 1,
-  processes: [
-    {
-      id: 'Process_1',
-      nodes: [
+nodes: [
         { id: 'Start_1', type: 'startEvent' },
         {
           id: 'Task_a',
           type: 'userTask',
           name: '一审',
-          extension: {
-            'floken:approval': {
+          approval: {
               approvers: [{ type: 'user', value: 'u_a' }],
               delegate: { allowed: true },
               transfer: { allowed: true },
             },
-          },
         },
         {
           id: 'Task_b',
           type: 'userTask',
           name: '二审',
-          extension: { 'floken:approval': { approvers: [{ type: 'user', value: 'u_b' }] } },
+          approval: { approvers: [{ type: 'user', value: 'u_b' }] },
         },
         { id: 'End_1', type: 'endEvent' },
       ],
-      flows: [
+  flows: [
         { id: 'Flow_1', from: 'Start_1', to: 'Task_a' },
         { id: 'Flow_2', from: 'Task_a', to: 'Task_b' },
         { id: 'Flow_3', from: 'Task_b', to: 'End_1' },
       ],
-    },
-  ],
 };
 
 /** `Start_1 → Task_sign（3 人会签，可任意退回）→ Task_next（u9）→ End_1` */
 const csRollbackDef = {
-  schemaVersion: '1.0.0',
-  id: 'Definitions_cs_rollback',
+  schemaVersion: '2.0.0',
+  id: 'Process_1',
   version: 1,
-  processes: [
-    {
-      id: 'Process_1',
-      nodes: [
+nodes: [
         { id: 'Start_1', type: 'startEvent' },
         {
           id: 'Task_sign',
           type: 'userTask',
           name: '会签',
-          extension: {
-            'floken:approval': {
+          approval: {
               approvers: [
                 { type: 'user', value: 'u1' },
                 { type: 'user', value: 'u2' },
@@ -1190,23 +1188,20 @@ const csRollbackDef = {
               onReject: 'abort',
               reject: { allowed: true, allowArbitrary: true, allowedTargets: ['starter'] },
             },
-          },
         },
         {
           id: 'Task_next',
           type: 'userTask',
           name: '下一节点',
-          extension: { 'floken:approval': { approvers: [{ type: 'user', value: 'u9' }] } },
+          approval: { approvers: [{ type: 'user', value: 'u9' }] },
         },
         { id: 'End_1', type: 'endEvent' },
       ],
-      flows: [
+  flows: [
         { id: 'Flow_1', from: 'Start_1', to: 'Task_sign' },
         { id: 'Flow_2', from: 'Task_sign', to: 'Task_next' },
         { id: 'Flow_3', from: 'Task_next', to: 'End_1' },
       ],
-    },
-  ],
 };
 
 const regressCtx = () => {
@@ -1311,37 +1306,34 @@ await checkAsync('T15 · D-34：组内 returnTo → 整组取消 + 重新展开�
  * ★ 这是 T16 的头号场景在**产物层**的复现：并行分叉 / 汇聚合流 / 全分支结束。
  */
 const parallelDef = {
-  schemaVersion: '1.0.0',
-  id: 'Definitions_parallel',
+  schemaVersion: '2.0.0',
+  id: 'Process_par',
   version: 1,
-  processes: [
-    {
-      id: 'Process_par',
-      nodes: [
+nodes: [
         { id: 'Start_1', type: 'startEvent' },
         { id: 'Fork', type: 'parallelGateway', name: '并行分叉' },
         {
           id: 'Task_a',
           type: 'userTask',
           name: 'A 分支',
-          extension: { 'floken:approval': { approvers: [{ type: 'user', value: 'u_a' }] } },
+          approval: { approvers: [{ type: 'user', value: 'u_a' }] },
         },
         {
           id: 'Task_b',
           type: 'userTask',
           name: 'B 分支',
-          extension: { 'floken:approval': { approvers: [{ type: 'user', value: 'u_b' }] } },
+          approval: { approvers: [{ type: 'user', value: 'u_b' }] },
         },
         { id: 'Join', type: 'parallelGateway', name: '并行汇聚' },
         {
           id: 'Task_end',
           type: 'userTask',
           name: '终审',
-          extension: { 'floken:approval': { approvers: [{ type: 'user', value: 'u_z' }] } },
+          approval: { approvers: [{ type: 'user', value: 'u_z' }] },
         },
         { id: 'End_1', type: 'endEvent' },
       ],
-      flows: [
+  flows: [
         { id: 'F1', from: 'Start_1', to: 'Fork' },
         { id: 'F2', from: 'Fork', to: 'Task_a' },
         { id: 'F3', from: 'Fork', to: 'Task_b' },
@@ -1350,8 +1342,6 @@ const parallelDef = {
         { id: 'F6', from: 'Join', to: 'Task_end' },
         { id: 'F7', from: 'Task_end', to: 'End_1' },
       ],
-    },
-  ],
 };
 
 const parEngine = () => {
@@ -1397,33 +1387,30 @@ await checkAsync('T16 · 并行：分叉出两条 → 都办完合流成一条 �
  *   「金额 > N 走谁」是中国式审批最高频的场景，装出来的引擎必须**默认就会算**。
  */
 const amountDef = {
-  schemaVersion: '1.0.0',
-  id: 'Definitions_amount',
+  schemaVersion: '2.0.0',
+  id: 'Process_amt',
   version: 1,
-  processes: [
-    {
-      id: 'Process_amt',
-      nodes: [
+nodes: [
         { id: 'Start_1', type: 'startEvent' },
         {
           id: 'Task_1',
           type: 'userTask',
-          extension: { 'floken:approval': { approvers: [{ type: 'user', value: 'u_1' }] } },
+          approval: { approvers: [{ type: 'user', value: 'u_1' }] },
         },
         { id: 'G', type: 'exclusiveGateway', defaultFlow: 'F_lead' },
         {
           id: 'Task_boss',
           type: 'userTask',
-          extension: { 'floken:approval': { approvers: [{ type: 'user', value: 'u_boss' }] } },
+          approval: { approvers: [{ type: 'user', value: 'u_boss' }] },
         },
         {
           id: 'Task_lead',
           type: 'userTask',
-          extension: { 'floken:approval': { approvers: [{ type: 'user', value: 'u_lead' }] } },
+          approval: { approvers: [{ type: 'user', value: 'u_lead' }] },
         },
         { id: 'End_1', type: 'endEvent' },
       ],
-      flows: [
+  flows: [
         { id: 'F1', from: 'Start_1', to: 'Task_1' },
         { id: 'F2', from: 'Task_1', to: 'G' },
         { id: 'F_boss', from: 'G', to: 'Task_boss', condition: 'amount > 5000' },
@@ -1431,8 +1418,6 @@ const amountDef = {
         { id: 'F3', from: 'Task_boss', to: 'End_1' },
         { id: 'F4', from: 'Task_lead', to: 'End_1' },
       ],
-    },
-  ],
 };
 
 const amtEngine = () => {
@@ -1518,28 +1503,23 @@ check('T17 · ★ dist 产物无动态执行 API（无 new Function / node:vm / 
 
 /** 一条「自动任务 + 人工审批」的最小流程；`auto` 节点的类型由调用方给 */
 const autoDef = (auto) => ({
-  schemaVersion: '1.0.0',
-  id: 'Definitions_auto',
-  processes: [
-    {
-      id: 'Process_auto',
-      nodes: [
+  schemaVersion: '2.0.0',
+  id: 'Process_auto',
+nodes: [
         { id: 'Start_1', type: 'startEvent' },
         { id: 'Auto_1', type: auto.type, name: '自动节点', ...auto },
         {
           id: 'Task_1',
           type: 'userTask',
-          extension: { 'floken:approval': { approvers: [{ type: 'user', value: 'u_1' }] } },
+          approval: { approvers: [{ type: 'user', value: 'u_1' }] },
         },
         { id: 'End_1', type: 'endEvent' },
       ],
-      flows: [
+  flows: [
         { id: 'F1', from: 'Start_1', to: 'Auto_1' },
         { id: 'F2', from: 'Auto_1', to: 'Task_1' },
         { id: 'F3', from: 'Task_1', to: 'End_1' },
       ],
-    },
-  ],
 });
 
 function autoEngine(auto, extra = {}) {
@@ -1594,7 +1574,8 @@ await checkAsync('T17 · serviceTask：调 handler 一次，返回值并入变�
 });
 
 await checkAsync('T17 · scriptTask（FEEL）：内置求值，结果落在 variables[nodeId]', async () => {
-  const c = autoEngine({ type: 'scriptTask', scriptFormat: 'feel', script: '1 + 2' });
+  // ★ v2：脚本是 `ScriptSpec { body, language }`，不再是 `script` + `scriptFormat` 两个字符串
+  const c = autoEngine({ type: 'scriptTask', script: { body: '1 + 2', language: 'feel' } });
   const id = await c.engine.start('Process_auto', { definitionVersion: 1, starter: 'u_0' });
   eq((await c.store.load(id)).variables.Auto_1, 3, 'FEEL 脚本结果');
 });
@@ -1625,26 +1606,21 @@ await checkAsync('T17 · ★ sendTask / receiveTask → 显式抛（不得静默
 
 await checkAsync('T17 · ★ 数据节点：令牌落到 dataObject → 抛（引擎只读不写）', async () => {
   const def = {
-    schemaVersion: '1.0.0',
-    id: 'Definitions_data',
-    processes: [
-      {
-        id: 'Process_data',
-        nodes: [
+    schemaVersion: '2.0.0',
+    id: 'Process_data',
+nodes: [
           { id: 'Start_1', type: 'startEvent' },
           { id: 'Data_1', type: 'dataObject' },
           {
             id: 'Task_1',
             type: 'userTask',
-            extension: { 'floken:approval': { approvers: [{ type: 'user', value: 'u_1' }] } },
+            approval: { approvers: [{ type: 'user', value: 'u_1' }] },
           },
         ],
-        flows: [
+    flows: [
           { id: 'F1', from: 'Start_1', to: 'Data_1' },
           { id: 'F2', from: 'Data_1', to: 'Task_1' },
         ],
-      },
-    ],
   };
   const engine = m.createEngine({
     definitionSource: { async getDefinition(pid, v) { return pid === 'Process_data' && v === 1 ? def : null; } },
@@ -1683,12 +1659,15 @@ const T18 = '2026-10-01T00:00:00.000Z';
 /** 最小 `ProcessDefinition`（探针不 import 测试夹具 —— 它只该跑**产物**） */
 function defOf(processId, nodes, flows) {
   return {
-    schemaVersion: '1.0.0',
-    id: `Definitions_${processId}`,
-    processes: [{ id: processId, nodes, flows }],
+    // ★ v2：一个定义就是一个流程 —— `id` 即 processId，节点与连线在顶层
+    schemaVersion: '2.0.0',
+    id: processId,
+    nodes,
+    flows,
   };
 }
-const userApprovalOf = (value) => ({ 'floken:approval': { approvers: [{ type: 'user', value }] } });
+/** ★ v2：`approval` 是一等字段，故它直接返回审批配置本体（不再包一层 extension） */
+const userApprovalOf = (value) => ({ approvers: [{ type: 'user', value }] });
 
 await checkAsync('T18 · 内嵌子流程：令牌走进去、再从出口出来（子流程自身不在图里）', async () => {
   const def = defOf(
@@ -1700,7 +1679,7 @@ await checkAsync('T18 · 内嵌子流程：令牌走进去、再从出口出来�
         type: 'subProcess',
         nodes: [
           { id: 'S_Start', type: 'startEvent' },
-          { id: 'S_Task', type: 'userTask', extension: userApprovalOf('u_child') },
+          { id: 'S_Task', type: 'userTask', approval: userApprovalOf('u_child') },
           { id: 'S_End', type: 'endEvent' },
         ],
         flows: [
@@ -1708,7 +1687,7 @@ await checkAsync('T18 · 内嵌子流程：令牌走进去、再从出口出来�
           { id: 'fs2', from: 'S_Task', to: 'S_End' },
         ],
       },
-      { id: 'Task_2', type: 'userTask', extension: userApprovalOf('u_boss') },
+      { id: 'Task_2', type: 'userTask', approval: userApprovalOf('u_boss') },
       { id: 'End_1', type: 'endEvent' },
     ],
     [
@@ -1748,11 +1727,10 @@ await checkAsync('T18 · CallActivity：版本绑定（INV-16）+ 子实例回�
       {
         id: 'Call_1',
         type: 'callActivity',
-        calledElement: 'Sub_Proc',
-        // ★ 版本必须在设计期**显式绑定**；引擎不取最新版
-        extension: { 'floken:call': { version: 1 } },
+        // ★ v2：`call` 是一等字段 `CallSpec { processId, version }`（v1 是 calledElement + extension['floken:call']）
+        call: { processId: 'Sub_Proc', version: 1 },
       },
-      { id: 'Task_2', type: 'userTask', extension: userApprovalOf('u_boss') },
+      { id: 'Task_2', type: 'userTask', approval: userApprovalOf('u_boss') },
       { id: 'End_1', type: 'endEvent' },
     ],
     [
@@ -1766,7 +1744,7 @@ await checkAsync('T18 · CallActivity：版本绑定（INV-16）+ 子实例回�
       'Sub_Proc',
       [
         { id: 'S_Start', type: 'startEvent' },
-        { id: `S_Task_v${v}`, type: 'userTask', extension: userApprovalOf(`u_v${v}`) },
+        { id: `S_Task_v${v}`, type: 'userTask', approval: userApprovalOf(`u_v${v}`) },
         { id: 'S_End', type: 'endEvent' },
       ],
       [
@@ -1866,11 +1844,11 @@ check('T18 · 门 2 需要的两个出口已公开；`nodes/activities` 其余�
 function expenseVersioned(version) {
   const nodes = [
     { id: 'Start_1', type: 'startEvent' },
-    { id: 'Task_a', type: 'userTask', extension: userApprovalOf('u_a') },
+    { id: 'Task_a', type: 'userTask', approval: userApprovalOf('u_a') },
     ...(version === 2
-      ? [{ id: 'Task_new', type: 'userTask', extension: userApprovalOf('u_new') }]
+      ? [{ id: 'Task_new', type: 'userTask', approval: userApprovalOf('u_new') }]
       : []),
-    { id: 'Task_b', type: 'userTask', extension: userApprovalOf('u_b') },
+    { id: 'Task_b', type: 'userTask', approval: userApprovalOf('u_b') },
     { id: 'End_1', type: 'endEvent' },
   ];
   const flows =
@@ -1886,7 +1864,7 @@ function expenseVersioned(version) {
           { id: 'f3', from: 'Task_new', to: 'Task_b' },
           { id: 'f4', from: 'Task_b', to: 'End_1' },
         ];
-  return { schemaVersion: '1.0.0', id: `Def_expense_v${version}`, version, processes: [{ id: 'expense', nodes, flows }] };
+  return { schemaVersion: '2.0.0', id: 'expense', version, nodes, flows };
 }
 
 /** 可增删版本的 source（改版 / 下线只能靠它模拟）；取不到即 `null`，**不做任何回退** */
@@ -1976,7 +1954,7 @@ const catchDefOf = (kind, name) =>
         name: '等付款',
         eventDefinition: kind === 'signal' ? { type: 'signal', signalRef: name } : { type: 'message', messageRef: name },
       },
-      { id: 'Task_1', type: 'userTask', extension: userApprovalOf('u1') },
+      { id: 'Task_1', type: 'userTask', approval: userApprovalOf('u1') },
       { id: 'End_1', type: 'endEvent' },
     ],
     [
@@ -2131,10 +2109,9 @@ const fakeScheduler = () => {
 };
 
 const approvalWithTimeout = (who) => ({
-  'floken:approval': {
-    approvers: [{ type: 'user', value: who }],
-    timeout: { duration: 'P3D', actions: [{ type: 'remind' }, { type: 'autoApprove' }] },
-  },
+  // ★ v2：`approval` 是一等字段（v1 是 extension['floken:approval']）
+  approvers: [{ type: 'user', value: who }],
+  timeout: { duration: 'P3D', actions: [{ type: 'remind' }, { type: 'autoApprove' }] },
 });
 
 /** `Task_1` 上挂一个消息边界事件（`cancelActivity` 不给 = 中断） */
@@ -2143,7 +2120,7 @@ const bndDefOf = (cancelActivity) =>
     'Process_1',
     [
       { id: 'Start_1', type: 'startEvent' },
-      { id: 'Task_1', type: 'userTask', extension: userApprovalOf('u1') },
+      { id: 'Task_1', type: 'userTask', approval: userApprovalOf('u1') },
       { id: 'End_1', type: 'endEvent' },
       {
         id: 'Bnd_1',
@@ -2152,7 +2129,7 @@ const bndDefOf = (cancelActivity) =>
         ...(cancelActivity === undefined ? {} : { cancelActivity }),
         eventDefinition: { type: 'message', messageRef: 'Msg_cancel' },
       },
-      { id: 'Task_2', type: 'userTask', extension: userApprovalOf('u2') },
+      { id: 'Task_2', type: 'userTask', approval: userApprovalOf('u2') },
       { id: 'End_2', type: 'endEvent' },
     ],
     [
@@ -2205,8 +2182,8 @@ await checkAsync('T21 · ★ 事务取消：作用域内**全部**在途令牌�
         nodes: [
           { id: 'T_S', type: 'startEvent' },
           { id: 'T_P', type: 'parallelGateway' },
-          { id: 'T_A', type: 'userTask', extension: userApprovalOf('u1') },
-          { id: 'T_B', type: 'userTask', extension: userApprovalOf('u2') },
+          { id: 'T_A', type: 'userTask', approval: userApprovalOf('u1') },
+          { id: 'T_B', type: 'userTask', approval: userApprovalOf('u2') },
           { id: 'T_E', type: 'endEvent' },
         ],
         flows: [
@@ -2224,7 +2201,7 @@ await checkAsync('T21 · ★ 事务取消：作用域内**全部**在途令牌�
         attachedTo: 'Tx_1',
         eventDefinition: { type: 'message', messageRef: 'Msg_cancel' },
       },
-      { id: 'Task_esc', type: 'userTask', extension: userApprovalOf('u_esc') },
+      { id: 'Task_esc', type: 'userTask', approval: userApprovalOf('u_esc') },
       { id: 'End_2', type: 'endEvent' },
     ],
     [
@@ -2260,8 +2237,8 @@ await checkAsync('T21 · ★ `EventBasedGateway` 竞速：投递 A → A 分支�
       { id: 'EG_1', type: 'eventBasedGateway' },
       { id: 'C_A', type: 'intermediateCatchEvent', eventDefinition: { type: 'message', messageRef: 'Msg_A' } },
       { id: 'C_B', type: 'intermediateCatchEvent', eventDefinition: { type: 'message', messageRef: 'Msg_B' } },
-      { id: 'Task_A', type: 'userTask', extension: userApprovalOf('u_a') },
-      { id: 'Task_B', type: 'userTask', extension: userApprovalOf('u_b') },
+      { id: 'Task_A', type: 'userTask', approval: userApprovalOf('u_a') },
+      { id: 'Task_B', type: 'userTask', approval: userApprovalOf('u_b') },
       { id: 'End_1', type: 'endEvent' },
     ],
     [
@@ -2296,8 +2273,8 @@ await checkAsync('T21 · ★ 超时经 `Scheduler`：按 `actions` 逐条排程�
     'Process_1',
     [
       { id: 'Start_1', type: 'startEvent' },
-      { id: 'Task_1', type: 'userTask', extension: approvalWithTimeout('u1') },
-      { id: 'Task_2', type: 'userTask', extension: approvalWithTimeout('u2') },
+      { id: 'Task_1', type: 'userTask', approval: approvalWithTimeout('u1') },
+      { id: 'Task_2', type: 'userTask', approval: approvalWithTimeout('u2') },
       { id: 'End_1', type: 'endEvent' },
     ],
     [
@@ -2333,8 +2310,8 @@ await checkAsync('T21 · ★ 待办办完 → `cancel()` 掉旧 handle 并**清�
     'Process_1',
     [
       { id: 'Start_1', type: 'startEvent' },
-      { id: 'Task_1', type: 'userTask', extension: approvalWithTimeout('u1') },
-      { id: 'Task_2', type: 'userTask', extension: approvalWithTimeout('u2') },
+      { id: 'Task_1', type: 'userTask', approval: approvalWithTimeout('u1') },
+      { id: 'Task_2', type: 'userTask', approval: approvalWithTimeout('u2') },
       { id: 'End_1', type: 'endEvent' },
     ],
     [
@@ -2368,7 +2345,7 @@ await checkAsync('T21 · ★ 不注入 `scheduler` = 不排程（超时是内核
     'Process_1',
     [
       { id: 'Start_1', type: 'startEvent' },
-      { id: 'Task_1', type: 'userTask', extension: approvalWithTimeout('u1') },
+      { id: 'Task_1', type: 'userTask', approval: approvalWithTimeout('u1') },
       { id: 'End_1', type: 'endEvent' },
     ],
     [
@@ -2439,8 +2416,8 @@ const traceDef = defOf(
   'Process_1',
   [
     { id: 'Start_1', type: 'startEvent' },
-    { id: 'Task_1', type: 'userTask', extension: userApprovalOf('u_manager') },
-    { id: 'Task_2', type: 'userTask', extension: userApprovalOf('u_finance') },
+    { id: 'Task_1', type: 'userTask', approval: userApprovalOf('u_manager') },
+    { id: 'Task_2', type: 'userTask', approval: userApprovalOf('u_finance') },
     { id: 'End_1', type: 'endEvent' },
   ],
   [
@@ -2544,20 +2521,20 @@ const extDef = () =>
       {
         id: 'Task_urgent',
         type: 'userTask',
+        approval: { approvers: [{ type: 'user', value: 'u_boss' }] },
+        // ★ v2：`extension` 只装宿主自己的东西；结构化值**也给**（ADR-009 细则④ 已放开）
         extension: {
-          'floken:approval': { approvers: [{ type: 'user', value: 'u_boss' }] },
           'acme:priority': 'high',
           'acme:slaHours': '48',
-          'acme:tags': ['finance'], // 结构化 → 应被跳过
+          'acme:tags': ['finance'],
+          'acme:rule': { limit: 1 },
         },
       },
       {
         id: 'Task_normal',
         type: 'userTask',
-        extension: {
-          'floken:approval': { approvers: [{ type: 'user', value: 'u_staff' }] },
-          'acme:priority': 'low',
-        },
+        approval: { approvers: [{ type: 'user', value: 'u_staff' }] },
+        extension: { 'acme:priority': 'low' },
       },
       { id: 'End_1', type: 'endEvent' },
     ],
@@ -2591,7 +2568,7 @@ await checkAsync('ADR-009 · ★ 不 opt-in → 同一个表达式**静默走另
   sameArray(seen, ['Task_normal/u_staff'], '不 opt-in 的代价：安静地走错');
 });
 
-await checkAsync('ADR-009 · 只读字段恒给：`floken:*` 不外泄、结构化值跳过、键带前缀', async () => {
+await checkAsync('ADR-009 · 只读字段恒给：一等字段不外泄、结构化值也给出、键带前缀', async () => {
   const seen = [];
   const { engine } = engineOn(extDef(), {
     projection: projectionOf(seen),
@@ -2606,8 +2583,10 @@ await checkAsync('ADR-009 · 只读字段恒给：`floken:*` 不外泄、结构�
   const bag = JSON.parse(seen.find((s) => s.includes('gwTag')));
   eq(bag.n['acme:gwTag'], 'main', '当前节点 = 网关自己的属性');
   eq(bag.t['acme:priority'], 'high', '目标节点 = 分支通向的节点');
-  eq(bag.t['floken:approval'], undefined, '★ 引擎自己的键不外泄');
-  eq(bag.t['acme:tags'], undefined, '★ 结构化值被跳过（与 XML 层同口径）');
+  // ★ v2：排除判据从「`floken:*` 前缀」改为「模型一等字段键」（前缀随 XML 一起消失）
+  eq(bag.t['approval'], undefined, '★ 模型的一等字段不外泄');
+  // ★ v2 起结构化值**也给出**（旧口径"只给标量"的理由是 XML 属性装不下，已不成立）
+  eq(JSON.stringify(bag.t['acme:tags']), '["finance"]', '★ 结构化值原样给出');
   eq(bag.t['acme:slaHours'], '48', '★ XML 往返后是字符串 —— cast 由宿主声明');
 });
 

@@ -114,6 +114,7 @@ export {
   //   否则引擎侧无法把「宿主抛的错」与「引擎抛的错」归一（`ARCHITECTURE.md` §7.2 StateStore）。
   persistConflict,
   persistAlreadyExists,
+  peerMissing,
 } from '../core/errors.js';
 export type {
   NodeRef,
@@ -124,6 +125,24 @@ export type {
   EngineDiagnostic,
   EngineDiagnosticInit,
 } from '../core/errors.js';
+
+// ---------------- peer 依赖（Q49：五个包之间一律 peer，不再内置）----------------
+
+/**
+ * ★ 浏览器 / 打包器 / pnpm 严格模式下，`node_modules` 解析取不到兄弟包，
+ *   宿主用 `registerPeer()` 显式注入即可（engine 侧其余部分无需改动）：
+ *
+ * ```ts
+ * import * as moddle from '@floken-io/moddle';
+ * import { registerPeer } from '@floken-io/engine';
+ * registerPeer('@floken-io/moddle', moddle);   // 任何 engine 调用之前执行一次
+ * ```
+ *
+ * `requirePeer` / `tryPeer` 也一并公开：自研扩展（如自定义求值器）可复用同一套
+ * 缺失提示，不必各自重写一遍 `Cannot find module` 的翻译。
+ */
+export { registerPeer, unregisterPeer, hasPeer, requirePeer, tryPeer } from '../core/peer.js';
+export type { PeerOptions } from '../core/peer.js';
 
 // ---------------- 内核原语（§8 ADR-001 · 10 个，业务无知） ----------------
 

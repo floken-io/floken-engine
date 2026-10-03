@@ -107,8 +107,9 @@ describe('@floken-io/engine 错误契约', () => {
       expect(new Set(diagCodes).size).toBe(diagCodes.length);
     });
 
-    it('抛出码全部形如 ENGINE_<类别>_<对象>，类别限于四族', () => {
-      const re = /^ENGINE_(ACTION|STATE|PERSIST|OPTION)_[A-Z0-9]+(?:_[A-Z0-9]+)*$/;
+    it('抛出码全部形如 ENGINE_<类别>_<对象>，类别限于五族', () => {
+      // ★ Q49 新增 PEER_（peer 包缺失）；与其余四族不得混用。
+      const re = /^ENGINE_(ACTION|STATE|PERSIST|OPTION|PEER)_[A-Z0-9]+(?:_[A-Z0-9]+)*$/;
       for (const c of throwCodes) expect(c, c).toMatch(re);
     });
 
@@ -124,8 +125,8 @@ describe('@floken-io/engine 错误契约', () => {
       expect(overlap).toEqual([]);
     });
 
-    it('诊断码**不得使用**抛出码的四个类别前缀', () => {
-      const forbidden = /^ENGINE_(ACTION|STATE|PERSIST|OPTION)_/;
+    it('诊断码**不得使用**抛出码的五个类别前缀', () => {
+      const forbidden = /^ENGINE_(ACTION|STATE|PERSIST|OPTION|PEER)_/;
       for (const c of diagCodes) expect(c, c).not.toMatch(forbidden);
     });
   });

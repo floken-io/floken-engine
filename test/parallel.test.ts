@@ -307,7 +307,8 @@ describe('网关条件的引擎接线（AC-E9 / D-37 / D-40）', () => {
   /** 语法错必须冒泡到调用方（`plan()` 与 `submit()` 都不吞），且不静默走 default */
   it('语法错 → 抛，不是静默走 default', async () => {
     const def = amountDef();
-    for (const f of def.processes[0]?.flows ?? []) {
+    // ★ moddle v2：连线在顶层，没有 `processes[]`
+    for (const f of def.flows) {
       if (f.id === 'F_big') f.condition = 'amount >';
     }
     const c = ctxOf(def);

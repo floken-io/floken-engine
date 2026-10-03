@@ -1,6 +1,6 @@
 {
   "name": "@floken-io/engine",
-  "version": "0.0.2",
+  "version": "0.0.3",
   "description": "Token-based process engine with Chinese-style approval actions for floken",
   "repository": { "type": "git", "url": "git+https://github.com/floken-io/floken-engine.git" },
   "bugs": { "url": "https://github.com/floken-io/floken-engine/issues" },
@@ -29,11 +29,16 @@
     "release": "npm run build && npm run verify && changeset publish",
     "prepublishOnly": "npm run build && npm run verify"
   },
-  "dependencies": {
-    "@floken-io/feel": ">=0.0.0 <1.0.0",
-    "@floken-io/moddle": ">=0.0.4 <1.0.0"
+  "peerDependencies": {
+    "@floken-io/moddle": ">=0.1.0 <0.2.0",
+    "@floken-io/feel": ">=0.0.4 <1.0.0"
+  },
+  "peerDependenciesMeta": {
+    "@floken-io/feel": { "optional": true }
   },
   "devDependencies": {
+    "@floken-io/moddle": "0.1.0",
+    "@floken-io/feel": "0.0.4",
     "@types/node": "^22.20.4",
     "typescript": "5.9.3",
     "tsup": "8.5.1",

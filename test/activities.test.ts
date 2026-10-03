@@ -43,9 +43,8 @@ const T0 = '2026-10-01T00:00:00.000Z';
 /** 走一遍 `makeDefinition` 拿到模型层形状，再喂给展开器 */
 function flattenOf(nodes: readonly TestNode[], flows: readonly TestFlow[]) {
   const def = makeDefinition({ nodes, flows });
-  const p = def.processes[0];
-  if (p === undefined) throw new Error('fixture: no process');
-  return expandSubProcesses(p.nodes ?? [], p.flows ?? []);
+  // ★ moddle v2：节点与连线在**顶层**，没有 `processes[]`
+  return expandSubProcesses(def.nodes, def.flows);
 }
 
 /** 一个「有内嵌子流程」的主流程：`Start_1 → Sub_1 → Task_2 → End_1` */
@@ -211,11 +210,12 @@ describe('① 4 类活动的分类（穷举）', () => {
 // ---------------- ② ★ CallActivity 的版本绑定（INV-16） ----------------
 
 describe('② ★ `callActivity` 的版本绑定（INV-16）', () => {
+  // ★ moddle v2：`call` 是一等字段 `CallSpec { processId, version }`（v1 是 extension['floken:call'] + calledElement）
   const node = (extra: Partial<Record<string, unknown>>): FlowNode =>
-    ({ id: 'C_1', type: 'callActivity', calledElement: 'Sub_Proc', ...extra }) as unknown as FlowNode;
+    ({ id: 'C_1', type: 'callActivity', call: { processId: 'Sub_Proc' }, ...extra }) as unknown as FlowNode;
 
   it('绑定了版本 → 返回 `{ processId, definitionVersion }`', () => {
-    expect(callTargetOf(node({ extension: { 'floken:call': { version: 3 } } }))).toEqual({
+    expect(callTargetOf(node({ call: { processId: 'Sub_Proc', version: 3 } }))).toEqual({
       processId: 'Sub_Proc',
       definitionVersion: 3,
     });
@@ -239,18 +239,18 @@ describe('② ★ `callActivity` 的版本绑定（INV-16）', () => {
   it('版本非法（0 / 负数 / 非整数 / 字符串）→ 抛', () => {
     for (const version of [0, -1, 1.5, '2']) {
       expectCode(
-        () => callTargetOf(node({ extension: { 'floken:call': { version } } })),
+        () => callTargetOf(node({ call: { processId: 'Sub_Proc', version } })),
         'ENGINE_STATE_SHAPE_INVALID',
       );
     }
   });
 
-  it('缺 `calledElement` → 抛（不知道要调谁）', () => {
+  it('缺 `call.processId` → 抛（不知道要调谁）', () => {
     const e = expectCode(
-      () => callTargetOf({ id: 'C_1', type: 'callActivity', extension: { 'floken:call': { version: 1 } } } as unknown as FlowNode),
+      () => callTargetOf({ id: 'C_1', type: 'callActivity', call: { version: 1 } } as unknown as FlowNode),
       'ENGINE_STATE_SHAPE_INVALID',
     );
-    expect(e.message).toContain('calledElement');
+    expect(e.message).toContain('processId');
   });
 });
 

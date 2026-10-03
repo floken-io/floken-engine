@@ -107,10 +107,21 @@ describe('ADR-009 · 只读字段恒给（不配置也有）', () => {
     const ctx = spy.find((c) => c.nodeId === 'GW');
     expect(ctx).toBeDefined();
     expect(ctx?.nodeExtensions).toEqual({ 'acme:gwTag': 'main' });
-    expect(ctx?.targetExtensions).toEqual({ 'acme:priority': 'high', 'acme:slaHours': '48' });
+    /*
+     * ★ v2 起**结构化值也给出**（ADR-009 细则④ 已放开，2026-10-03）：
+     * 旧口径"只给标量"的理由是「结构化值写不进 XML 属性」，那个理由随 moddle v2
+     * 的 JSON-only 一起消失了。继续只给标量的代价是：宿主存得下 `rule:{limit:1}`，
+     * 却读不进条件表达式。
+     */
+    expect(ctx?.targetExtensions).toEqual({
+      'acme:priority': 'high',
+      'acme:slaHours': '48',
+      'acme:tags': ['finance'],
+      'acme:rule': { limit: 1 },
+    });
   });
 
-  it('③ `floken:*` 一律不外泄（引擎自己的键不进这两袋）', async () => {
+  it('③ 模型的一等字段一律不外泄（v1 是排除 `floken:*`，v2 改为排除保留键）', async () => {
     const spy: ConditionCtx[] = [];
     await startIt(engineWith(undefined, spy));
     for (const c of spy) {
@@ -122,13 +133,14 @@ describe('ADR-009 · 只读字段恒给（不配置也有）', () => {
     }
   });
 
-  it('④ 只给标量：数组 / 对象被跳过（与 XML 层同口径）', async () => {
+  it('④ v2：结构化值**也给**（只有函数排除）', async () => {
     const spy: ConditionCtx[] = [];
     await startIt(engineWith(undefined, spy));
     const ctx = spy.find((c) => c.targetExtensions?.['acme:priority'] === 'high');
     expect(ctx?.targetExtensions).toBeDefined();
-    expect(ctx?.targetExtensions?.['acme:tags']).toBeUndefined();
-    expect(ctx?.targetExtensions?.['acme:rule']).toBeUndefined();
+    // 数组与对象原样给出（moddle v2 的 extension 就是任意 JSON，类型天然保真）
+    expect(ctx?.targetExtensions?.['acme:tags']).toEqual(['finance']);
+    expect(ctx?.targetExtensions?.['acme:rule']).toEqual({ limit: 1 });
   });
 
   it('⑤⑨ 默认**不并入** `variables`，且**绝不写回** state（细则⑨）', async () => {

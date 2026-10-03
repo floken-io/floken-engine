@@ -15,11 +15,27 @@
  * ★ 分层：`eval/` 是域层，可 import `core/`；**`core/` 不得反向 import `eval/`**。
  */
 
-import { evaluate } from '@floken-io/feel';
 import type { EvaluateOptions } from '@floken-io/feel';
 
 import { conditionInvalid } from '../core/errors.js';
+import { requirePeer } from '../core/peer.js';
 import type { ConditionCtx, ConditionHandler } from '../core/spi.js';
+
+/**
+ * 惰性取 `@floken-io/feel`（Q49：**optional** peer —— 流程定义里不写 FEEL 表达式就不用装）。
+ *
+ * ★ 命名为 `feelModule` 而不是 `feel`：本档下方已有同名局部变量（`EvaluateOptions`）。
+ * ★ 只在**真的要求值**时才解析，且 `optional: true` 让报错文案说清「用不到就不必装」。
+ */
+type FeelEvaluator = Pick<typeof import('@floken-io/feel'), 'evaluate'>;
+let feelCache: FeelEvaluator | undefined;
+function feelModule(): FeelEvaluator {
+  return (feelCache ??= requirePeer<FeelEvaluator>('@floken-io/feel', {
+    neededFor: 'FEEL evaluation: evaluate() for gateway conditions and flow conditions',
+    range: '>=0.0.4 <1.0.0',
+    optional: true,
+  }));
+}
 
 /**
  * JUEL 插值（`${variables.foo}`）—— **不是 FEEL**。
@@ -100,7 +116,7 @@ export function createFeelConditionHandler(options: FeelConditionOptions = {}): 
       if (src === '') return true;
 
       // ③ 求值。语法错 → feel 抛 `FeelSyntaxError`，**原样向上**（不 catch、不降级）。
-      const result = evaluate(src, ctx.variables as Record<string, unknown>, feel);
+      const result = feelModule().evaluate(src, ctx.variables as Record<string, unknown>, feel);
 
       // ④ 三值 → 二值：`null`（未知）**抛错**，不静默转 false（**D-38**）。
       //    网关分支的真值只有「走 / 不走」，「未知」没有对应的行为。

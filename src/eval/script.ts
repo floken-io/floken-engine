@@ -22,10 +22,26 @@
  * ★ 分层：`eval/` 是域层，可 import `core/`；**`core/` 不得反向 import `eval/`**。
  */
 
-import { evaluate } from '@floken-io/feel';
 import type { Diagnostic, EvalResult } from '@floken-io/feel';
 
+import { requirePeer } from '../core/peer.js';
 import { assertNotJuel } from './condition.js';
+
+/**
+ * 惰性取 `@floken-io/feel`（Q49：**optional** peer —— 没有 `scriptTask` 就不用装）。
+ *
+ * ★ 本档是「不执行任意 JS」红线的落点，求值入口**只有** feel 的 `evaluate()`；
+ *   peer 化之后这条红线不变，只是「feel 从哪来」由依赖声明改成了运行期解析。
+ */
+type FeelEvaluator = Pick<typeof import('@floken-io/feel'), 'evaluate'>;
+let feelCache: FeelEvaluator | undefined;
+function feelModule(): FeelEvaluator {
+  return (feelCache ??= requirePeer<FeelEvaluator>('@floken-io/feel', {
+    neededFor: 'FEEL evaluation: evaluate() for scriptTask (scriptFormat = FEEL)',
+    range: '>=0.0.4 <1.0.0',
+    optional: true,
+  }));
+}
 
 export interface ScriptResult {
   /** FEEL 的求值结果（**可能是 `null`** —— 三值语义的合法值，不抛） */
@@ -59,6 +75,6 @@ export function evaluateScript(
   // 空脚本：`nodes/graph.ts` 的 `scriptOf()` 已把它归一化成 `undefined`，
   // 走到这里说明调用方自己传了空白 —— 交给 feel 报语法错比在这里静默返回 null 好
   // （静默 null 的表现是"变量被写成了空"，排查时看不出脚本根本没写）。
-  const result = evaluate(src, variables as Record<string, unknown>);
+  const result = feelModule().evaluate(src, variables as Record<string, unknown>);
   return { value: result.value, warnings: [...result.warnings] };
 }

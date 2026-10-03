@@ -28,8 +28,9 @@
  *   表现为**一条能照着修的错误**，而不是"流程静默走错分支"。
  */
 
-import { normalizeApproval } from '@floken-io/moddle';
 import type { Flow, FlowNode, NormalizedApproval, ProcessDefinition } from '@floken-io/moddle';
+
+import { requirePeer } from '../core/peer.js';
 
 import { definitionMissing, stateShapeInvalid, tokenOrphan } from '../core/errors.js';
 import { SUBPROCESS_PATH_SEP, callTargetOf, expandSubProcesses } from './activities.js';
@@ -38,6 +39,28 @@ import { boundaryBindingOf } from './boundary.js';
 import type { BoundaryBinding } from './boundary.js';
 import { catchBindingOf } from './catch.js';
 import type { CatchBinding } from './catch.js';
+
+/**
+ * 惰性取 `@floken-io/moddle`（Q49：peer 依赖，不再内置）。
+ *
+ * ★ 只取**本档真正用到的**那一个函数，并把解析结果缓存到模块级变量 ——
+ *   建图时每个带审批配置的节点都要走一次，不能每次都做一遍模块解析。
+ * ★ 首次**用到**才解析：只 import engine 不建图不会被缺失的 peer 打断。
+ */
+type ModdleSlice = Pick<
+  typeof import('@floken-io/moddle'),
+  'normalizeApproval' | 'NODE_RESERVED_KEYS'
+>;
+
+let moddleCache: ModdleSlice | undefined;
+function moddle(): ModdleSlice {
+  return (moddleCache ??= requirePeer<ModdleSlice>('@floken-io/moddle', {
+      neededFor:
+        'approval semantics: normalizeApproval() when building the definition graph; NODE_RESERVED_KEYS for ADR-009 exclusion',
+      range: '>=0.1.0 <0.2.0',
+    },
+  ));
+}
 
 // ---------------- 引擎关心的节点分类 ----------------
 
@@ -51,34 +74,41 @@ export const WAITING_NODE_TYPES: readonly string[] = ['userTask'];
 /** **结束类**：令牌到达即该令牌完成；全部令牌完成 → 实例 `completed`。 */
 export const TERMINAL_NODE_TYPES: readonly string[] = ['endEvent'];
 
-/** `floken:approval` 的扩展键（与 moddle 的 `ExtensionBag` 键名逐字一致） */
-export const APPROVAL_EXT_KEY = 'floken:approval';
+/**
+ * ★ ADR-009 细则③：**排除模型的一等字段键**（v2 口径，2026-10-03 改定）。
+ *
+ * v1 排除的是 `floken:` 前缀（那时审批语义住在 `extension['floken:approval']` 里，
+ * 前缀是 XML 命名空间机制的产物）。**moddle v2 取消前缀、JSON-only** 之后，
+ * `approval` / `call` / `eventDefinition` 提升为了一等字段，故排除判据改为**保留键**：
+ *
+ *   ① 不外泄引擎内部语义（`approval` 是引擎的输入，不是宿主该读的东西）；
+ *   ② 一等字段与袋里同名的那份「哪个生效」会变成未定义行为。
+ *
+ * ★ 清单**从 moddle 取**（`NODE_RESERVED_KEYS`），引擎**不另写一份** ——
+ * 补名单这条路迟早会漏一个（v1 就是手写一个前缀，结果 `floken:xxx` 全被排除，
+ * 连宿主自己想用的也一起排掉了）。
+ */
+function reservedKeysOf(): ReadonlySet<string> {
+  const keys = moddle().NODE_RESERVED_KEYS;
+  return new Set(keys);
+}
 
 /**
- * ★ 引擎**自己的**扩展键前缀（ADR-009）。
+ * ★ ADR-009 细则④：**结构化值也给**（v2 起放开，2026-10-03 改定）。
  *
- * `extensionsOf()` 会**排除**这个前缀下的全部键：
- *   ① 不外泄引擎内部语义（`floken:approval` 是引擎的输入，不是宿主该读的东西）；
- *   ② `floken:approval` 是**对象**，塞进求值上下文会污染，而 ADR-009 只承诺给标量。
+ * v1 只给标量，理由是「结构化值写不进 XML 属性」。**那个理由随 XML 一起消失了** ——
+ * moddle v2 的 `extension` 就是 `Record<string, unknown>`，对象和数组天然保真。
+ * 继续只给标量的代价是：宿主能**存** `rule: {maxAmount: 5000}`，却**读不进**条件表达式。
  *
- * ⚠️ 排除的是"前缀"而不是"固定几个键名"：将来引擎再挂 `floken:xxx`，自动一并排除，
- * 不需要回到这里补名单（补名单 = 迟早漏一个）。
+ * 唯一仍然排除的是**函数**：它会让后续任何 `JSON.stringify`
+ * （state 落库、诊断详情）静默丢字段或直接炸掉。
  */
-export const FLOKEN_EXT_PREFIX = 'floken:';
+function isUsableExtensionValue(v: unknown): boolean {
+  return typeof v !== 'function' && typeof v !== 'undefined';
+}
 
 /** `moddle` 保全袋里第三方原样快照的键（不是属性，不给宿主） */
 const RAW_SNAPSHOT_KEY = '_extensionElements';
-
-/**
- * ★ ADR-009 细则④：**只给标量**。
- *
- * 与 `moddle` 的 XML 层同一口径（结构化值写不进 XML 属性，走 `_extensionElements` 快照），
- * 宿主不必记两套规则。对象 / 数组 / 函数一律跳过 —— 尤其是**函数**：
- * 它会让后续任何 `JSON.stringify`（state 落库、诊断详情）静默丢字段或炸掉。
- */
-function isScalarValue(v: unknown): boolean {
-  return v === null || typeof v === 'string' || typeof v === 'number' || typeof v === 'boolean';
-}
 
 /** 一条**出向流**（引擎视角）：条件已归一化成"表达式文本或空" */
 export interface OutFlow {
@@ -239,9 +269,14 @@ export function createProcessGraph(
   if (definition === null || typeof definition !== 'object') {
     throw definitionMissing(processId, definitionVersion);
   }
-  const processes = Array.isArray(definition.processes) ? definition.processes : [];
-  const process = processes.find((p) => p?.id === processId);
-  if (process === undefined) {
+  /*
+   * ★ moddle v2（Q48）：`processes[]` 这一层**已删除**，节点与连线上提到顶层。
+   * 一个定义就是一个流程 —— 于是「找 process」退化为「校验 definition.id」。
+   */
+  if (typeof definition.id !== 'string' || definition.id !== processId) {
+    throw definitionMissing(processId, definitionVersion);
+  }
+  if (!Array.isArray(definition.nodes) || !Array.isArray(definition.flows)) {
     throw definitionMissing(processId, definitionVersion);
   }
 
@@ -253,7 +288,7 @@ export function createProcessGraph(
    * **一行都不用改**就知道"子流程里还有哪些节点"。这是选择"展开"而不是
    * "运行期另起一套子令牌树"的全部理由：后者要给上面每一处都加一遍"如果在子流程里"。
    */
-  const flat = expandSubProcesses(process.nodes ?? [], process.flows ?? []);
+  const flat = expandSubProcesses(definition.nodes, definition.flows);
   const flatNodes = flat.nodes;
   const flatFlows = flat.flows;
 
@@ -417,26 +452,27 @@ export function createProcessGraph(
     approvalOf(nodeId) {
       const cached = approvalCache.get(nodeId);
       if (cached !== undefined || approvalCache.has(nodeId)) return cached;
-      const node = nodes.get(nodeId);
-      const raw = node?.extension?.[APPROVAL_EXT_KEY];
+      // ★ moddle v2：`approval` 是**一等字段**，不再从 extension 袋里掏
+      const raw = nodes.get(nodeId)?.approval;
       // DV-1：默认值只在 moddle 的 normalizeApproval 落一处；这里只做「取与归一化」
-      const value = raw === undefined ? undefined : normalizeApproval(raw, { nodeId });
+      const value = raw === undefined ? undefined : moddle().normalizeApproval(raw, { nodeId });
       approvalCache.set(nodeId, value);
       return value;
     },
 
-    hasApproval: (nodeId) => nodes.get(nodeId)?.extension?.[APPROVAL_EXT_KEY] !== undefined,
+    hasApproval: (nodeId) => nodes.get(nodeId)?.approval !== undefined,
 
     extensionsOf(nodeId) {
       if (extCache.has(nodeId)) return extCache.get(nodeId);
       const raw = nodes.get(nodeId)?.extension;
       let value: Readonly<Record<string, unknown>> | undefined;
       if (raw !== undefined && typeof raw === 'object' && raw !== null && !Array.isArray(raw)) {
+        const reserved = reservedKeysOf();
         const out: Record<string, unknown> = {};
         for (const [key, v] of Object.entries(raw)) {
-          if (key.startsWith(FLOKEN_EXT_PREFIX)) continue; // 细则③：不外泄引擎自己的键
+          if (reserved.has(key)) continue; // 细则③：不外泄模型的一等字段
           if (key === RAW_SNAPSHOT_KEY) continue;
-          if (!isScalarValue(v)) continue; // 细则④：只给标量
+          if (!isUsableExtensionValue(v)) continue; // 细则④：结构化值也给，只有函数排除
           out[key] = v;
         }
         // 细则「没配 → undefined」：全被过滤掉时也算"没有"，不返回空对象
@@ -446,15 +482,16 @@ export function createProcessGraph(
       return value;
     },
 
+    /** ★ moddle v2：脚本是 `ScriptSpec { body, language }`，不再是 `script` + `scriptFormat` 两个字符串 */
     scriptOf: (nodeId) => {
-      const s = nodes.get(nodeId)?.script;
-      if (typeof s !== 'string') return undefined;
-      const trimmed = s.trim();
+      const s = nodes.get(nodeId)?.script as { body?: unknown } | undefined;
+      if (s === null || typeof s !== 'object' || typeof s.body !== 'string') return undefined;
+      const trimmed = s.body.trim();
       return trimmed === '' ? undefined : trimmed;
     },
 
     scriptFormatOf: (nodeId) => {
-      const f = nodes.get(nodeId)?.scriptFormat;
+      const f = (nodes.get(nodeId)?.script as { language?: unknown } | undefined)?.language;
       return typeof f === 'string' && f.trim() !== '' ? f : undefined;
     },
 

@@ -28,8 +28,9 @@ export interface NodeRef {
 /**
  * 抛出类错误的码表（`EngineError` 家族）。
  *
- * ★ 类别只允许四个：`ACTION_`（动作受理）/ `STATE_`（实例状态与不变量）/
- * `PERSIST_`（StateStore 写入冲突）/ `OPTION_`（createEngine 配置）。
+ * ★ 类别只允许五个：`ACTION_`（动作受理）/ `STATE_`（实例状态与不变量）/
+ * `PERSIST_`（StateStore 写入冲突）/ `OPTION_`（createEngine 配置）/
+ * `PEER_`（**peer 依赖缺失**，Q49 新增 —— 五个包之间一律 peer 后，缺失在运行期才暴露）。
  */
 export const ENGINE_ERROR_CODES = {
   // —— 动作层：19 项动作的受理、开关、目标与意见校验 ——
@@ -84,6 +85,15 @@ export const ENGINE_ERROR_CODES = {
   OPTION_UNKNOWN: 'ENGINE_OPTION_UNKNOWN',
   /** 配置项取值非法（如 `maxAuditEntries` 非正整数） */
   OPTION_INVALID: 'ENGINE_OPTION_INVALID',
+
+  // —— 依赖层：peer 依赖（Q49：五个包之间一律 peer，不再内置）——
+  /**
+   * peer 包未安装且当前操作需要它（`core/peer.ts` 的 `requirePeer()` 抛出）。
+   *
+   * ★ 与 `STATE_DEFINITION_MISSING` 之类别混：后者是**数据**缺失（流程定义取不到），
+   *   本码是**代码**缺失（`node_modules` 里没有那个包），照 `details.install` 装完即解决。
+   */
+  PEER_MISSING: 'ENGINE_PEER_MISSING',
 } as const;
 
 /**
@@ -489,6 +499,40 @@ export function optionInvalid(key: string, reason: string, value?: unknown): Eng
     details: { option: key, reason, ...(value === undefined ? {} : { value }) },
   };
   return new EngineOptionError(`Invalid value for engine option '${key}'`, init);
+}
+
+/**
+ * **peer 依赖缺失**（Q49：五个包之间一律 peer，不再内置）。
+ *
+ * ★ 本构造器是「友好提示」的落点 —— 把 Node 原生的
+ *   `Cannot find module '@floken-io/moddle'` 翻译成「缺什么 / 为什么需要它 / 怎么装 /
+ *   浏览器怎么注入」四件套。只透传原生错误的话，pnpm 严格模式与
+ *   `--legacy-peer-deps` 用户看不出该装哪个包、装什么版本。
+ *
+ * ⚠️ 用基类 `EngineError` 而不是某个子类：peer 缺失不属于动作受理 / 状态 / 持久 / 配置任一类，
+ *    硬塞进 `OPTION_` 会让宿主以为是 `createEngine()` 传错了参数。
+ *
+ * @param peer peer 包名（如 `@floken-io/moddle`）
+ * @param info.neededFor 为什么需要它（进 `details.neededFor`，让人判断该不该装）
+ * @param info.range 声明的版本范围（进 `details.range`；**不参与运行期校验**，范围由包管理器负责）
+ * @param info.optional optional peer —— `details.optional` 为 true，文案说明「用不到就不必装」
+ */
+export function peerMissing(
+  peer: string,
+  info: { neededFor?: string; range?: string; optional?: boolean } = {},
+): EngineError {
+  const install = `npm i ${peer}${info.range ? `@"${info.range}"` : ''}`;
+  return new EngineError(`Missing peer dependency '${peer}'`, {
+    code: ENGINE_ERROR_CODES.PEER_MISSING,
+    hint: `install it: ${install}  —  or inject explicitly: registerPeer('${peer}', mod)`,
+    details: {
+      peer,
+      install,
+      optional: info.optional === true,
+      ...(info.range ? { range: info.range } : {}),
+      ...(info.neededFor ? { neededFor: info.neededFor } : {}),
+    },
+  });
 }
 
 /**
