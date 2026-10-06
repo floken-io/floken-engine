@@ -763,6 +763,84 @@ describe('⑦ 超时排程（`Scheduler` SPI）', () => {
     expect(sched.scheduled).toEqual([]);
   });
 
+  // ── 工作日历：两种形态都**原样**交出 ──
+
+  const calendar = {
+    id: 'my-cal',
+    workdays: [1, 2, 3, 4, 5, 6],
+    hours: [{ from: '09:30', to: '18:30' }],
+    holidays: ['2026-10-01'],
+  };
+
+  function calDef(workCalendar: unknown) {
+    return makeDefinition({
+      nodes: [
+        { id: 'Start_1', type: 'startEvent' },
+        {
+          id: 'Task_1',
+          type: 'userTask',
+          approval: userApproval('u1', {
+            timeout: { duration: 'P3D', workCalendar, actions: [{ type: 'autoApprove' }] },
+          }),
+        },
+        { id: 'End_1', type: 'endEvent' },
+      ],
+      flows: [
+        { from: 'Start_1', to: 'Task_1' },
+        { from: 'Task_1', to: 'End_1' },
+      ],
+    });
+  }
+
+  it('★ 内联 `workCalendar` 对象**原样**交给调度方（不得静默丢弃）', async () => {
+    const sched = fakeScheduler();
+    const { engine } = engineOf(calDef(calendar) as ReturnType<typeof makeDefinition>, {
+      scheduler: sched,
+    });
+    await engine.start('Process_1', { definitionVersion: 1, starter: 'u0' });
+
+    expect(sched.scheduled).toHaveLength(1);
+    // ⚠️ 早期实现只在它是 string 时透传 → 内联对象到调度方手里整个消失且不报错
+    expect(sched.scheduled[0]?.timeout.workCalendar).toEqual(calendar);
+  });
+
+  it('★ 字符串 `workCalendar` 是**日历 id**，原样透传（引擎不认它的内容）', async () => {
+    const sched = fakeScheduler();
+    const { engine } = engineOf(calDef('my-cal') as ReturnType<typeof makeDefinition>, {
+      scheduler: sched,
+    });
+    await engine.start('Process_1', { definitionVersion: 1, starter: 'u0' });
+
+    expect(sched.scheduled[0]?.timeout.workCalendar).toBe('my-cal');
+  });
+
+  it('★ 不写 `workCalendar` → 归一化补 cn-default（默认不得退化成 7×24）', async () => {
+    const sched = fakeScheduler();
+    const { engine } = engineOf(
+      makeDefinition({
+        nodes: [
+          { id: 'Start_1', type: 'startEvent' },
+          {
+            id: 'Task_1',
+            type: 'userTask',
+            approval: userApproval('u1', {
+              timeout: { duration: 'P3D', actions: [{ type: 'autoApprove' }] },
+            }),
+          },
+          { id: 'End_1', type: 'endEvent' },
+        ],
+        flows: [
+          { from: 'Start_1', to: 'Task_1' },
+          { from: 'Task_1', to: 'End_1' },
+        ],
+      }),
+      { scheduler: sched },
+    );
+    await engine.start('Process_1', { definitionVersion: 1, starter: 'u0' });
+
+    expect(sched.scheduled[0]?.timeout.workCalendar).toBe('cn-default');
+  });
+
   it('★ `diffTimers` 是纯的：同一份前后状态算两遍结果一致', () => {
     const g = graphOf(timeoutDef());
     const prev: InstanceState = {

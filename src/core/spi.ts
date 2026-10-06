@@ -11,7 +11,7 @@
  * ★ 命名红线：同一接口只允许一个名字 —— 求值 = `ConditionHandler` / `DecisionHandler`
  *   （旧名 `ExpressionEvaluator` **废弃、全项目不再使用**）；存储写线 = `StateStore`。
  */
-import type { ApproverSpec, ProcessDefinition } from '@floken-io/moddle';
+import type { ApproverSpec, ProcessDefinition, WorkCalendarSpec } from '@floken-io/moddle';
 import type { InstanceState } from './state.js';
 import type { TaskDelta, TaskView } from './task.js';
 import type { EngineEvent } from './events.js';
@@ -265,8 +265,15 @@ export interface TimeoutSpec {
   readonly date?: string | undefined;
   /** 周期 */
   readonly cycle?: string | undefined;
-  /** 工作日历 id；不给 = 调度方自己的默认（`03` F-1：不得退化成 7×24） */
-  readonly workCalendar?: string | undefined;
+  /**
+   * 工作日历 —— **两种形态都原样交出，内核不解读、不改写、不补齐**：
+   * - `string` = 日历 **id**（`'cn-default'` 只是个名字，含义由调度方解释）；
+   * - `WorkCalendarSpec` = 宿主**内联**的日历（`workdays` / `hours` / `holidays`）。
+   *
+   * ⚠️ 不给 = 调度方自己的默认（`03` F-1：不得退化成 7×24）。
+   * ⚠️ 引擎**不内置任何节假日表**：`holidays` 一律由宿主给（每家公司的放假安排不同）。
+   */
+  readonly workCalendar?: string | WorkCalendarSpec | undefined;
 }
 
 export interface ScheduleRequest {
@@ -285,7 +292,7 @@ export interface ScheduleRequest {
 /**
  * 定时（超时提醒 / 自动审批）。
  * ★ **内核里不允许出现定时逻辑**（把定时画进内核是最常见的架构污染）；
- * 不注入 = 内置 `createMemoryScheduler()` 零依赖进程内实现。
+ * ★ **不注入 = 不排程**（没有 `createMemoryScheduler()` 这类内置实现，别信旧注释）。
  */
 export interface Scheduler {
   /** 返回可取消的 handle（形状由**调度方**决定，引擎不得假定） */

@@ -34,7 +34,7 @@
  *   定时器会在待办办完之后照样触发（最典型的"已办结还在催办"）。
  */
 
-import type { NormalizedTimeout, TimeoutAction } from '@floken-io/moddle';
+import type { NormalizedTimeout, TimeoutAction, WorkCalendarSpec } from '@floken-io/moddle';
 
 import type { InstanceState } from '../core/state.js';
 import type { TimeoutSpec } from '../core/spi.js';
@@ -76,18 +76,27 @@ export function timerKeyOf(nodeId: string, tokenId: string): string {
   return `${nodeId}::${tokenId}`;
 }
 
-/** ★ 把 moddle 的归一化超时配置裁成 `TimeoutSpec`（只交**原始配置**，不交算好的时刻） */
+/**
+ * ★ 把 moddle 的归一化超时配置裁成 `TimeoutSpec`（只交**原始配置**，不交算好的时刻）
+ *
+ * ⚠️ `workCalendar` 的两种形态（`string` 日历 id / 内联 `WorkCalendarSpec` 对象）
+ * **都原样交出**。早期只在它是字符串时透传，内联对象被**静默丢弃** ——
+ * 模型层允许写、归一化也留着，到调度方手里却没了，全程无提示（= 静默吞掉宿主的配置）。
+ *
+ * 内核**不解读**日历内容（`workdays` / `hours` / `holidays` 是什么、怎么跳过节假日
+ * 都是业务数据），也不补齐默认值 —— 那些是调度方的事。
+ */
 export function timeoutSpecOf(t: NormalizedTimeout): TimeoutSpec {
-  const out: { duration?: string; date?: string; cycle?: string; workCalendar?: string } = {};
+  const out: {
+    duration?: string;
+    date?: string;
+    cycle?: string;
+    workCalendar?: string | WorkCalendarSpec;
+  } = {};
   if (typeof t.duration === 'string') out.duration = t.duration;
   if (typeof t.date === 'string') out.date = t.date;
   if (typeof t.cycle === 'string') out.cycle = t.cycle;
-  /*
-   * ⚠️ `workCalendar` 归一化后可能是**完整日历对象**（宿主内联配置），
-   * 这里只在其为字符串（日历 id）时透传 —— 对象形态交给调度方用自己的默认或另一条通道。
-   * 内核不解释日历内容（那是要跳过节假日的业务数据）。
-   */
-  if (typeof t.workCalendar === 'string') out.workCalendar = t.workCalendar;
+  if (t.workCalendar !== undefined) out.workCalendar = t.workCalendar;
   return out;
 }
 

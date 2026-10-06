@@ -23,6 +23,19 @@
 
 现在 `extension` 里**什么键都能写**，与一等字段同名也照给、零诊断。
 
+### 修复 · 内联 `workCalendar` 不再被静默丢弃
+
+`TimeoutSpec.workCalendar` 的类型由 `string` 放宽为 **`string | WorkCalendarSpec`**，
+`timeoutSpecOf()` 对两种形态**都原样交出**。
+
+此前只在它是字符串（日历 id）时透传，**内联对象被整个丢掉且不报错** ——
+模型层允许写、归一化也留着，到调度方手里却没了，等于静默吞掉宿主的配置。
+
+同时订正两条注释口径：
+
+- 引擎**不内置任何节假日表**，`holidays` 一律由宿主给；
+- `Scheduler` **不注入 = 不排程**（不存在 `createMemoryScheduler()`，旧注释写错了）。
+
 ### 破坏性变更 · 并入层不再"去命名空间前缀"（v1 遗留，Q48 后失效）
 
 `extensionVars` 并入求值上下文时，v1 会把 `acme:priority` 截成 `priority`。v2 已删：
