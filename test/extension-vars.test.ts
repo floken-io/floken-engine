@@ -124,30 +124,38 @@ describe('ADR-009 · 只读字段恒给（不配置也有）', () => {
     });
   });
 
-  it('③ 模型的一等字段一律不外泄（判据 = `NODE_RESERVED_KEYS`，引擎不另写一份）', async () => {
+  it('③ `extension` 是宿主的地盘：与一等字段**同名也照给**（引擎不筛选）', async () => {
     /*
-     * ★ 真断言（v1 版写的是 `!key.startsWith('floken:')`，而测试数据里早就**没有**
-     * `floken:` 键了 —— 那条断言恒真，等于没测）。
-     * 这里往 `extension` 里**真的塞**一等字段键，看引擎是否照样排除。
-     * （moddle 校验层会把 `extension` 里的保留键判成 error，故这里直接构造对象绕过校验 ——
-     *   测的是引擎这道防线本身，不是模型层那道。）
+     * ★ 用户 2026-10-06 质问：「自定义扩展键中出现什么都不奇怪吧，这是用户自己的」。
+     * 对。v2 里一等字段在 `node.approval`，**不在** `node.extension` 里 ——
+     * 所以袋里出现 `approval` 只可能是**宿主自己的业务数据**。
+     * 引擎若按保留键把它剔除，就是**静默吃掉宿主的数据**，与"原样存取"的承诺矛盾。
+     * （引擎侧这道排除逻辑已于 2026-10-06 删除；误用提示交给 moddle 的 warn 指路。）
+     *
+     * ⚠️ 这条曾经是"恒真空断言"：断言 `!key.startsWith('floken:')`，而测试数据里
+     * 早就没有 `floken:` 键 —— 恒真，等于没测。现在改成真断言：塞进去真能读出来。
      */
-    const leaky = def() as unknown as { nodes: Array<Record<string, unknown>> };
-    leaky.nodes[2] = {
-      ...leaky.nodes[2]!,
-      extension: { approval: 'x', call: 'y', timeout: 'z', mine: 'ok' },
+    const withSameName = def() as unknown as { nodes: Array<Record<string, unknown>> };
+    withSameName.nodes[2] = {
+      ...withSameName.nodes[2]!,
+      extension: { approval: '宿主自己的审批意见', call: 42, timeout: null, mine: 'ok' },
     };
     const spy: ConditionCtx[] = [];
     const e = createEngine({
-      definitionSource: { async getDefinition() { return leaky as never; } },
+      definitionSource: { async getDefinition() { return withSameName as never; } },
       clock: () => T,
       conditionHandler: { evaluate(_expr, ctx) { spy.push(ctx); return true; } },
     });
     await startIt(e);
     const ctx = spy.find((c) => c.targetExtensions !== undefined);
     expect(ctx).toBeDefined();
-    // 保留键一个都不许出现；宿主的键照给
-    expect(ctx?.targetExtensions).toEqual({ mine: 'ok' });
+    // ★ 一个都不少、一个都没被改写
+    expect(ctx?.targetExtensions).toEqual({
+      approval: '宿主自己的审批意见',
+      call: 42,
+      timeout: null,
+      mine: 'ok',
+    });
   });
 
   it('④ v2：结构化值**也给**（只有函数排除）', async () => {

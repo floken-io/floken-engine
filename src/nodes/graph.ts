@@ -47,16 +47,12 @@ import type { CatchBinding } from './catch.js';
  *   建图时每个带审批配置的节点都要走一次，不能每次都做一遍模块解析。
  * ★ 首次**用到**才解析：只 import engine 不建图不会被缺失的 peer 打断。
  */
-type ModdleSlice = Pick<
-  typeof import('@floken-io/moddle'),
-  'normalizeApproval' | 'NODE_RESERVED_KEYS'
->;
+type ModdleSlice = Pick<typeof import('@floken-io/moddle'), 'normalizeApproval'>;
 
 let moddleCache: ModdleSlice | undefined;
 function moddle(): ModdleSlice {
   return (moddleCache ??= requirePeer<ModdleSlice>('@floken-io/moddle', {
-      neededFor:
-        'approval semantics: normalizeApproval() when building the definition graph; NODE_RESERVED_KEYS for ADR-009 exclusion',
+      neededFor: 'approval semantics: normalizeApproval() when building the definition graph',
       range: '>=0.1.0 <0.2.0',
     },
   ));
@@ -74,24 +70,21 @@ export const WAITING_NODE_TYPES: readonly string[] = ['userTask'];
 /** **结束类**：令牌到达即该令牌完成；全部令牌完成 → 实例 `completed`。 */
 export const TERMINAL_NODE_TYPES: readonly string[] = ['endEvent'];
 
-/**
- * ★ ADR-009 细则③：**排除模型的一等字段键**（v2 口径，2026-10-03 改定）。
+/*
+ * ★ **这里曾经有一道"排除模型一等字段键"的逻辑，2026-10-06 删除**（ADR-009 细则③）。
  *
- * v1 排除的是 `floken:` 前缀（那时审批语义住在 `extension['floken:approval']` 里，
- * 前缀是 XML 命名空间机制的产物）。**moddle v2 取消前缀、JSON-only** 之后，
- * `approval` / `call` / `eventDefinition` 提升为了一等字段，故排除判据改为**保留键**：
+ * 它的来龙去脉：v1 排除 `floken:*` 前缀（那时审批语义**住在** `extension['floken:approval']`
+ * 里，前缀是 XML 命名空间的产物）；v2 把 `approval` / `call` / `eventDefinition` 提升为
+ * 一等字段后，判据改成"排除 `NODE_RESERVED_KEYS`"。
  *
- *   ① 不外泄引擎内部语义（`approval` 是引擎的输入，不是宿主该读的东西）；
- *   ② 一等字段与袋里同名的那份「哪个生效」会变成未定义行为。
+ * **v2 里这道逻辑已经没有对象了**：一等字段在 `node.approval`，**不在** `node.extension` 里。
+ * 于是 `extension` 里出现 `approval` 只有一种可能 —— **宿主自己的业务数据**。
+ * 再排除它就不是"不外泄内部语义"，而是**静默吃掉宿主的数据**，
+ * 直接违背「`extension` 是宿主的地盘，引擎不解读、不改写、**不筛选**」这条承诺。
  *
- * ★ 清单**从 moddle 取**（`NODE_RESERVED_KEYS`），引擎**不另写一份** ——
- * 补名单这条路迟早会漏一个（v1 就是手写一个前缀，结果 `floken:xxx` 全被排除，
- * 连宿主自己想用的也一起排掉了）。
+ * 那"作者把审批误写进 extension"谁来管？—— **moddle 校验层给 warn 指路**（不拒绝数据）。
+ * 引擎不接管这件事：它连模型是哪儿来的都不知道，判不了"你是不是想配审批"。
  */
-function reservedKeysOf(): ReadonlySet<string> {
-  const keys = moddle().NODE_RESERVED_KEYS;
-  return new Set(keys);
-}
 
 /**
  * ★ ADR-009 细则④：**结构化值也给**（v2 起放开，2026-10-03 改定）。
@@ -249,7 +242,8 @@ export interface ProcessGraph {
    * 给出去的是**原样键值**，引擎**不解释**任何宿主属性是什么意思 ——
    * 解释权 100% 在宿主（源码里不得出现任何具体宿主键名）。
    *
-   * - **排除模型一等字段键**（`NODE_RESERVED_KEYS`，从 `moddle` 取）：那些是引擎自己的；
+   * - **原样给出**：`extension` 是宿主的地盘，引擎**不解读、不改写、不筛选** ——
+   *   与一等字段同名的键也照给（那是宿主自己的数据，引擎没资格替他决定要不要）；
    * - **结构化值也给**（数组 / 对象原样；只有函数与 `undefined` 排除）；
    * - **一个都没有 → `undefined`**（不填空对象 —— 调用方要能区分「没配」与「配了但被过滤空」）。
    */
@@ -467,10 +461,8 @@ export function createProcessGraph(
       const raw = nodes.get(nodeId)?.extension;
       let value: Readonly<Record<string, unknown>> | undefined;
       if (raw !== undefined && typeof raw === 'object' && raw !== null && !Array.isArray(raw)) {
-        const reserved = reservedKeysOf();
         const out: Record<string, unknown> = {};
         for (const [key, v] of Object.entries(raw)) {
-          if (reserved.has(key)) continue; // 细则③：不外泄模型的一等字段
           if (key === RAW_SNAPSHOT_KEY) continue;
           if (!isUsableExtensionValue(v)) continue; // 细则④：结构化值也给，只有函数排除
           out[key] = v;

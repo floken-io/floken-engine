@@ -971,7 +971,7 @@ class EngineError extends Error {
 > ★ **2026-10-03 改定（随 `moddle@0.1.0` 的 JSON-only 重做一起）** —— 下表 ③ / ④ / ⑧ 三条已改：
 > | 项 | 原（0.0.2） | 现（0.0.3 起） |
 > |---|---|---|
-> | ③ 排除判据 | 排除 `floken:*` **前缀** | 排除**模型一等字段键 `NODE_RESERVED_KEYS`**（从 `@floken-io/moddle` 惰性取，引擎**不另写一份**） |
+> | ③ 排除判据 | 排除 `floken:*` **前缀** | ★ **不排除任何键**（2026-10-06 再放开，判据整个删除） |
 > | ④ 值的范围 | **只给标量** | **结构化值也给**，只排除函数与 `undefined` |
 > | ⑧ 类型还原起因 | XML 往返后值一律字符串 | v2 是 JSON、值不受序列化约束；但**作者写 `"48"` 就还是字符串**，故 `casts` 仍需保留 |
 >
@@ -998,11 +998,11 @@ class EngineError extends Error {
 |---|---|---|
 | ① | **只读字段恒给** | `ConditionCtx` 增 `nodeExtensions` / `targetExtensions`（`Readonly<Record<string, unknown>>`）。**不配置也永远给** —— 纯增字段，0.0.1 行为逐字不变 |
 | ② | **谁的扩展** | `nodeExtensions` = **当前节点**（`ctx.nodeId`，即条件所在的网关/活动）；`targetExtensions` = **该条件所在顺序流的目标节点**（`OutFlow.to`）。二者都要，因为"加急等级"通常挂在**审批节点**（目标）而不是网关上。**取不到 → `undefined`**（不抛、不填空对象） |
-| ③ | ★ **排除模型一等字段键**（2026-10-03 改定） | 排除 `NODE_RESERVED_KEYS`（`approval` / `call` / `script` …，**从 moddle 取**）：① 模型自己的键不外泄；② 它们已是一等字段，袋里再塞一份会让「哪个生效」变成未定义行为。⚠️ 原为「排除 `floken:*` 前缀」，前缀机制随 XML 消失 |
+| ③ | ★ **不排除任何键**（2026-10-06 删除，见下） | v2 里一等字段在 `node.approval`，**不在** `node.extension` 里 —— 袋里出现 `approval` 只可能是**宿主自己的业务数据**。再排除它就不是"不外泄内部语义"，而是**静默吃掉宿主的数据**，违背「引擎不解读、不改写、**不筛选**」的承诺。<br>演变：`floken:*` 前缀（v1）→ `NODE_RESERVED_KEYS`（2026-10-03，前缀随 XML 消失后的等价替换）→ **判据整个删除**（2026-10-06）。配套删除 `NODE_RESERVED_KEYS` 常量、`VALIDATE_RESERVED_KEY` 诊断码，以及对 `extension` 键名的任何校验（含降级成 warn 的版本） |
 | ④ | ★ **结构化值也给**（2026-10-03 改定） | 只排除**函数**与 `undefined`，对象/数组**原样给出**。⚠️ 原为「只给标量」，那条约束来自「XML 属性只能装字符串」，JSON 里没有 |
 | ⑤ | **默认不并入** | 自动并入会改变既有流程的求值结果。**只有**宿主显式声明 `EngineConfig.extensionVars` 才并入 —— 不声明 = 现状语义 |
 | ⑥ | **并入形态：两个对象，不平铺** | 挂成 `variables.node` / `variables.target`（键名可配）。FEEL 写 `target.priority = "high"`。**理由**：把"设计期配置"与"运行期数据"分成两个命名空间，撞车面从「每个键」降到「两个名字」 |
-| ⑥b | ★ **并入层的键要去前缀** | 实测：键带冒号时 **FEEL 根本引用不到它** —— `target.acme:priority` → `FeelSyntaxError: Unexpected token ':'`；`target["acme:priority"]` → **`null`**（`[...]` 在 FEEL 里是列表筛选/索引，不是对象取键）。故并入层写 `priority`，而**只读字段保留前缀**（`acme:priority`，原样）。去前缀后**同节点内不同前缀同名** → 抛 `OPTION_INVALID`（不静默二选一） |
+| ⑥b | ★ **并入层的键原样、且不得带冒号** | 实测：键带冒号时 **FEEL 根本引用不到它** —— `target.acme:priority` → `FeelSyntaxError: Unexpected token ':'`；`target["acme:priority"]` → **`null`**（`[...]` 在 FEEL 里是列表筛选/索引，不是对象取键）。故并入层遇到冒号键**直接抛 `OPTION_INVALID`**（不静默并入一个读不出来的变量）。<br>⚠️ v1 靠"去前缀"绕过（`acme:priority` → `priority`），2026-10-06 已删：那会**静默截断**普通键（实测 `order:id` → `id`） |
 | ⑦ | **冲突 → 抛错，不静默** | 变量名已被占用（如用户自己有个 `node` 变量）→ 抛 **`ENGINE_OPTION_INVALID`**（复用现有码，**不新增第 20 个抛出码 / 第 3 个诊断码**），hint 指名改用 `extensionVars.key`。仅在 opt-in 后才可能发生 |
 | ⑧ | **类型还原靠宿主声明** | ★ **v2 改口径**：值不再受序列化约束（JSON 里 `48` 存进去就是 `48`），但**作者自己写 `"48"` 就还是字符串**，`slaHours > 24` 遇到 `"48"` 会按字符串比较 → 抛错。引擎**不猜类型**（猜 = 静默错误），按 `EngineConfig.extensionVars.casts` 声明转换；**二期**改由模型内 `floken:extensionTypes` 声明块承载 |
 | ⑨ | **不进 state、不破纯度** | 并入只发生在 `buildApply()` 的重跑里（`runtime/engine.ts`，唯一不纯文件），**写进求值上下文、绝不写进 `InstanceState.variables`**（否则状态膨胀且快照里存两份真相）。`plan()` 门 2 不经过它 —— 宿主自提供 `conditionsOf` 闭包， purity 不受影响 |

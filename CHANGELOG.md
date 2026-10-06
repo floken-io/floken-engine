@@ -5,6 +5,24 @@
 
 ## 未发布
 
+### 破坏性变更 · `extension` 是宿主的地盘：引擎不再筛选任何键
+
+`extensionsOf()` / `ConditionCtx.nodeExtensions` / `targetExtensions` 原来会按
+"模型一等字段键"排除一部分键。这条判据**整个删除**：
+
+- v2 里一等字段在 `node.approval`，**不在** `node.extension` 里 —— 袋里出现 `approval`
+  只有一种可能：**宿主自己的业务数据**；
+- 再排除它就不是"不外泄内部语义"，而是**静默吃掉宿主的数据**，
+  直接违背「引擎不解读、不改写、**不筛选**」这条承诺。
+
+（演变：`floken:*` 前缀 → `NODE_RESERVED_KEYS` → 判据整个删除。前两版是 v1 判据的
+等价替换，替换得再准，判据本身在 v2 已无对象。）
+
+配套删除：`ModdleSlice` 不再取 `NODE_RESERVED_KEYS`（对 moddle 的需求只剩
+`normalizeApproval` 一项）。
+
+现在 `extension` 里**什么键都能写**，与一等字段同名也照给、零诊断。
+
 ### 破坏性变更 · 并入层不再"去命名空间前缀"（v1 遗留，Q48 后失效）
 
 `extensionVars` 并入求值上下文时，v1 会把 `acme:priority` 截成 `priority`。v2 已删：

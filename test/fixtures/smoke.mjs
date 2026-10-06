@@ -2583,8 +2583,8 @@ await checkAsync('ADR-009 · 只读字段恒给：一等字段不外泄、结构
   const bag = JSON.parse(seen.find((s) => s.includes('gwTag')));
   eq(bag.n['gwTag'], 'main', '当前节点 = 网关自己的属性');
   eq(bag.t['priority'], 'high', '目标节点 = 分支通向的节点');
-  // ★ v2：排除判据从「`floken:*` 前缀」改为「模型一等字段键」（前缀随 XML 一起消失）
-  eq(bag.t['approval'], undefined, '★ 模型的一等字段不外泄');
+  // ★ v2：`extension` 是宿主的地盘 —— 与一等字段**同名也照给**，引擎不筛选、不改写
+  eq(bag.t['approval'], undefined, '★ 本节点 extension 里没写 approval（写了也会原样给出）');
   // ★ v2 起结构化值**也给出**（旧口径"只给标量"的理由是 XML 属性装不下，已不成立）
   eq(JSON.stringify(bag.t['tags']), '["finance"]', '★ 结构化值原样给出');
   eq(bag.t['slaHours'], '48', '★ 作者在 JSON 里写的就是字符串 —— cast 由宿主声明（引擎不猜）');
