@@ -3,6 +3,29 @@
 本包遵循 [Semantic Versioning](https://semver.org/)，格式参考 [Keep a Changelog](https://keepachangelog.com/)。
 0.x 阶段跨包依赖写 `>=x.y.z <1.0.0`（不用 `^`）。
 
+## 未发布
+
+### 破坏性变更 · 并入层不再"去命名空间前缀"（v1 遗留，Q48 后失效）
+
+`extensionVars` 并入求值上下文时，v1 会把 `acme:priority` 截成 `priority`。v2 已删：
+
+- `extension` 是**任意 JSON，没有命名空间概念**，前缀只是宿主自己的命名习惯；
+- 留着它会**静默截断**普通键 —— 实测 `order:id` → `id`、`a:b:c` → `b:c`，
+  机缘巧合还会命中另一个真实变量从而判错分支。
+
+现在**键原样并入**，写什么键就是什么键。同时新增一道硬约束：
+
+- **键里带冒号 → 抛 `OPTION_INVALID`**（不静默并入）。实测 FEEL 引用不到带冒号的键：
+  `target.acme:priority` 语法错、`target["acme:priority"]` 求值为 `null`
+  （`[...]` 在 FEEL 里是列表筛选，不是对象取键）。并进去了却读不出来 = 功能不存在且毫无提示。
+- 由此可知：扩展键**不要带冒号**。写 `priority`，别写 `acme:priority`。
+
+配套删除：「去前缀后两个命名空间撞名 → 抛错」这条判据一并删除
+（键不再被改写，就不可能被改写出碰撞）。
+
+⚠️ 迁移：把模型里 `extension` 的键与前缀一起去掉（`acme:priority` → `priority`），
+并把 `extensionVars.casts` 的键同步改成无前缀形式。
+
 ## 0.0.3 — 2026-10-03
 
 ★ 本次含**两项破坏性变更**（Q49 跨包 peer 化 + Q48 联动 Model JSON v2），

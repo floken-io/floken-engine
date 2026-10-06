@@ -181,12 +181,14 @@ export interface ExtensionVarsOption {
   /** ★ **目标节点**扩展属性并入后的顶层键名（默认 `'target'`）；冲突处置同 `key` */
   targetKey?: string;
   /**
-   * ★ 类型还原表：`'acme:slaHours'` → `'number'`。
+   * ★ 类型还原表：键 → 目标类型。例如 `{ slaHours: 'number' }`。
    *
-   * 为什么必须有：`moddle` 从 XML 读回的扩展属性**一律是字符串**（实测 `48 → "48"`），
+   * 为什么必须有：模型作者**可能**把值写成字符串（`'48'` 而不是 `48`），
    * 而 `slaHours > 24` 遇到 `"48"` 会按字符串比较 → 抛错。
    * 引擎**不猜类型**（`"48"` 究竟是数字还是编号？猜 = 静默错误），按本表声明转换。
-   * 二期改由模型内 `floken:extensionTypes` 声明块承载（仍是 `floken:` 命名空间）。
+   *
+   * ⚠️ 键**不带前缀**（v2 起 `extension` 无命名空间概念，且带冒号的键 FEEL 引用不到，
+   * 见 `castExtensionBag`）。表的键必须与 `extension` 里的键**逐字相同**。
    */
   casts?: Readonly<Record<string, 'number' | 'boolean' | 'iso-date'>>;
 }
@@ -489,20 +491,19 @@ function applyExtensionCast(key: string, value: unknown, kind: ExtensionCast): u
 }
 
 /**
- * ★ 去掉命名空间前缀（`acme:priority` → `priority`）—— **只作用于并入层**。
+ * ★ 把一袋扩展属性转成并入用的对象（应用 cast）；空袋 → `undefined`。
  *
- * 为什么必须去前缀（实测结论，不是偏好）：键带冒号时 **FEEL 引用不到它** ——
- *   - `target.acme:priority` → `FeelSyntaxError: Unexpected token ':'`；
- *   - `target["acme:priority"]` → **`null`**（`[...]` 在 FEEL 里是列表筛选/索引，不是对象取键）。
- * 于是"并进了却读不出来"，等于功能不存在。故并入层一律去前缀，
- * 而**只读字段 `nodeExtensions` 保留前缀**（原样，供宿主在非 FEEL 场景使用）。
+ * **键原样并入，引擎绝不改写**（v2 口径）。v1 曾有一道「去掉 `acme:` 命名空间前缀」的
+ * 逻辑（`acme:priority` → `priority`），Q48 之后随 XML 一起作废：v2 的 `extension` 是
+ * **任意 JSON，没有命名空间概念**，前缀只是宿主自己的命名习惯。留着它会**静默截断** ——
+ * 实测 `order:id` → `id`、`a:b:c` → `b:c`，机缘巧合还会**命中另一个真实变量**从而判错分支。
+ * 引擎不猜宿主的键名（与「引擎不解释宿主语义」同一条红线）。
+ *
+ * ★ **键里带冒号 → 直接抛错**，不静默跳过（实测，不是偏好）：FEEL 引用不到带冒号的键 ——
+ *   - `target.acme:priority` → `FeelSyntaxError: Unexpected token ':'`
+ *   - `target["acme:priority"]` → `null`（`[...]` 在 FEEL 里是列表筛选，不是对象取键）
+ *   静默并入一个读不出来的变量 = 功能不存在却毫无提示，比报错糟得多。
  */
-function stripExtPrefix(key: string): string {
-  const i = key.indexOf(':');
-  return i === -1 ? key : key.slice(i + 1);
-}
-
-/** 把一袋扩展属性转成并入用的对象（去前缀 + 应用 cast）；空袋 → `undefined` */
 function castExtensionBag(
   bag: Readonly<Record<string, unknown>> | undefined,
   casts: Readonly<Record<string, ExtensionCast>> | undefined,
@@ -510,22 +511,15 @@ function castExtensionBag(
   if (bag === undefined) return undefined;
   const out: Record<string, unknown> = {};
   for (const [key, value] of Object.entries(bag)) {
-    const kind = casts?.[key];
-    const v = kind === undefined ? value : applyExtensionCast(key, value, kind);
-    const name = stripExtPrefix(key);
-    /*
-     * ★ 去前缀之后**同名** = 两个命名空间用了同一个名字（`acme:level` 与 `hr:level`）。
-     * 此时并入哪一个都是静默丢数据 —— 抛错，让宿主去改名或收窄前缀。
-     * （只读字段仍带前缀，信息没丢；这里只是拒绝**自动**二选一。）
-     */
-    if (Object.prototype.hasOwnProperty.call(out, name)) {
+    if (key.includes(':')) {
       throw optionInvalid(
         'extensionVars',
-        `two extension keys collapse to the same variable name '${name}' after stripping the namespace prefix`,
-        { name, bag: Object.keys(bag) },
+        `extension key '${key}' contains ':' — FEEL cannot reference it ('x.${key}' is a syntax error and 'x["${key}"]' evaluates to null); use a plain key like '${key.slice(key.lastIndexOf(':') + 1)}'`,
+        { key, bag: Object.keys(bag) },
       );
     }
-    out[name] = v;
+    const kind = casts?.[key];
+    out[key] = kind === undefined ? value : applyExtensionCast(key, value, kind);
   }
   return out;
 }

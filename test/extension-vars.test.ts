@@ -1,10 +1,10 @@
 /**
- * ★ ADR-009：宿主自定义扩展属性（`node.extension['acme:*']`）→ 引擎。
+ * ★ ADR-009：宿主自定义扩展属性（`node.extension`）→ 引擎。
  *
  * 九条细则里，本文件逐个钉死最容易被"做歪"的几条：
  *   ① 只读字段**恒给**（不配置也有）      —— 用例 1 / 2
- *   ③ `floken:*` 不外泄                  —— 用例 3
- *   ④ 只给标量（结构化值跳过）            —— 用例 4
+ *   ③ 模型一等字段键不外泄                —— 用例 3
+ *   ④ 结构化值**也给**（v2 放开）          —— 用例 4
  *   ⑤ 默认**不并入** `variables`          —— 用例 1 / 5
  *   ⑥ opt-in 后挂成 `node` / `target`     —— 用例 6
  *   ⑦ 变量名冲突 → 抛错（不静默覆盖）      —— 用例 7
@@ -12,6 +12,10 @@
  *   ⑨ 不入 `state.variables`              —— 用例 5
  *
  * ⚠️ 判据一律是**可观测行为**，不是"代码里写了"：并入与否看**待办落在哪个分支**。
+ *
+ * ★ v2 口径：extension 的键**不带前缀**（`priority`，不是 `acme:priority`）。
+ * 前缀是 XML 命名空间的遗留物，v2 已无此概念；且带冒号的键 **FEEL 引用不到**
+ * （`x.a:b` 语法错、`x["a:b"]` 求值为 null），故并入层遇到冒号键直接抛错（用例 7b）。
  */
 import { describe, expect, it } from 'vitest';
 
@@ -30,9 +34,8 @@ const T = '2026-10-02T04:00:00.000Z';
  * `Start_1 → GW →(target.priority = "high")→ Task_urgent →(…)→ End_1`
  *                 `→(无条件)→ Task_normal → End_1`
  *
- * - `GW` 自身挂 `acme:gwTag`（测 `nodeExtensions` = 当前节点）
- * - `Task_urgent` 挂 `acme:priority='high'` / `acme:slaHours`（字符串 "48"）/ **结构化值**（测跳过）
- * - 两个 Task 都带 `floken:approval`（测 `floken:*` 不被外泄）
+ * - `GW` 自身挂 `gwTag`（测 `nodeExtensions` = 当前节点）
+ * - `Task_urgent` 挂 `priority='high'` / `slaHours`（字符串 "48"）/ **结构化值**（v2 也给）
  */
 const def = () =>
   makeDefinition({
@@ -43,7 +46,7 @@ const def = () =>
       {
         id: 'GW',
         type: 'exclusiveGateway',
-        extension: { 'acme:gwTag': 'main' },
+        extension: { gwTag: 'main' },
       },
       {
         id: 'Task_urgent',
@@ -51,10 +54,10 @@ const def = () =>
         name: '加急',
         approval: userApproval('u_boss'),
         extension: {
-          'acme:priority': 'high',
-          'acme:slaHours': '48', // ★ 字符串（XML 往返后的真实形态）
-          'acme:tags': ['finance'], // 结构化 → 应被跳过
-          'acme:rule': { limit: 1 }, // 结构化 → 应被跳过
+          priority: 'high',
+          slaHours: '48', // ★ 字符串（作者这么写就存成字符串，JSON 不强制类型）
+          tags: ['finance'], // 结构化值
+          rule: { limit: 1 }, // 结构化值
         },
       },
       {
@@ -62,7 +65,7 @@ const def = () =>
         type: 'userTask',
         name: '普通',
         approval: userApproval('u_staff'),
-        extension: { 'acme:priority': 'low' },
+        extension: { priority: 'low' },
       },
       { id: 'End_1', type: 'endEvent' },
     ],
@@ -106,7 +109,7 @@ describe('ADR-009 · 只读字段恒给（不配置也有）', () => {
     await startIt(engineWith(undefined, spy));
     const ctx = spy.find((c) => c.nodeId === 'GW');
     expect(ctx).toBeDefined();
-    expect(ctx?.nodeExtensions).toEqual({ 'acme:gwTag': 'main' });
+    expect(ctx?.nodeExtensions).toEqual({ gwTag: 'main' });
     /*
      * ★ v2 起**结构化值也给出**（ADR-009 细则④ 已放开，2026-10-03）：
      * 旧口径"只给标量"的理由是「结构化值写不进 XML 属性」，那个理由随 moddle v2
@@ -114,33 +117,47 @@ describe('ADR-009 · 只读字段恒给（不配置也有）', () => {
      * 却读不进条件表达式。
      */
     expect(ctx?.targetExtensions).toEqual({
-      'acme:priority': 'high',
-      'acme:slaHours': '48',
-      'acme:tags': ['finance'],
-      'acme:rule': { limit: 1 },
+      priority: 'high',
+      slaHours: '48',
+      tags: ['finance'],
+      rule: { limit: 1 },
     });
   });
 
-  it('③ 模型的一等字段一律不外泄（v1 是排除 `floken:*`，v2 改为排除保留键）', async () => {
+  it('③ 模型的一等字段一律不外泄（判据 = `NODE_RESERVED_KEYS`，引擎不另写一份）', async () => {
+    /*
+     * ★ 真断言（v1 版写的是 `!key.startsWith('floken:')`，而测试数据里早就**没有**
+     * `floken:` 键了 —— 那条断言恒真，等于没测）。
+     * 这里往 `extension` 里**真的塞**一等字段键，看引擎是否照样排除。
+     * （moddle 校验层会把 `extension` 里的保留键判成 error，故这里直接构造对象绕过校验 ——
+     *   测的是引擎这道防线本身，不是模型层那道。）
+     */
+    const leaky = def() as unknown as { nodes: Array<Record<string, unknown>> };
+    leaky.nodes[2] = {
+      ...leaky.nodes[2]!,
+      extension: { approval: 'x', call: 'y', timeout: 'z', mine: 'ok' },
+    };
     const spy: ConditionCtx[] = [];
-    await startIt(engineWith(undefined, spy));
-    for (const c of spy) {
-      for (const bag of [c.nodeExtensions, c.targetExtensions]) {
-        for (const key of Object.keys(bag ?? {})) {
-          expect(key.startsWith('floken:')).toBe(false);
-        }
-      }
-    }
+    const e = createEngine({
+      definitionSource: { async getDefinition() { return leaky as never; } },
+      clock: () => T,
+      conditionHandler: { evaluate(_expr, ctx) { spy.push(ctx); return true; } },
+    });
+    await startIt(e);
+    const ctx = spy.find((c) => c.targetExtensions !== undefined);
+    expect(ctx).toBeDefined();
+    // 保留键一个都不许出现；宿主的键照给
+    expect(ctx?.targetExtensions).toEqual({ mine: 'ok' });
   });
 
   it('④ v2：结构化值**也给**（只有函数排除）', async () => {
     const spy: ConditionCtx[] = [];
     await startIt(engineWith(undefined, spy));
-    const ctx = spy.find((c) => c.targetExtensions?.['acme:priority'] === 'high');
+    const ctx = spy.find((c) => c.targetExtensions?.['priority'] === 'high');
     expect(ctx?.targetExtensions).toBeDefined();
     // 数组与对象原样给出（moddle v2 的 extension 就是任意 JSON，类型天然保真）
-    expect(ctx?.targetExtensions?.['acme:tags']).toEqual(['finance']);
-    expect(ctx?.targetExtensions?.['acme:rule']).toEqual({ limit: 1 });
+    expect(ctx?.targetExtensions?.['tags']).toEqual(['finance']);
+    expect(ctx?.targetExtensions?.['rule']).toEqual({ limit: 1 });
   });
 
   it('⑤⑨ 默认**不并入** `variables`，且**绝不写回** state（细则⑨）', async () => {
@@ -167,12 +184,16 @@ describe('ADR-009 · 只读字段恒给（不配置也有）', () => {
 });
 
 describe('ADR-009 · opt-in 并入（细则⑥⑦⑧）', () => {
-  it('⑥ 挂成 `variables.node` / `variables.target`，**键已去前缀**（FEEL 只能引用无冒号的名字）', async () => {
+  it('⑥ 挂成 `variables.node` / `variables.target`，**键原样**（引擎不改写宿主键名）', async () => {
     const spy: ConditionCtx[] = [];
     const e = engineWith({}, spy);
     await startIt(e);
     const ctx = spy.find((c) => c.nodeId === 'GW');
-    // ★ 实测：`target.acme:priority` 语法错、`target["acme:priority"]` 求值为 null —— 带冒号引用不到
+    /*
+     * ★ v1 曾在这里"去命名空间前缀"（`acme:priority` → `priority`）。v2 已删：
+     * 无前缀概念，且去前缀会**静默截断**普通键（`order:id` → `id`）。
+     * 现在写什么键就是什么键 —— 也正因为如此，键**不能带冒号**（见下一条用例）。
+     */
     expect(ctx?.variables).toMatchObject({
       node: { gwTag: 'main' },
       target: { priority: 'high', slaHours: '48' },
@@ -216,8 +237,15 @@ describe('ADR-009 · opt-in 并入（细则⑥⑦⑧）', () => {
     expect(seen).toEqual(['Task_normal/u_staff']); // ★ 静默走错分支：这就是不 opt-in 的代价
   });
 
-  it('⑥ 去前缀后同名（两个命名空间撞名）→ 抛 `OPTION_INVALID`，不静默二选一', async () => {
-    const clash = makeDefinition({
+  it('⑥★ 键里带冒号 → `OPTION_INVALID`（FEEL 引用不到，静默并入等于功能不存在）', async () => {
+    /*
+     * 实测（`tmp/ext-key-check.mjs`，直连 feel dist）：
+     *   `target.acme:priority`        → FeelSyntaxError: Unexpected token ':'
+     *   `target["acme:priority"]`     → null（[...] 是列表筛选，不是对象取键）
+     * 所以"并进去了却读不出来"比"当场报错"糟得多 —— 这里必须抛。
+     * （v1 靠"去前缀"绕过，代价是 `order:id` 被截成 `id`；v2 两者都不做，直接说清。）
+     */
+    const colon = makeDefinition({
       nodes: [
         { id: 'Start_1', type: 'startEvent' },
         { id: 'GW', type: 'exclusiveGateway' },
@@ -226,7 +254,7 @@ describe('ADR-009 · opt-in 并入（细则⑥⑦⑧）', () => {
           type: 'userTask',
           name: 'A',
           approval: userApproval('u_a'),
-          extension: { 'acme:level': 'high', 'hr:level': 'low' }, // 去前缀后都叫 level
+          extension: { 'acme:level': 'high' },
         },
         { id: 'Task_b', type: 'userTask', name: 'B', approval: userApproval('u_b') },
         { id: 'End_1', type: 'endEvent' },
@@ -240,12 +268,12 @@ describe('ADR-009 · opt-in 并入（细则⑥⑦⑧）', () => {
       ],
     });
     const e = createEngine({
-      definitionSource: { async getDefinition() { return clash; } },
+      definitionSource: { async getDefinition() { return colon; } },
       clock: () => T,
       extensionVars: {},
     });
     const err = await expectCodeAsync(() => startIt(e), ENGINE_ERROR_CODES.OPTION_INVALID);
-    expect(String(err.details?.reason)).toContain('level');
+    expect(String(err.details?.reason)).toContain('acme:level');
   });
 
   it('⑥ 条件写 `node.*` 也能用（当前节点自己的属性）', async () => {
@@ -277,7 +305,7 @@ describe('ADR-009 · opt-in 并入（细则⑥⑦⑧）', () => {
 
   it('⑧ cast：声明 number 后 `"48"` 变 48（不声明就是字符串 —— 引擎不猜类型）', async () => {
     const spy: ConditionCtx[] = [];
-    const e = engineWith({ casts: { 'acme:slaHours': 'number' } }, spy);
+    const e = engineWith({ casts: { slaHours: 'number' } }, spy);
     await startIt(e);
     const ctx = spy.find((c) => c.nodeId === 'GW');
     expect(ctx?.variables).toMatchObject({ target: { slaHours: 48 } });
@@ -295,7 +323,7 @@ describe('ADR-009 · opt-in 并入（细则⑥⑦⑧）', () => {
           type: 'userTask',
           name: 'A',
           approval: userApproval('u_a'),
-          extension: { 'acme:slaHours': 'soon' }, // 不是数字
+          extension: { slaHours: 'soon' }, // 声明了 number 却不是数字
         },
         { id: 'Task_b', type: 'userTask', name: 'B', approval: userApproval('u_b') },
         { id: 'End_1', type: 'endEvent' },
@@ -311,7 +339,7 @@ describe('ADR-009 · opt-in 并入（细则⑥⑦⑧）', () => {
     const e = createEngine({
       definitionSource: { async getDefinition() { return bad; } },
       clock: () => T,
-      extensionVars: { casts: { 'acme:slaHours': 'number' } },
+      extensionVars: { casts: { slaHours: 'number' } },
       conditionHandler: {
         evaluate(_expr, ctx) { spy.push(ctx); return true; },
       },
@@ -340,7 +368,7 @@ describe('ADR-009 · 配置形状（禁止静默忽略，D-7 同款）', () => {
       () =>
         createEngine({
           definitionSource: { async getDefinition() { return def(); } },
-          extensionVars: { casts: { 'acme:x': 'int' } } as unknown as ExtensionVarsOption,
+          extensionVars: { casts: { x: 'int' } } as unknown as ExtensionVarsOption,
         }),
       ENGINE_ERROR_CODES.OPTION_INVALID,
     );
@@ -358,8 +386,8 @@ describe('ADR-009 · 配置形状（禁止静默忽略，D-7 同款）', () => {
   });
 });
 
-describe('ADR-009 · 默认语义零变化（0.0.1 → 0.0.2 不 breaking）', () => {
-  it('不声明 `extensionVars` 时，`variables` 与 0.0.1 逐字一致（只多两个只读字段）', async () => {
+describe('ADR-009 · 不 opt-in 时零变化（向后语义）', () => {
+  it('不声明 `extensionVars` 时，`variables` 只多两个只读字段，业务变量逐字不变', async () => {
     const spy: ConditionCtx[] = [];
     await startIt(engineWith(undefined, spy), { amount: 9000 });
     const ctx = spy.find((c) => c.nodeId === 'GW');

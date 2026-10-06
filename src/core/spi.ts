@@ -187,8 +187,9 @@ export interface ConditionCtx {
   /**
    * ★ **当前节点**（`nodeId`，即条件所在的网关 / 活动）上的宿主自定义扩展属性（ADR-009）。
    *
-   * - 键**带前缀**原样给出（`acme:priority`），引擎**不解释**其语义；
-   * - 排除 `floken:*`（引擎自己的键）；**只含标量**；
+   * - 键**原样给出**，引擎**不解释**其语义（v2 起 `extension` 无前缀要求、无标量限制）；
+   * - **排除模型一等字段键**（`NODE_RESERVED_KEYS`，从 `moddle` 取）—— 那些是引擎自己的；
+   * - **结构化值也给**（数组 / 对象原样；只有函数与 `undefined` 排除）；
    * - 没有 → `undefined`（不填空对象）。
    *
    * ⚠️ 它**恒给**（不需任何配置）；"自动并入 `variables`"才需要 opt-in（见 `EngineConfig.extensionVars`）。

@@ -2516,7 +2516,7 @@ const extDef = () =>
       {
         id: 'GW',
         type: 'exclusiveGateway',
-        extension: { 'acme:gwTag': 'main' },
+        extension: { 'gwTag': 'main' },
       },
       {
         id: 'Task_urgent',
@@ -2524,17 +2524,17 @@ const extDef = () =>
         approval: { approvers: [{ type: 'user', value: 'u_boss' }] },
         // ★ v2：`extension` 只装宿主自己的东西；结构化值**也给**（ADR-009 细则④ 已放开）
         extension: {
-          'acme:priority': 'high',
-          'acme:slaHours': '48',
-          'acme:tags': ['finance'],
-          'acme:rule': { limit: 1 },
+          'priority': 'high',
+          'slaHours': '48',
+          'tags': ['finance'],
+          'rule': { limit: 1 },
         },
       },
       {
         id: 'Task_normal',
         type: 'userTask',
         approval: { approvers: [{ type: 'user', value: 'u_staff' }] },
-        extension: { 'acme:priority': 'low' },
+        extension: { 'priority': 'low' },
       },
       { id: 'End_1', type: 'endEvent' },
     ],
@@ -2568,7 +2568,7 @@ await checkAsync('ADR-009 · ★ 不 opt-in → 同一个表达式**静默走另
   sameArray(seen, ['Task_normal/u_staff'], '不 opt-in 的代价：安静地走错');
 });
 
-await checkAsync('ADR-009 · 只读字段恒给：一等字段不外泄、结构化值也给出、键带前缀', async () => {
+await checkAsync('ADR-009 · 只读字段恒给：一等字段不外泄、结构化值也给出、键原样', async () => {
   const seen = [];
   const { engine } = engineOn(extDef(), {
     projection: projectionOf(seen),
@@ -2581,19 +2581,19 @@ await checkAsync('ADR-009 · 只读字段恒给：一等字段不外泄、结构
   });
   await engine.start('Process_1', { definitionVersion: 1, starter: 'u_x' });
   const bag = JSON.parse(seen.find((s) => s.includes('gwTag')));
-  eq(bag.n['acme:gwTag'], 'main', '当前节点 = 网关自己的属性');
-  eq(bag.t['acme:priority'], 'high', '目标节点 = 分支通向的节点');
+  eq(bag.n['gwTag'], 'main', '当前节点 = 网关自己的属性');
+  eq(bag.t['priority'], 'high', '目标节点 = 分支通向的节点');
   // ★ v2：排除判据从「`floken:*` 前缀」改为「模型一等字段键」（前缀随 XML 一起消失）
   eq(bag.t['approval'], undefined, '★ 模型的一等字段不外泄');
   // ★ v2 起结构化值**也给出**（旧口径"只给标量"的理由是 XML 属性装不下，已不成立）
-  eq(JSON.stringify(bag.t['acme:tags']), '["finance"]', '★ 结构化值原样给出');
-  eq(bag.t['acme:slaHours'], '48', '★ XML 往返后是字符串 —— cast 由宿主声明');
+  eq(JSON.stringify(bag.t['tags']), '["finance"]', '★ 结构化值原样给出');
+  eq(bag.t['slaHours'], '48', '★ 作者在 JSON 里写的就是字符串 —— cast 由宿主声明（引擎不猜）');
 });
 
 await checkAsync('ADR-009 · cast：声明 number 后 `"48"` 变 48；不声明则原样（引擎不猜类型）', async () => {
   const seen = [];
   const { engine } = engineOn(extDef(), {
-    extensionVars: { casts: { 'acme:slaHours': 'number' } },
+    extensionVars: { casts: { 'slaHours': 'number' } },
     projection: projectionOf(seen),
     conditionHandler: {
       evaluate(_expr, ctx) { seen.push(ctx.variables); return false; },
@@ -2603,7 +2603,7 @@ await checkAsync('ADR-009 · cast：声明 number 后 `"48"` 变 48；不声明�
   const vars = seen.find((v) => typeof v === 'object' && 'target' in v);
   eq(vars.target.slaHours, 48, '按声明还原成数字');
   eq(typeof vars.target.slaHours, 'number', '类型是 number，不是 "48"');
-  eq(vars.node.gwTag, 'main', '并入层已去前缀（FEEL 引用不到带冒号的键）');
+  eq(vars.node.gwTag, 'main', '✦ 键原样并入（v1 的"去前缀"已删：会静默截断 order:id）');
 });
 
 await checkAsync('ADR-009 · 变量名撞车 → 抛 OPTION_INVALID（不静默覆盖业务变量）', async () => {

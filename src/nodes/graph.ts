@@ -246,11 +246,11 @@ export interface ProcessGraph {
   /**
    * ★ 该节点上的**宿主自定义**扩展属性（ADR-009 细则①②③④）。
    *
-   * 给出去的是**原样键值**，引擎**不解释** `acme:priority` 是什么意思 ——
-   * 解释权 100% 在宿主（源码里不得出现任何具体宿主前缀）。
+   * 给出去的是**原样键值**，引擎**不解释**任何宿主属性是什么意思 ——
+   * 解释权 100% 在宿主（源码里不得出现任何具体宿主键名）。
    *
-   * - 排除 `floken:*`（引擎自己的键）与 `_extensionElements`（第三方原样快照）；
-   * - **只留标量**；
+   * - **排除模型一等字段键**（`NODE_RESERVED_KEYS`，从 `moddle` 取）：那些是引擎自己的；
+   * - **结构化值也给**（数组 / 对象原样；只有函数与 `undefined` 排除）；
    * - **一个都没有 → `undefined`**（不填空对象 —— 调用方要能区分「没配」与「配了但被过滤空」）。
    */
   extensionsOf(nodeId: string): Readonly<Record<string, unknown>> | undefined;
