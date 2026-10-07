@@ -5,6 +5,25 @@
 
 ## 未发布
 
+### 修复 · `script.language` 不写 = FEEL（此前注释这么写，实测不是）
+
+`scriptTask` 不写 `language` 时，`scriptFormatOf()` 拿到 `undefined`，
+`isFeelScriptFormat(undefined)` = `false` ⇒ 落到「非 FEEL → 查 `handlers` 表」那一支，
+定义里明明写了 FEEL 脚本却报「请在 handlers 表注册」。现在不写 = FEEL，与
+`ScriptSpec.language` 的注释、`FEEL_EXPRESSION_LANGUAGE` 的语义一致。
+
+### 修复 · `condition.language` 不再被**完全忽略**（非 FEEL 建图即抛）
+
+此前引擎没有任何一处读这个字段，实测 `condition:{body:'…', language:'javascript'}`
+照当 FEEL 求值，报的是**FEEL 语法错** —— 把「不支持这种语言」伪装成「表达式写错了」，
+宿主还以为自己写的 JS 会被执行。现在建图时校验：不是 FEEL（`feel` / `text/feel` /
+`FEEL` / 以 `/feel` 结尾的 URN，大小写与尾斜杠容错）就抛 `OPTION_INVALID`，`reason` 指名该语言。
+不写 `language` 仍 = FEEL。
+
+⚠️ 顺带记一条**不是 bug 但极易误会**的事实：非 FEEL 的 `scriptTask` 走 `handlers` 表时，
+引擎**连 `body` 都不传给 handler**（`fn(variables, ctx)` 里没有源码）——
+那段 JS 对引擎是死内容，实现由宿主自己写。引擎没有任何动态执行 JS 的能力。
+
 ### 新增 · `ActionInput.tokenId` / `nodeId`：投递时可以**点名**那条待办
 
 两个可选字段（推荐一起给 —— 调度方手里本来就有，见 `ScheduleRequest`）。

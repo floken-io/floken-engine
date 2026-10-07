@@ -1583,13 +1583,20 @@ async function resolveEffect(params: {
   if (kind === 'manual') return { nodeId, events: manualTaskEvents({ nodeId, tokenId, graph, state, record }) };
 
   // —— serviceTask / 非 FEEL 的 scriptTask：查 handlers 表 ——
-  if (kind === 'service' || (kind === 'script' && !isFeelScriptFormat(graph.scriptFormatOf(nodeId)))) {
+  /*
+   * ★ `script.language` **不写 = FEEL**（与 moddle `ScriptSpec` 的注释、`FEEL_EXPRESSION_LANGUAGE`
+   *   的语义一致）。此前 `scriptFormatOf()` 拿不到就落到这一支 —— 注释说"缺省按 FEEL"，
+   *   实测却是"报错要求注册 handler"，承诺没兑现（2026-10-07 修）。
+   */
+  const scriptFormat = kind === 'script' ? graph.scriptFormatOf(nodeId) : undefined;
+  const isFeelScript = kind === 'script' && (scriptFormat === undefined || isFeelScriptFormat(scriptFormat));
+  if (kind === 'service' || (kind === 'script' && !isFeelScript)) {
     const ref = graph.handlerRefOf(nodeId);
     const fn = handlers?.get(ref);
     if (fn === undefined) {
       const why =
         kind === 'script'
-          ? `scriptTask '${nodeId}' 的 scriptFormat '${String(graph.scriptFormatOf(nodeId))}' 不是 FEEL`
+          ? `scriptTask '${nodeId}' 的 script.language '${String(scriptFormat)}' 不是 FEEL`
           : `serviceTask '${nodeId}' 没有注册处理器`;
       throw optionInvalid('handlers', `${why} —— 请在 handlers 表注册 ref '${ref}'`, {
         nodeId,

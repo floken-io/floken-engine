@@ -32,13 +32,14 @@ import type { Flow, FlowNode, NormalizedApproval, ProcessDefinition } from '@flo
 
 import { requirePeer } from '../core/peer.js';
 
-import { definitionMissing, stateShapeInvalid, tokenOrphan } from '../core/errors.js';
+import { conditionInvalid, definitionMissing, stateShapeInvalid, tokenOrphan } from '../core/errors.js';
 import { SUBPROCESS_PATH_SEP, callTargetOf, expandSubProcesses } from './activities.js';
 import type { CallTarget } from './activities.js';
 import { boundaryBindingOf } from './boundary.js';
 import type { BoundaryBinding } from './boundary.js';
 import { catchBindingOf } from './catch.js';
 import type { CatchBinding } from './catch.js';
+import { FEEL_SCRIPT_FORMATS, isFeelScriptFormat } from './tasks.js';
 
 /**
  * 惰性取 `@floken-io/moddle`（Q49：peer 依赖，不再内置）。
@@ -144,6 +145,21 @@ export function expressionOf(condition: Flow['condition']): string | undefined {
   return trimmed === '' ? undefined : trimmed;
 }
 
+/**
+ * 取 `Flow.condition` 的 `language`（`string` 简写没有语言 → `undefined`）。
+ *
+ * ⚠️ 为什么要把它单独取出来：**引擎只会 FEEL**，而此前这个字段被**完全忽略** ——
+ * 实测 `condition:{body:'x = `js` && …', language:'javascript'}` 照样当 FEEL 求值，
+ * 报的是「FEEL 语法错」而不是「不支持这种语言」（更安静的一种错：宿主以为写了 JS）。
+ * 取出来后由建图处校验（见 `buildOutFlows`）：不认的语言**直接抛**，不静默当 FEEL。
+ */
+export function languageOf(condition: Flow['condition']): string | undefined {
+  if (condition === undefined || condition === null) return undefined;
+  if (typeof condition !== 'object') return undefined;
+  const lang = (condition as { language?: unknown }).language;
+  return typeof lang === 'string' && lang.trim() !== '' ? lang : undefined;
+}
+
 // ---------------- 适配器 ----------------
 
 export interface ProcessGraph {
@@ -194,7 +210,13 @@ export interface ProcessGraph {
   // —— T17：任务类节点的取参（`nodes/tasks.ts` 的分类决定要不要读）——
   /** `<bpmn:script>` 子元素（`scriptTask`）；未配 / 空白 → `undefined` */
   scriptOf(nodeId: string): string | undefined;
-  /** `scriptFormat`（`scriptTask`）；未配 → `undefined`（⇒ 不是 FEEL，走 `handlers` 表） */
+  /**
+   * `script.language`（`scriptTask`）；未配 → `undefined`。
+   *
+   * ⚠️ **未配 ⇒ 按 FEEL 求值**（不是"走 handlers 表"）—— moddle `ScriptSpec.language`
+   *   注释写的是"缺省按 FEEL"，`FEEL_EXPRESSION_LANGUAGE` 也是这个语义；
+   *   判 FEEL 与否用 `isFeelScriptFormat()`，`undefined` 那一支由调用方按 FEEL 处理。
+   */
   scriptFormatOf(nodeId: string): string | undefined;
   /**
    * ★ `serviceTask` / 非 FEEL 的 `scriptTask` 在 `handlers` 表里的**查找键**。
@@ -309,6 +331,20 @@ export function createProcessGraph(
     if (typeof f.from !== 'string' || typeof f.to !== 'string') continue;
     const flowId = typeof f.id === 'string' ? f.id : `flow:${f.from}->${f.to}`;
     const expr = expressionOf(f.condition);
+    /*
+     * ★ `condition.language` 的**唯一**校验点（此前完全不读，见 `languageOf` 的说明）。
+     *   引擎只会 FEEL：写了别的语言就**在建图时抛**，而不是等令牌走到网关再报「FEEL 语法错」——
+     *   后者会把「不支持这种语言」伪装成「你的表达式写错了」，方向全错。
+     *   不写 `language` = 默认 FEEL（与 `FEEL_EXPRESSION_LANGUAGE` 的语义一致）。
+     */
+    const lang = languageOf(f.condition);
+    if (lang !== undefined && !isFeelScriptFormat(lang)) {
+      throw conditionInvalid(expr ?? '', `不支持的 condition.language '${lang}'：引擎只按 FEEL 求值`, {
+        flowId,
+        language: lang,
+        supported: [...FEEL_SCRIPT_FORMATS],
+      });
+    }
     const outList = out.get(f.from);
     if (outList === undefined) out.set(f.from, [{ id: flowId, to: f.to, ...(expr === undefined ? {} : { expression: expr }) }]);
     else outList.push({ id: flowId, to: f.to, ...(expr === undefined ? {} : { expression: expr }) });

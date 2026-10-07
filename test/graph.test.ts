@@ -116,6 +116,58 @@ describe('节点分类（T11 边界）', () => {
   });
 });
 
+describe('★ `condition.language`：只认 FEEL，其余建图即抛（此前完全不读）', () => {
+  /** 一个带条件分支的图：`Gate_1` → A（有条件）/ B（默认流） */
+  const gateDef = (condition: unknown) =>
+    makeDefinition({
+      nodes: [
+        { id: 'Start_1', type: 'startEvent' },
+        { id: 'Gate_1', type: 'exclusiveGateway', defaultFlow: 'f3' },
+        { id: 'A', type: 'endEvent' },
+        { id: 'B', type: 'endEvent' },
+      ],
+      flows: [
+        { id: 'f1', from: 'Start_1', to: 'Gate_1' },
+        { id: 'f2', from: 'Gate_1', to: 'A', condition: condition as never },
+        { id: 'f3', from: 'Gate_1', to: 'B' },
+      ],
+    });
+
+  it("★ `language:'javascript'` → 抛 OPTION_INVALID（不静默当 FEEL 求值）", () => {
+    expectCode(
+      () => createProcessGraph(gateDef({ body: 'amount > 500', language: 'javascript' }), 'Process_1', 1),
+      ENGINE_ERROR_CODES.OPTION_INVALID,
+    );
+  });
+
+  it('其它语言（`python` / `groovy`）同样抛', () => {
+    for (const language of ['python', 'groovy', 'xpath']) {
+      expectCode(
+        () => createProcessGraph(gateDef({ body: 'amount > 500', language }), 'Process_1', 1),
+        ENGINE_ERROR_CODES.OPTION_INVALID,
+      );
+    }
+  });
+
+  it("FEEL 的各种写法放行：`feel` / `text/feel` / `FEEL` / OMG URN", () => {
+    for (const language of [
+      'feel',
+      'text/feel',
+      'FEEL',
+      'https://www.omg.org/spec/DMN/20230324/FEEL/',
+    ]) {
+      expect(() =>
+        createProcessGraph(gateDef({ body: 'amount > 500', language }), 'Process_1', 1),
+      ).not.toThrow();
+    }
+  });
+
+  it('不写 `language`（简写也不写）→ 一律按 FEEL，不抛', () => {
+    expect(() => createProcessGraph(gateDef({ body: 'amount > 500' }), 'Process_1', 1)).not.toThrow();
+    expect(() => createProcessGraph(gateDef('amount > 500'), 'Process_1', 1)).not.toThrow();
+  });
+});
+
 describe('assertTokensInGraph（INV-3）', () => {
   it('全部令牌都在图里 → 通过', () => {
     const g = graphOf();

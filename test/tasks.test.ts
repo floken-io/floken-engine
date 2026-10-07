@@ -354,6 +354,13 @@ describe('⑥ `scriptTask`：FEEL 走内置求值，其余走 `handlers`', () =>
     );
   });
 
+  it('★ 不写 `scriptFormat`（= `script.language`）→ **按 FEEL 求值**（"缺省按 FEEL"是真的）', async () => {
+    const { engine, store } = engineOf(defWith({ type: 'scriptTask', script: '1 + 2' }));
+    const id = await engine.start('Process_1', { definitionVersion: 1, starter: 'u0' });
+    const state = await store.load(id);
+    expect(state?.variables.Node_1).toBe(3);
+  });
+
   it('FEEL 但没有 `<script>` → 抛（定义不完整，不得静默跳过）', async () => {
     const { engine } = engineOf(defWith({ type: 'scriptTask', scriptFormat: 'feel' }));
     await expectCodeAsync(engine.start('Process_1', { definitionVersion: 1, starter: 'u0' }),
