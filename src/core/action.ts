@@ -25,6 +25,23 @@ export interface ActionInput {
   comment?: string;
   /** `reject` / `rejectToPrev` / `jumpTo` / `returnTo` 的目标 nodeId（INV-6） */
   target?: string;
+  /**
+   * ★ 本次动作**作用于哪条待办** —— `tokenId` 与 `nodeId` 可单独给、也可一起给
+   * （**推荐一起给**：调度方手里两个都有，见 {@link ScheduleRequest}）。
+   *
+   * ⚠️ 为什么要有它：超时动作是**延迟**执行的，等它到点那条待办可能早就办完了。
+   * 没有它时引擎只能按 `actor` 找"当前待办"，于是迟到的动作会**打到另一条待办上**
+   * —— 实测：本该驳回 `Task_a` 的动作，把同审批人的 `Task_b` 给退回了，语义全错。
+   *
+   * ⚠️ 为什么光有 `tokenId` 不够：**令牌 id 在节点之间是复用的**
+   * （实测 `tk_start` 从 `Task_a` 走到 `Task_b` 仍是 `tk_start`），
+   * 所以只有同时校验「这个令牌**还在不在那个节点上**」才认得出"待办已经走了"。
+   *
+   * 给了却命中不到 / 令牌已离开该节点 → **抛错**，绝不改打别的待办。
+   * 都不给 = 老行为（按 `actor` 定位），单活令牌场景下等价。
+   */
+  tokenId?: string | undefined;
+  nodeId?: string | undefined;
   /** 表单增量 / 变量更新 → 并入 `variables` */
   payload?: Record<string, unknown>;
   /** 显式时间（ISO 8601）。缺省由 `clock()` 填 —— ADR-007 */
@@ -64,6 +81,12 @@ export function assertActionInput(action: unknown, path = '$'): asserts action i
   }
   if (a.at !== undefined && (typeof a.at !== 'string' || a.at.length === 0)) {
     fail('at', 'must be a non-empty ISO 8601 string when present');
+  }
+  if (a.tokenId !== undefined && (typeof a.tokenId !== 'string' || a.tokenId.length === 0)) {
+    fail('tokenId', 'must be a non-empty string when present');
+  }
+  if (a.nodeId !== undefined && (typeof a.nodeId !== 'string' || a.nodeId.length === 0)) {
+    fail('nodeId', 'must be a non-empty string when present');
   }
   if (a.payload !== undefined && (typeof a.payload !== 'object' || a.payload === null)) {
     fail('payload', 'must be a plain object when present');

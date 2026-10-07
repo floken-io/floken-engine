@@ -897,6 +897,102 @@ describe('⑦ 超时排程（`Scheduler` SPI）', () => {
     });
   });
 
+  // ---------- ⑨ 迟到的超时动作：不得打到「当前」待办上 ----------
+
+  /**
+   * `Task_a`（有超时）→ `Task_b`（同一办理人，也允许驳回）→ `End_1`
+   * ★ 关键：令牌 id 在节点间**复用**（`tk_*` 走到 `Task_b` 还是同一个），
+   * 所以"这条待办还是不是当初那条"只能靠 **tokenId + nodeId** 一起判。
+   */
+  function twoTaskDef() {
+    return makeDefinition({
+      nodes: [
+        { id: 'Start_1', type: 'startEvent' },
+        {
+          id: 'Task_a',
+          type: 'userTask',
+          approval: userApproval('u1', {
+            reject: { allowed: true, allowArbitrary: true },
+            timeout: {
+              duration: 'P3D',
+              actions: [
+                { type: 'autoApprove' },
+                { type: 'autoReject', target: 'Start_1' },
+              ],
+            },
+          }),
+        },
+        {
+          id: 'Task_b',
+          type: 'userTask',
+          approval: userApproval('u1', { reject: { allowed: true, allowArbitrary: true } }),
+        },
+        { id: 'End_1', type: 'endEvent' },
+      ],
+      flows: [
+        { from: 'Start_1', to: 'Task_a' },
+        { from: 'Task_a', to: 'Task_b' },
+        { from: 'Task_b', to: 'End_1' },
+      ],
+    });
+  }
+
+  it('★ 迟到的超时动作点名了待办 → 抛错，绝不去打当前待办', async () => {
+    const sched = fakeScheduler();
+    const { engine, store } = engineOf(twoTaskDef() as ReturnType<typeof makeDefinition>, {
+      scheduler: sched,
+    });
+    const id = await engine.start('Process_1', { definitionVersion: 1, starter: 'u0' });
+
+    // 调度方手里有的东西：当初排程时的 tokenId + nodeId
+    const tokenId = sched.scheduled[0]?.tokenId;
+    expect(tokenId).toBeDefined();
+
+    // autoApprove 先到点，把 Task_a 办掉 → 令牌走到 Task_b
+    await engine.submit(id, { action: 'approve', actor: 'u1' });
+    const moved = (await store.load(id))?.tokens.find((t) => t.id === tokenId);
+    expect(moved?.nodeId).toBe('Task_b');
+
+    // 迟到的 autoReject：点名「Task_a 上的那条待办」
+    await expectCodeAsync(
+      () =>
+        engine.submit(id, {
+          action: 'reject',
+          actor: 'u1',
+          comment: '超时自动驳回',
+          target: 'Start_1',
+          tokenId,
+          nodeId: 'Task_a',
+        }),
+      SHAPE,
+    );
+
+    // ★ 误打没发生：Task_b 的待办还在原地
+    const after = (await store.load(id))?.tokens.find((t) => t.id === tokenId);
+    expect(after?.nodeId).toBe('Task_b');
+  });
+
+  it('对照：不点名待办（老写法）→ 迟到的动作会打到当前待办上（所以要带 tokenId）', async () => {
+    const sched = fakeScheduler();
+    const { engine, store } = engineOf(twoTaskDef() as ReturnType<typeof makeDefinition>, {
+      scheduler: sched,
+    });
+    const id = await engine.start('Process_1', { definitionVersion: 1, starter: 'u0' });
+    const tokenId = sched.scheduled[0]?.tokenId;
+
+    await engine.submit(id, { action: 'approve', actor: 'u1' });
+
+    // 不带 tokenId / nodeId：引擎只能按 actor 找"当前待办" → 打到了 Task_b 身上
+    await engine.submit(id, {
+      action: 'reject',
+      actor: 'u1',
+      comment: '超时自动驳回',
+      target: 'Task_a',
+    });
+    const after = (await store.load(id))?.tokens.find((t) => t.id === tokenId);
+    expect(after?.nodeId).toBe('Task_a'); // ← 被从 Task_b 退回了，语义是错的
+  });
+
   it('★ `diffTimers` 是纯的：同一份前后状态算两遍结果一致', () => {
     const g = graphOf(timeoutDef());
     const prev: InstanceState = {

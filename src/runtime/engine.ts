@@ -1776,7 +1776,55 @@ async function resolveAssigneesFor(
  *   「审计说办的是 A 分支、实际推进的是 B 分支」—— 而两份代码单独看都对。
  */
 function resolveSubjectToken(state: InstanceState, input: ActionInput): string | undefined {
-  return subjectTokenOf(state, input.actor)?.id;
+  if (input.tokenId === undefined && input.nodeId === undefined) {
+    return subjectTokenOf(state, input.actor)?.id;
+  }
+
+  /*
+   * ★ 显式点名待办（`tokenId` / `nodeId`）：命中不到就**抛错**，
+   *   绝不退回"按 actor 找当前待办"。
+   *
+   * ⚠️ 为什么不退回：退回了就等于允许一条**迟到**的超时动作打到另一条待办上 ——
+   *   实测过：本该驳回 `Task_a` 的动作，把同审批人的 `Task_b` 给退回了，语义全错。
+   *   迟到的正确结局是"这次动作作废"，而作废必须是**显式**的（抛错让宿主知道并补偿）。
+   *
+   * ⚠️ 为什么必须两个一起校验：令牌 id 在节点间是**复用**的
+   *   （`tk_start` 走到下一个节点仍是 `tk_start`），只有"令牌还在不在那个节点上"
+   *   才认得出待办已经走了。
+   */
+  const live = state.tokens.filter((t) => LIVE_TOKEN_STATES.includes(t.state));
+  const byToken =
+    input.tokenId === undefined ? undefined : live.find((t) => t.id === input.tokenId);
+  const byNode =
+    input.nodeId === undefined ? undefined : live.filter((t) => t.nodeId === input.nodeId);
+
+  if (input.tokenId !== undefined && byToken === undefined) {
+    throw stateShapeInvalid(
+      `action '${input.action}' targets token '${input.tokenId}' which is not live`,
+      { action: input.action, tokenId: input.tokenId, tokenIds: state.tokens.map((t) => t.id) },
+    );
+  }
+  if (input.nodeId !== undefined && byNode !== undefined && byNode.length === 0) {
+    throw stateShapeInvalid(
+      `action '${input.action}' targets node '${input.nodeId}' which has no live token`,
+      { action: input.action, nodeId: input.nodeId },
+    );
+  }
+  if (input.nodeId !== undefined && byNode !== undefined && byNode.length > 1 && input.tokenId === undefined) {
+    throw stateShapeInvalid(
+      `action '${input.action}' cannot resolve a unique token on node '${input.nodeId}': pass tokenId`,
+      { action: input.action, nodeId: input.nodeId, tokenIds: byNode.map((t) => t.id) },
+    );
+  }
+  /* ★ 两个都给了 → 令牌必须**还在那个节点上**（迟到与否就是靠这一条判出来的） */
+  if (byToken !== undefined && input.nodeId !== undefined && byToken.nodeId !== input.nodeId) {
+    throw stateShapeInvalid(
+      `action '${input.action}' targets token '${input.tokenId}' on node '${input.nodeId}', but it is now on '${byToken.nodeId}'`,
+      { action: input.action, tokenId: input.tokenId, nodeId: input.nodeId, actual: byToken.nodeId },
+    );
+  }
+
+  return (byToken ?? (byNode === undefined ? undefined : byNode[0]))?.id;
 }
 
 /** 换人类动作必须**点名**目标人；加签 / 会签未点名时展开该节点配置的办理人 */
