@@ -27,8 +27,9 @@ import {
 } from '../src/nodes/tasks';
 import { createEngine } from '../src/runtime/engine';
 import { createMemoryStore } from '../src/store/memory';
+import { plainScriptValue } from '../src/eval/script';
 import { makeDefinition, singleVersionSource, userApproval } from './helpers/definition';
-import { expectCodeAsync } from './helpers/expect';
+import { expectCode, expectCodeAsync } from './helpers/expect';
 
 const T0 = '2026-10-01T00:00:00.000Z';
 
@@ -366,6 +367,52 @@ describe('⑥ `scriptTask`：FEEL 走内置求值，其余走 `handlers`', () =>
     await expectCodeAsync(engine.start('Process_1', { definitionVersion: 1, starter: 'u0' }),
       ENGINE_ERROR_CODES.STATE_SHAPE_INVALID,
     );
+  });
+
+  // ---------------- ★ D-93：FEEL 结果的归一化 ----------------
+
+  it('★ 返回 context（`{a: 1}`）→ 归一化成 plain object 落库（**D-93**）', async () => {
+    /*
+     * ⚠️ 这是「一次算多个值」的写法，归一化之前**一步都跑不动**：
+     *   `_FeelContext` 是类实例（键值对装在 `entries` 这个 Map 里），落库时被挡成
+     *   `non-serializable class-instance … detail: _FeelContext`（实测 2026-10-07）。
+     */
+    const { engine, store } = engineOf(
+      defWith({ type: 'scriptTask', scriptFormat: 'feel', script: '{ tax: amount + 1, total: amount * 2 }' }),
+    );
+    const id = await engine.start('Process_1', {
+      definitionVersion: 1,
+      starter: 'u0',
+      variables: { amount: 1000 },
+    });
+    const state = await store.load(id);
+    expect(state?.variables.Node_1).toEqual({ tax: 1001, total: 2000 });
+  });
+
+  it('★ 嵌套 context / 列表里的 context 一并摊平（不是只摊第一层）', async () => {
+    const { engine, store } = engineOf(
+      defWith({ type: 'scriptTask', scriptFormat: 'feel', script: '{ a: { b: 1 }, c: [{ d: 2 }] }' }),
+    );
+    const id = await engine.start('Process_1', { definitionVersion: 1, starter: 'u0' });
+    const state = await store.load(id);
+    expect(state?.variables.Node_1).toEqual({ a: { b: 1 }, c: [{ d: 2 }] });
+  });
+
+  it('★ 结果是**别的**类实例 → 抛（绝不静默转 `{}`）', () => {
+    class NotData {
+      readonly x = 1;
+    }
+    expectCode(() => plainScriptValue(new NotData()), ENGINE_ERROR_CODES.STATE_SHAPE_INVALID);
+    // 函数 / undefined 同处置：它们连 JSON 都过不去，静默落库等于写了个空
+    expectCode(() => plainScriptValue(undefined), ENGINE_ERROR_CODES.STATE_SHAPE_INVALID);
+    expectCode(() => plainScriptValue(() => 1), ENGINE_ERROR_CODES.STATE_SHAPE_INVALID);
+  });
+
+  it('★ 标量 / 列表 / null **原样**返回（归一化不得改变既有语义）', () => {
+    expect(plainScriptValue(42)).toBe(42);
+    expect(plainScriptValue(null)).toBeNull();
+    expect(plainScriptValue('ok')).toBe('ok');
+    expect(plainScriptValue([1, 'a', null])).toEqual([1, 'a', null]);
   });
 });
 

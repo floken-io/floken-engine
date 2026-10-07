@@ -770,6 +770,7 @@ export function createEngine(config: EngineConfig): Engine {
               record,
               handlers,
               decisionHandler,
+              extensionVars,
             }),
           );
           continue;
@@ -1575,12 +1576,35 @@ async function resolveEffect(params: {
   readonly record: ActionRecord;
   readonly handlers: ServiceHandler | undefined;
   readonly decisionHandler: DecisionHandler | undefined;
+  /**
+   * ★ ADR-009 的 opt-in（`EngineConfig.extensionVars`）—— **副作用侧也要并入**（**D-94**）。
+   *
+   * ⚠️ 为什么之前没有：并入只接在了**网关条件**那条路（`evaluateCondition` 之前），
+   *   于是 `scriptTask` / `serviceTask` / `businessRuleTask` 的求值上下文里**没有**
+   *   `node` / `target` —— 实测即使声明了 `extensionVars:{key:'node'}`，脚本里的
+   *   `node.taxRate` 仍然是 `null`（**不报错**，静默走空值）。而 `03` §768 写的是
+   *   「并入**求值上下文**」，没限定只给条件 ⇒ 文档与实现对不上。
+   *
+   * ⚠️ 代价（已知并接受）：宿主 handler 收到的第 1 参里会多出 `node` / `target` 两个键。
+   *   与条件同一口径 —— **只在求值上下文里并入，绝不写回 `InstanceState.variables`**。
+   */
+  readonly extensionVars: ExtensionVarsOption | undefined;
 }): Promise<NodeEffect> {
   const { nodeId, tokenId, kind, variables, graph, state, record } = params;
-  const { handlers, decisionHandler } = params;
+  const { handlers, decisionHandler, extensionVars } = params;
 
   // —— manualTask：不产生待办、不等待，只留两条痕 ——
   if (kind === 'manual') return { nodeId, events: manualTaskEvents({ nodeId, tokenId, graph, state, record }) };
+
+  /*
+   * ★ 副作用侧的求值上下文（**D-94**）：与条件同一套 `mergeExtensionVars()`，
+   *   只是没有「目标节点」这一说（`target` 只有在顺序流的条件里才有意义），
+   *   故第二袋恒为 `undefined` ⇒ opt-in 后只并入 `node`。
+   *
+   * ⚠️ 不声明 `extensionVars` 时 `mergeExtensionVars()` 原样返回 `variables`（细则⑤），
+   *   即**默认行为逐字不变**。
+   */
+  const evalVars = mergeExtensionVars(variables, graph.extensionsOf(nodeId), undefined, extensionVars);
 
   // —— serviceTask / 非 FEEL 的 scriptTask：查 handlers 表 ——
   /*
@@ -1610,7 +1634,7 @@ async function resolveEffect(params: {
         hint: '引擎不执行任意 JS（无动态求值能力，也不加载 vm 类模块）；非 FEEL 的脚本与其它实现一律由宿主提供',
       });
     }
-    const out = await fn(variables, {
+    const out = await fn(evalVars, {
       instanceId: state.instanceId,
       processId: state.processId,
       definitionVersion: state.definitionVersion,
@@ -1628,7 +1652,7 @@ async function resolveEffect(params: {
         hint: '给该节点写 <bpmn:script>，或改为非 FEEL 的 scriptFormat 并在 handlers 表注册处理器',
       });
     }
-    const r = evaluateScript(source, variables);
+    const r = evaluateScript(source, evalVars);
     /*
      * ★ 结果落在**节点 id** 这个变量名下（**D-59**）。
      *   BPMN 的结果变量走 `ioSpecification` / `dataOutput`，而模型层未兑现该字段 ——
@@ -1645,10 +1669,10 @@ async function resolveEffect(params: {
       { nodeId, hint: '可接 @floken-io/dmn，也可以直接传一个 (input, ctx) => output 的函数' },
     );
   }
-  const out = await decisionHandler.evaluate({ ...variables }, {
+  const out = await decisionHandler.evaluate({ ...evalVars }, {
     instanceId: state.instanceId,
     nodeId,
-    input: { ...variables },
+    input: { ...evalVars },
   });
   return { nodeId, variables: assertVariablePatch(nodeId, kind, out) };
 }

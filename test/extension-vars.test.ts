@@ -20,6 +20,7 @@
 import { describe, expect, it } from 'vitest';
 
 import { createEngine } from '../src/runtime/engine';
+import { createMemoryStore } from '../src/store/memory';
 import type { ExtensionVarsOption } from '../src/runtime/engine';
 import { ENGINE_ERROR_CODES } from '../src/core/errors';
 import type { ConditionCtx } from '../src/core/spi';
@@ -400,5 +401,129 @@ describe('ADR-009 · 不 opt-in 时零变化（向后语义）', () => {
     await startIt(engineWith(undefined, spy), { amount: 9000 });
     const ctx = spy.find((c) => c.nodeId === 'GW');
     expect(ctx?.variables).toEqual({ amount: 9000 });
+  });
+});
+
+// ---------------- ★ D-94：副作用侧（`scriptTask` / `serviceTask`）同样并入 ----------------
+
+/**
+ * 一个 `scriptTask` / `serviceTask`，节点自身挂 `extension: { taxRate: 0.06 }`。
+ *
+ * ⚠️ 为什么单开一个流程：上面那套是**网关条件**流程（判据看"待办落在哪个分支"），
+ *   而副作用的判据是「脚本算出来什么 / handler 收到什么」，观测点不同，
+ *   硬塞进同一张图会让断言绕一大圈。
+ */
+const effectDef = (type: 'scriptTask' | 'serviceTask') =>
+  makeDefinition({
+    nodes: [
+      { id: 'Start_1', type: 'startEvent' },
+      {
+        id: 'Calc_1',
+        type,
+        // ★ FEEL 里读并入的扩展属性；读不到是 `null`（不抛），正好做「默认不并入」的判据
+        ...(type === 'scriptTask' ? { script: 'node.taxRate', scriptFormat: 'feel' } : {}),
+        extension: { taxRate: 0.06 },
+      },
+      { id: 'End_1', type: 'endEvent' },
+    ],
+    flows: [
+      { from: 'Start_1', to: 'Calc_1' },
+      { from: 'Calc_1', to: 'End_1' },
+    ],
+  });
+
+describe('ADR-009 · **D-94**：副作用侧（脚本 / 服务）与条件同一口径', () => {
+  it('不 opt-in → 脚本读不到 `node`（默认行为逐字不变）', async () => {
+    const store = createMemoryStore();
+    const engine = createEngine({
+      definitionSource: { async getDefinition() { return effectDef('scriptTask'); } },
+      clock: () => T,
+      store,
+    });
+    const id = await engine.start('Process_1', { definitionVersion: 1, starter: 'u_x' });
+    const state = await store.load(id);
+    expect(state?.variables.Calc_1).toBeNull();
+  });
+
+  it('★ opt-in 后脚本能读到 `node.taxRate`（此前**永远 null** 且不报错）', async () => {
+    const store = createMemoryStore();
+    const engine = createEngine({
+      definitionSource: { async getDefinition() { return effectDef('scriptTask'); } },
+      clock: () => T,
+      extensionVars: {},
+      store,
+    });
+    const id = await engine.start('Process_1', { definitionVersion: 1, starter: 'u_x' });
+    const state = await store.load(id);
+    expect(state?.variables.Calc_1).toBe(0.06);
+  });
+
+  it('★ opt-in 后 `serviceTask` 的 handler 也收到 `node`（第 1 参）', async () => {
+    const seen: Array<Record<string, unknown>> = [];
+    const store = createMemoryStore();
+    const engine = createEngine({
+      definitionSource: { async getDefinition() { return effectDef('serviceTask'); } },
+      clock: () => T,
+      extensionVars: { key: 'node' },
+      handlers: {
+        get: () => async (vars) => {
+          seen.push({ ...vars });
+          return { ok: true };
+        },
+      },
+      store,
+    });
+    await engine.start('Process_1', { definitionVersion: 1, starter: 'u_x', variables: { amount: 1000 } });
+    expect(seen[0]).toEqual({ amount: 1000, node: { taxRate: 0.06 } });
+  });
+
+  it('不 opt-in 时 handler 收到的变量**一个键都不多**', async () => {
+    const seen: Array<Record<string, unknown>> = [];
+    const store = createMemoryStore();
+    const engine = createEngine({
+      definitionSource: { async getDefinition() { return effectDef('serviceTask'); } },
+      clock: () => T,
+      handlers: {
+        get: () => async (vars) => {
+          seen.push({ ...vars });
+          return { ok: true };
+        },
+      },
+      store,
+    });
+    await engine.start('Process_1', { definitionVersion: 1, starter: 'u_x', variables: { amount: 1000 } });
+    expect(seen[0]).toEqual({ amount: 1000 });
+  });
+
+  it('★ 并入键与已有变量撞车 → 抛（与条件同款，不静默覆盖）', async () => {
+    const store = createMemoryStore();
+    const engine = createEngine({
+      definitionSource: { async getDefinition() { return effectDef('scriptTask'); } },
+      clock: () => T,
+      extensionVars: {},
+      store,
+    });
+    await expectCodeAsync(
+      engine.start('Process_1', {
+        definitionVersion: 1,
+        starter: 'u_x',
+        variables: { node: '宿主自己的 node' },
+      }),
+      ENGINE_ERROR_CODES.OPTION_INVALID,
+    );
+  });
+
+  it('★ 并入只在求值上下文里：`state.variables` 里**不出现** `node`', async () => {
+    const store = createMemoryStore();
+    const engine = createEngine({
+      definitionSource: { async getDefinition() { return effectDef('scriptTask'); } },
+      clock: () => T,
+      extensionVars: {},
+      store,
+    });
+    const id = await engine.start('Process_1', { definitionVersion: 1, starter: 'u_x' });
+    const state = await store.load(id);
+    // 只有脚本结果（键 = 节点 id），没有 `node` / `taxRate`
+    expect(Object.keys(state?.variables ?? {})).toEqual(['Calc_1']);
   });
 });
