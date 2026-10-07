@@ -814,7 +814,7 @@ describe('⑦ 超时排程（`Scheduler` SPI）', () => {
     expect(sched.scheduled[0]?.timeout.workCalendar).toBe('my-cal');
   });
 
-  it('★ 不写 `workCalendar` → 归一化补 cn-default（默认不得退化成 7×24）', async () => {
+  it('★ 不写 `workCalendar` → 归一化补 default（默认不得退化成 7×24）', async () => {
     const sched = fakeScheduler();
     const { engine } = engineOf(
       makeDefinition({
@@ -838,7 +838,7 @@ describe('⑦ 超时排程（`Scheduler` SPI）', () => {
     );
     await engine.start('Process_1', { definitionVersion: 1, starter: 'u0' });
 
-    expect(sched.scheduled[0]?.timeout.workCalendar).toBe('cn-default');
+    expect(sched.scheduled[0]?.timeout.workCalendar).toBe('default');
   });
 
   it('★ `diffTimers` 是纯的：同一份前后状态算两遍结果一致', () => {

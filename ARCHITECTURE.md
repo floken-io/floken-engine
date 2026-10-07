@@ -430,7 +430,7 @@ interface ConvergeCtx {
 | DV-1 | `approval.*` 的全部字段合法性、默认值、互斥规则**以 moddle 的 `normalizeApproval()` 结果为准**；engine 不得再实现一份默认值，也不得在无 `NormalizedApproval` 时自行兜底 | 两处默认值分叉 → 同一流程在 engine 与 designer 行为不同 |
 | DV-2 | 未开启的动作（`approval.X.allowed === false`）在运行期提交 → **抛错**，不静默忽略 | `AC-E2` |
 | DV-3 | `requireComment` 默认按动作性质两分：**回退类 = `true`**（reject / rejectToPrev / jumpTo / returnTo / takeBack / revoke）、**换人类 = `false`**（transfer / delegate） | 驳回不写意见被放行 → 追责链断裂 |
-| DV-4 | `workCalendar` 默认 `cn-default`，**不得退化成 7×24** | 超时计算与国内作息不符 |
+| DV-4 | `workCalendar` 默认 `default`，**不得退化成 7×24** | 超时计算与国内作息不符 |
 | DV-5 | 4 项动作**没有设计期开关**（`approve` / `terminate` / `suspend`+`resume` / `saveDraft`）—— 不得给它们补开关 | 流程定义多一层无意义配置 |
 | DV-6 | `timeout.actions` 是**数组**（`remind` / `autoApprove` / `autoReject` / `escalate` 可并存）；`duration` / `date` / `cycle` **三选一互斥** | `AC-` 配置互斥 |
 | DV-7 | 定义中的可执行元素必须属于 **27 类**；出现 5 类例外（`ComplexGateway` / `AdHocSubProcess` / `Transaction` / `EventBasedGateway` / `ImplicitThrowEvent`）时，**必须按对应 FR 的降级语义处理并明示**，不得含糊成"支持" | 宣称覆盖度失真（违反 `AGENTS.md` §6） |

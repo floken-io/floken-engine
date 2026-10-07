@@ -267,7 +267,7 @@ export interface TimeoutSpec {
   readonly cycle?: string | undefined;
   /**
    * 工作日历 —— **两种形态都原样交出，内核不解读、不改写、不补齐**：
-   * - `string` = 日历 **id**（`'cn-default'` 只是个名字，含义由调度方解释）；
+   * - `string` = 日历 **id**（`'default'` 只是个名字，含义由调度方解释）；
    * - `WorkCalendarSpec` = 宿主**内联**的日历（`workdays` / `hours` / `holidays`）。
    *
    * ⚠️ 不给 = 调度方自己的默认（`03` F-1：不得退化成 7×24）。
