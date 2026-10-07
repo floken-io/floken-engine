@@ -841,6 +841,62 @@ describe('⑦ 超时排程（`Scheduler` SPI）', () => {
     expect(sched.scheduled[0]?.timeout.workCalendar).toBe('default');
   });
 
+  // ---------- ⑧ 超时动作的**参数**必须交到调度方手上 ----------
+
+  function actionsDef(actions: unknown[]) {
+    return makeDefinition({
+      nodes: [
+        { id: 'Start_1', type: 'startEvent' },
+        {
+          id: 'Task_1',
+          type: 'userTask',
+          approval: userApproval('u1', { timeout: { duration: 'P3D', actions } }),
+        },
+        { id: 'End_1', type: 'endEvent' },
+      ],
+      flows: [
+        { from: 'Start_1', to: 'Task_1' },
+        { from: 'Task_1', to: 'End_1' },
+      ],
+    });
+  }
+
+  it('★ `remind` 的 `interval` / `max` 原样交出（只给 kind 就没法催办）', async () => {
+    const sched = fakeScheduler();
+    const { engine } = engineOf(
+      actionsDef([{ type: 'remind', interval: 'PT12H', max: 3 }]) as ReturnType<
+        typeof makeDefinition
+      >,
+      { scheduler: sched },
+    );
+    await engine.start('Process_1', { definitionVersion: 1, starter: 'u0' });
+
+    expect(sched.scheduled).toHaveLength(1);
+    expect(sched.scheduled[0]?.kind).toBe('remind');
+    // ⚠️ 早期只传 kind → 调度方不知道隔多久催、最多催几次（F-3 AC1 兑现不了）
+    expect(sched.scheduled[0]?.payload).toEqual({ type: 'remind', interval: 'PT12H', max: 3 });
+  });
+
+  it('★ `autoReject.target` / `escalate.to` 原样交出（驳回给谁、升级给谁）', async () => {
+    const sched = fakeScheduler();
+    const { engine } = engineOf(
+      actionsDef([
+        { type: 'autoReject', target: 'previous' },
+        { type: 'escalate', to: [{ type: 'role', value: 'r_admin' }] },
+      ]) as ReturnType<typeof makeDefinition>,
+      { scheduler: sched },
+    );
+    await engine.start('Process_1', { definitionVersion: 1, starter: 'u0' });
+
+    // 两个动作 = 两个定时器（各自一个 handle），不是合并成一个
+    expect(sched.scheduled).toHaveLength(2);
+    expect(sched.scheduled[0]?.payload).toEqual({ type: 'autoReject', target: 'previous' });
+    expect(sched.scheduled[1]?.payload).toEqual({
+      type: 'escalate',
+      to: [{ type: 'role', value: 'r_admin' }],
+    });
+  });
+
   it('★ `diffTimers` 是纯的：同一份前后状态算两遍结果一致', () => {
     const g = graphOf(timeoutDef());
     const prev: InstanceState = {

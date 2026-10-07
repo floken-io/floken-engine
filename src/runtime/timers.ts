@@ -52,8 +52,17 @@ export interface PendingTimeout {
   /** 待办创建时刻 —— 调度方据此按工作日历推算到期时刻 */
   readonly fromAt: string;
   readonly timeout: TimeoutSpec;
-  /** 本次要排的动作（可并存多个，故是数组） */
-  readonly kinds: readonly TimerKind[];
+  /**
+   * ★ **原始**动作对象数组（`timeout.actions` 原样，含 `interval` / `max` / `target` / `to`）。
+   * 一个动作排一次，故数组长度 = 该待办要排几个定时器。
+   *
+   * ⚠️ 这里早期只留 `kinds: TimerKind[]`（光秃秃的类型字符串），**动作参数被静默丢弃**：
+   * 调度方不知道隔多久催一次（`remind.interval`）、最多催几次（`remind.max`）、
+   * 驳回给谁（`autoReject.target`）、升级给谁（`escalate.to`）
+   * ⇒ `03` F-3 的 AC1 / AC3 / AC4 **根本无法兑现**。动作参数与 `timeout` 一样属宿主数据，
+   * 内核**不解读、不改写、不筛选**，只负责原样交出。
+   */
+  readonly actions: readonly TimeoutAction[];
 }
 
 /** ★ 一个"该取消"的意图 */
@@ -117,10 +126,12 @@ export function timingKeysOf(
     const approval = graph.approvalOf(t.nodeId);
     const timeout = approval?.timeout;
     if (timeout === undefined) continue;
-    const kinds = (timeout.actions ?? [])
-      .map((a) => a?.type)
-      .filter((k): k is TimerKind => typeof k === 'string');
-    if (kinds.length === 0) continue;
+    /* ★ 原样留下**整个动作对象**（含参数），不是只留 `type` —— 见 `PendingTimeout.actions` */
+    const actions = (timeout.actions ?? []).filter(
+      (a): a is TimeoutAction =>
+        typeof a === 'object' && a !== null && typeof (a as TimeoutAction).type === 'string',
+    );
+    if (actions.length === 0) continue;
 
     out.set(timerKeyOf(t.nodeId, t.id), {
       tokenId: t.id,
@@ -128,7 +139,7 @@ export function timingKeysOf(
       // ★ 计时的起点 = **这条待办的创建时刻**，不是实例的启动时刻
       fromAt: t.createdAt ?? state.startedAt,
       timeout: timeoutSpecOf(timeout),
-      kinds,
+      actions,
     });
   }
 

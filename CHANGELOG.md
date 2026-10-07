@@ -5,6 +5,27 @@
 
 ## 未发布
 
+### 修复 · 超时动作的**参数**不再被静默丢弃
+
+`ScheduleRequest.payload` 现在装的是**整个 `TimeoutAction` 原样副本**
+（`{ type, interval?, max?, target?, to? }`）。此前只交 `kind` 一个字符串：
+
+| 定义里写的 | 调度方原来收到 | 现在收到 |
+|---|---|---|
+| `{ type:'remind', interval:'PT12H', max:3 }` | `{kind:'remind'}` | `payload:{type:'remind',interval:'PT12H',max:3}` |
+| `{ type:'autoReject', target:'previous' }` | `{kind:'autoReject'}` | `payload:{type:'autoReject',target:'previous'}` |
+| `{ type:'escalate', to:[{type:'role',value:'r_admin'}] }` | `{kind:'escalate'}` | `payload:{type:'escalate',to:[…]}` |
+
+后果是 `03` F-3 的 AC1（按 `interval` 催、到 `max` 停）/ AC3（驳回给谁）/ AC4（升级给谁）
+**三条都兑现不了** —— 调度方根本拿不到这些参数。与 `workCalendar` 是同一类问题：
+宿主写在定义里的数据，内核不解读、不改写、**也不该丢**。
+
+### 破坏性变更 · `PendingTimeout.kinds` → `actions`
+
+`PendingTimeout`（`runtime/timers.ts`，公开导出）原字段 `kinds: TimerKind[]`
+换成 **`actions: readonly TimeoutAction[]`** —— 只留类型字符串正是上面那个 bug 的根因，
+留着两处同源数据就是分叉的开始。`TimerKind` 类型本身仍导出（它等于 `ScheduleKind`）。
+
 ### 破坏性变更 · `extension` 是宿主的地盘：引擎不再筛选任何键
 
 `extensionsOf()` / `ConditionCtx.nodeExtensions` / `targetExtensions` 原来会按

@@ -285,7 +285,19 @@ export interface ScheduleRequest {
   fromAt: string;
   /** ★ 定义上写的超时配置（内核**不**算 `dueAt`，理由见 {@link TimeoutSpec}） */
   timeout: TimeoutSpec;
+  /**
+   * 到点后做什么 —— `03` §4 的 `timeout.actions[]` 四选
+   * （可并存 ⇒ 每个动作各排一次，故 `kind` 是单值）。
+   */
   kind: ScheduleKind;
+  /**
+   * ★ **原始动作对象**（`{ type, interval?, max?, target?, to? }` 原样）。
+   *
+   * ⚠️ 为什么光有 `kind` 不够：它只是个标签，调度方仍不知道
+   * 「隔多久催一次（`remind.interval`）、最多催几次（`remind.max`）、
+   * 驳回给谁（`autoReject.target`）、升级给谁（`escalate.to`）」——
+   * 这些是宿主写在定义里的参数，内核同样**不解读、不改写**，只原样交出。
+   */
   payload?: Record<string, unknown>;
 }
 

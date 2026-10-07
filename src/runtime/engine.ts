@@ -1247,7 +1247,7 @@ export function createEngine(config: EngineConfig): Engine {
     const gained = new Map<string, string[]>();
     for (const p of diff.schedule) {
       const handles: string[] = [];
-      for (const kind of p.kinds) {
+      for (const action of p.actions) {
         handles.push(
           await scheduler.schedule({
             instanceId: next.instanceId,
@@ -1255,7 +1255,13 @@ export function createEngine(config: EngineConfig): Engine {
             tokenId: p.tokenId,
             fromAt: p.fromAt,
             timeout: p.timeout,
-            kind,
+            kind: action.type,
+            /*
+             * ★ 整个动作**原样**交出（含 `remind.interval` / `remind.max` /
+             * `autoReject.target` / `escalate.to`）。只给 `kind` 的话，调度方无从知道
+             * 「隔多久催、催几次、驳回给谁、升级给谁」——那些是宿主的定义，内核不解读。
+             */
+            payload: { ...action },
           }),
         );
       }
